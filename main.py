@@ -48,6 +48,43 @@ class LeadIngestModel(BaseModel):
     industry: Optional[str] = None
 
 
+class BlueprintInboundModel(BaseModel):
+    headcount: int
+    weekly_hours_wasted: int
+    annual_wasted_hours: int
+    annual_financial_bleed: float
+    friction_points: List[str]
+    name: str
+    company_name: str
+    email: str
+
+
+INBOUND_BLUEPRINTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS inbound_blueprints (
+    id                     BIGSERIAL    PRIMARY KEY,
+    headcount              INTEGER      NOT NULL,
+    weekly_hours_wasted    INTEGER      NOT NULL,
+    annual_wasted_hours    INTEGER      NOT NULL,
+    annual_financial_bleed DOUBLE PRECISION NOT NULL,
+    friction_points        JSONB        NOT NULL,
+    name                   TEXT         NOT NULL,
+    company_name           TEXT         NOT NULL,
+    email                  TEXT         NOT NULL,
+    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_email ON inbound_blueprints (email);
+CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_created_at ON inbound_blueprints (created_at DESC);
+"""
+
+
+async def ensure_inbound_blueprints_table() -> None:
+    async with app.state.db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(INBOUND_BLUEPRINTS_TABLE_SQL)
+        await conn.commit()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database_url = get_validated_database_url()
@@ -55,6 +92,7 @@ async def lifespan(app: FastAPI):
     app.state.db_pool = AsyncConnectionPool(conninfo=database_url, open=False)
     try:
         await app.state.db_pool.open(wait=True)
+        await ensure_inbound_blueprints_table()
     except Exception as exc:
         print(
             "\n[helix] CLOUD CONNECTION FAILED — possible causes: wrong credentials, "
@@ -142,6 +180,61 @@ async def ingest_leads(
     except Exception as exc:
         raise HTTPException(
             status_code=500, detail=f"Failed to ingest leads: {exc}"
+        ) from exc
+
+
+@app.post("/api/v1/inbound-blueprints")
+async def inbound_blueprints(
+    payload: BlueprintInboundModel,
+    x_inbound_key: str | None = Header(default=None),
+):
+    expected_key = os.getenv("INBOUND_API_KEY")
+    if expected_key and not (
+        x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    print(
+        "[ALERT][PRIORITY=HIGH] Inbound blueprint received "
+        f"name={payload.name} company={payload.company_name} email={payload.email} "
+        f"annual_financial_bleed={payload.annual_financial_bleed}"
+    )
+
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO inbound_blueprints (
+                        headcount,
+                        weekly_hours_wasted,
+                        annual_wasted_hours,
+                        annual_financial_bleed,
+                        friction_points,
+                        name,
+                        company_name,
+                        email
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                    """,
+                    (
+                        payload.headcount,
+                        payload.weekly_hours_wasted,
+                        payload.annual_wasted_hours,
+                        payload.annual_financial_bleed,
+                        Jsonb(payload.friction_points),
+                        payload.name,
+                        payload.company_name,
+                        payload.email,
+                    ),
+                )
+            await conn.commit()
+
+        return {"status": "success"}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to ingest inbound blueprint: {exc}",
         ) from exc
 
 
