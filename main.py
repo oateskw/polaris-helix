@@ -2,11 +2,12 @@ import os
 import traceback
 import asyncio
 import json
+import hmac
 from contextlib import asynccontextmanager
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, List
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from psycopg.rows import dict_row
@@ -35,6 +36,16 @@ class LogIngestSchema(BaseModel):
     log_level: str = "INFO"
     message: str
     metadata: dict[str, Any] | None = None
+
+
+class LeadIngestModel(BaseModel):
+    email: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    company: Optional[str] = None
+    title: Optional[str] = None
+    website: Optional[str] = None
+    industry: Optional[str] = None
 
 
 @asynccontextmanager
@@ -90,6 +101,47 @@ async def ingest_log(payload: LogIngestSchema):
     except Exception as exc:
         raise HTTPException(
             status_code=500, detail=f"Failed to log event: {exc}"
+        ) from exc
+
+
+@app.post("/api/v1/ingest")
+async def ingest_leads(
+    leads: List[LeadIngestModel],
+    x_ingest_key: str | None = Header(default=None),
+):
+    expected_key = os.getenv("INGEST_API_KEY")
+    if expected_key and not (
+        x_ingest_key and hmac.compare_digest(x_ingest_key, expected_key)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                for lead in leads:
+                    await cur.execute(
+                        """
+                        INSERT INTO cold_leads
+                        (email, first_name, last_name, company, title, website, industry)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (email) DO NOTHING;
+                        """,
+                        (
+                            lead.email,
+                            lead.first_name,
+                            lead.last_name,
+                            lead.company,
+                            lead.title,
+                            lead.website,
+                            lead.industry,
+                        ),
+                    )
+            await conn.commit()
+
+        return {"status": "success", "processed": len(leads)}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to ingest leads: {exc}"
         ) from exc
 
 
