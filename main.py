@@ -1,10 +1,13 @@
 import os
 import traceback
+import asyncio
+import json
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -92,40 +95,66 @@ async def ingest_log(payload: LogIngestSchema):
 
 @app.get("/api/v1/stream")
 async def stream_logs(
+    request: Request,
     agent_name: Literal["vanguard", "beacon"] | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=1000),
 ):
-    try:
-        async with app.state.db_pool.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                if agent_name is not None:
-                    await cur.execute(
-                        """
-                        SELECT id, agent_name, log_level, message, metadata, timestamp
-                        FROM agent_system_logs
-                        WHERE agent_name = %s
-                        ORDER BY timestamp DESC
-                        LIMIT %s;
-                        """,
-                        (agent_name, limit),
-                    )
-                else:
-                    await cur.execute(
-                        """
-                        SELECT id, agent_name, log_level, message, metadata, timestamp
-                        FROM agent_system_logs
-                        ORDER BY timestamp DESC
-                        LIMIT %s;
-                        """,
-                        (limit,),
-                    )
-                records = await cur.fetchall()
+    async def log_publisher(agent_name: Optional[str] = None):
+        last_seen_id = 0
 
-        return {"status": "success", "records": records}
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to fetch logs: {exc}"
-        ) from exc
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                async with app.state.db_pool.connection() as conn:
+                    async with conn.cursor(row_factory=dict_row) as cur:
+                        if agent_name is not None:
+                            await cur.execute(
+                                """
+                                SELECT id, agent_name, log_level, message, timestamp
+                                FROM agent_system_logs
+                                WHERE id > %s AND agent_name = %s
+                                ORDER BY id ASC;
+                                """,
+                                (last_seen_id, agent_name),
+                            )
+                        else:
+                            await cur.execute(
+                                """
+                                SELECT id, agent_name, log_level, message, timestamp
+                                FROM agent_system_logs
+                                WHERE id > %s
+                                ORDER BY id ASC;
+                                """,
+                                (last_seen_id,),
+                            )
+
+                        rows = await cur.fetchall()
+
+                if rows:
+                    last_seen_id = max(row["id"] for row in rows)
+                    for row in rows:
+                        payload = {
+                            "id": row["id"],
+                            "agent_name": row["agent_name"],
+                            "log_level": row["log_level"],
+                            "message": row["message"],
+                            "timestamp": row["timestamp"].isoformat(),
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+                else:
+                    await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            return
+
+    return StreamingResponse(
+        log_publisher(agent_name=agent_name),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 if __name__ == "__main__":
