@@ -43,6 +43,22 @@ CREATE TABLE IF NOT EXISTS agent_system_logs (
 CREATE INDEX IF NOT EXISTS idx_asl_agent_name  ON agent_system_logs (agent_name);
 CREATE INDEX IF NOT EXISTS idx_asl_timestamp   ON agent_system_logs (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_asl_log_level   ON agent_system_logs (log_level);
+
+CREATE TABLE IF NOT EXISTS inbound_blueprints (
+    id                     BIGSERIAL    PRIMARY KEY,
+    headcount              INTEGER      NOT NULL,
+    weekly_hours_wasted    INTEGER      NOT NULL,
+    annual_wasted_hours    INTEGER      NOT NULL,
+    annual_financial_bleed DOUBLE PRECISION NOT NULL,
+    friction_points        JSONB        NOT NULL,
+    name                   TEXT         NOT NULL,
+    company_name           TEXT         NOT NULL,
+    email                  TEXT         NOT NULL,
+    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_email ON inbound_blueprints (email);
+CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_created_at ON inbound_blueprints (created_at DESC);
 """
 
 
