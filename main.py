@@ -48,6 +48,11 @@ class LeadIngestModel(BaseModel):
     industry: Optional[str] = None
 
 
+class LeadStatusUpdateModel(BaseModel):
+    status: str
+    email_body: Optional[str] = None
+
+
 class BlueprintInboundModel(BaseModel):
     headcount: int
     weekly_hours_wasted: int
@@ -300,6 +305,99 @@ async def stream_logs(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.get("/api/v1/leads/unprocessed")
+async def get_unprocessed_leads(
+    x_inbound_key: str | None = Header(default=None),
+):
+    expected_key = os.getenv("INBOUND_API_KEY")
+    if expected_key and not (
+        x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("""
+                    SELECT id, email, first_name, last_name, company, title,
+                           website, industry, status, created_at
+                    FROM cold_leads
+                    WHERE status = 'scraped'
+                    ORDER BY created_at ASC
+                    LIMIT 50;
+                    """)
+                rows = await cur.fetchall()
+
+        return [
+            {
+                **row,
+                "created_at": (
+                    row["created_at"].isoformat() if row.get("created_at") else None
+                ),
+            }
+            for row in rows
+        ]
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch unprocessed leads: {exc}"
+        ) from exc
+
+
+@app.patch("/api/v1/leads/{lead_id}")
+async def update_lead_status(
+    lead_id: int,
+    payload: LeadStatusUpdateModel,
+    x_inbound_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+):
+    expected_key = os.getenv("INBOUND_API_KEY")
+    helix_api_token = os.getenv("HELIX_API_TOKEN")
+
+    inbound_key_valid = bool(
+        expected_key
+        and x_inbound_key
+        and hmac.compare_digest(x_inbound_key, expected_key)
+    )
+
+    bearer_token_valid = False
+    if helix_api_token and authorization:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and token:
+            bearer_token_valid = hmac.compare_digest(token, helix_api_token)
+
+    if not (inbound_key_valid or bearer_token_valid):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE cold_leads
+                    SET status = %s,
+                        email_body = COALESCE(%s, email_body)
+                    WHERE id = %s
+                    RETURNING id;
+                    """,
+                    (payload.status, payload.email_body, lead_id),
+                )
+                updated = await cur.fetchone()
+            await conn.commit()
+
+        if updated is None:
+            raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
+
+        print(f"[STATUS UPDATE] Lead {lead_id} transitioned to {payload.status}")
+
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to update lead status: {exc}"
+        ) from exc
 
 
 if __name__ == "__main__":
