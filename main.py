@@ -32,7 +32,7 @@ def get_validated_database_url() -> str:
 
 
 class LogIngestSchema(BaseModel):
-    agent_name: Literal["vanguard", "beacon"]
+    agent_name: Literal["vanguard", "beacon", "echo", "shadow"]
     log_level: str = "INFO"
     message: str
     metadata: dict[str, Any] | None = None
