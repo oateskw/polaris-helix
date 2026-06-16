@@ -94,7 +94,15 @@ async def ensure_inbound_blueprints_table() -> None:
 async def lifespan(app: FastAPI):
     database_url = get_validated_database_url()
 
-    app.state.db_pool = AsyncConnectionPool(conninfo=database_url, open=False)
+    # 🎯 SELF-HEALING ASYNC CONNECTION POOL CONFIGURATION
+    app.state.db_pool = AsyncConnectionPool(
+        conninfo=database_url,
+        open=False,
+        # Forces the pool to test the socket before lending it to an API route
+        check=AsyncConnectionPool.check_connection,
+        # Automatically drops and recreates idle connections older than 4.5 minutes
+        max_idle=270.0,
+    )
     try:
         await app.state.db_pool.open(wait=True)
         await ensure_inbound_blueprints_table()
