@@ -325,6 +325,10 @@ async def ingest_log(payload: LogIngestSchema):
 
         return {"status": "success", "logged_id": row[0]}
     except Exception as exc:
+        # 🟢 This will print the EXACT python/SQL error to your Render console logs!
+        print(f"\n❌ [CRITICAL ENDPOINT FAILURE] /api/v1/logs crashed!")
+        traceback.print_exc()
+
         raise HTTPException(
             status_code=500, detail=f"Failed to log event: {exc}"
         ) from exc
