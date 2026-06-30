@@ -410,10 +410,11 @@ async def rotate_scheduler_target(
     try:
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
+                # 🟢 Automatically uses the current target_region if payload's region is omitted or blank
                 await cur.execute(
                     """
                     UPDATE helix_brain_scheduler
-                    SET target_region = %s,
+                    SET target_region = COALESCE(NULLIF(%s, ''), target_region),
                         last_targeted_at = NOW()
                     WHERE industry_name = %s
                     RETURNING industry_id, industry_name, target_region, last_targeted_at;
