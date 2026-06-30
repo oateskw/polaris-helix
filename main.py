@@ -3,6 +3,7 @@ import traceback
 import asyncio
 import json
 import hmac
+from anthropic import Anthropic
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional, List
 
@@ -490,6 +491,92 @@ async def get_current_scheduler_target(
             status_code=500,
             detail=f"Failed to fetch current scheduler target: {exc}",
         ) from exc
+
+
+@app.post("/api/v1/scheduler/expand-horizons")
+async def expand_target_industries(
+    x_inbound_key: str | None = Header(default=None),
+):
+    expected_key = os.getenv("INBOUND_API_KEY")
+    if expected_key and not (
+        x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Fetch what we already have so we don't generate duplicates
+    async with app.state.db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT industry_name FROM helix_brain_scheduler;")
+            existing_rows = await cur.fetchall()
+            existing_industries = [row[0] for row in existing_rows]
+
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not anthropic_key:
+        raise HTTPException(
+            status_code=500, detail="Missing Anthropic Key for industry discovery"
+        )
+
+    ai_client = Anthropic(api_key=anthropic_key)
+
+    prompt = f"""You are a B2B market expansion strategist specializing in AI Automation Agents.
+    Current targets already in database: {existing_industries}
+
+    Task: Identify exactly 3 new, highly-specific industry verticals or niches where AI agents can heavily solve an operational operational bottleneck (e.g., 'Boutique Law Firms', 'Property Management Companies', 'E-commerce Logistics').
+    
+    Rules:
+    - Do not repeat or overlap with the current targets.
+    - Provide deep, tangible, pain-focused profiles.
+    - Return ONLY a valid JSON array of objects, with no markdown fences, matching this structure:
+    [
+      {{
+        "industry_name": "Industry Niche",
+        "bottleneck_profile": "Clear sentence describing the manual, high-friction problem an AI voice/chat agent solves.",
+        "pain_tokens": ["token1", "token2"],
+        "target_region": "US State matching where this industry density is high"
+      }}
+    ]"""
+
+    try:
+        message = ai_client.messages.create(
+            model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
+            max_tokens=1000,
+            temperature=0.7,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        # Simple string cleaning
+        raw_json = message.content[0].text.strip()
+        if raw_json.startswith("```"):
+            raw_json = "\n".join(raw_json.splitlines()[1:-1]).strip()
+
+        new_sectors = json.loads(raw_json)
+
+        # Inject the discovered sectors dynamically into the brain table
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                for sector in new_sectors:
+                    await cur.execute(
+                        """
+                        INSERT INTO helix_brain_scheduler (
+                            industry_name, bottleneck_profile, pain_tokens, target_region, priority_score
+                        ) VALUES (%s, %s, %s, %s, 1)
+                        ON CONFLICT (industry_name) DO NOTHING;
+                        """,
+                        (
+                            sector["industry_name"],
+                            sector["bottleneck_profile"],
+                            sector["pain_tokens"],
+                            sector.get("target_region", "Texas"),
+                        ),
+                    )
+            await conn.commit()
+
+        return {
+            "status": "success",
+            "discovered_and_added": [s["industry_name"] for s in new_sectors],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Discovery failed: {e}")
 
 
 @app.post("/api/v1/scheduler/add")
