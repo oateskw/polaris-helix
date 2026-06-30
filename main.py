@@ -10,13 +10,41 @@ from typing import Any, Literal, Optional, List
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request, Header
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 import uvicorn
 
 load_dotenv()
+
+
+# 🛡️ THE INTERCEPTOR LAYER: Cleans up the body before Pydantic checks fields
+@model_validator(mode="before")
+@classmethod
+def self_heal_legacy_payloads(cls, data: Any) -> Any:
+    if isinstance(data, dict):
+        # 1. Handle legacy "agent" to "agent_name" mapping if it ever shows up again
+        if "agent" in data and "agent_name" not in data:
+            raw_agent = str(data.pop("agent")).lower()
+            if "vector" in raw_agent:
+                data["agent_name"] = "vector"
+            elif "nexus" in raw_agent:
+                data["agent_name"] = "nexus"
+            else:
+                data["agent_name"] = raw_agent
+
+        # 2. 🎯 FIXES YOUR CURRENT ERROR: Inject a message if the caller didn't provide one
+        if "message" not in data or not data["message"]:
+            event_name = data.get("event", "generic_background_telemetry")
+            data["message"] = f"Background pipeline activity: {event_name}"
+
+        # 3. Clean up the rest of the payload data into the metadata block
+        if "metadata" not in data or data["metadata"] is None:
+            known_fields = {"agent_name", "log_level", "message"}
+            data["metadata"] = {k: v for k, v in data.items() if k not in known_fields}
+
+    return data
 
 
 def get_validated_database_url() -> str:
