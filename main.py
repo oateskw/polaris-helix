@@ -592,7 +592,7 @@ async def expand_target_industries(
                         """
                         INSERT INTO helix_brain_scheduler (
                             industry_name, bottleneck_profile, pain_tokens, target_region, priority_score
-                        ) VALUES (%s, %s, %s, %s, 1)
+                        ) VALUES (%s, %s, %s::text[], %s, 1) -- 🟢 ADDED THE ::text[] TYPE CAST HERE
                         ON CONFLICT (industry_name) DO NOTHING;
                         """,
                         (
