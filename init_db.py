@@ -59,6 +59,19 @@ CREATE TABLE IF NOT EXISTS inbound_blueprints (
 
 CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_email ON inbound_blueprints (email);
 CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_created_at ON inbound_blueprints (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS helix_brain_scheduler (
+    industry_id SERIAL PRIMARY KEY,
+    industry_name VARCHAR(100) UNIQUE NOT NULL,
+    bottleneck_profile TEXT NOT NULL,
+    pain_tokens TEXT[] NOT NULL,
+    target_region VARCHAR(100) DEFAULT 'Texas',
+    is_active BOOLEAN DEFAULT TRUE,
+    last_targeted_at TIMESTAMP DEFAULT NULL,
+    priority_score INT DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_hbs_last_targeted ON helix_brain_scheduler (last_targeted_at);
 """
 
 

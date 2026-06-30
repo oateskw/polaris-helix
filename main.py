@@ -64,6 +64,19 @@ class BlueprintInboundModel(BaseModel):
     email: str
 
 
+class SchedulerTargetUpdateModel(BaseModel):
+    industry_name: str
+    target_region: str
+
+
+class SchedulerRecordIngestModel(BaseModel):
+    industry_name: str
+    bottleneck_profile: str
+    pain_tokens: List[str]
+    target_region: str = "Texas"
+    priority_score: int = 1
+
+
 INBOUND_BLUEPRINTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS inbound_blueprints (
     id                     BIGSERIAL    PRIMARY KEY,
@@ -80,6 +93,31 @@ CREATE TABLE IF NOT EXISTS inbound_blueprints (
 
 CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_email ON inbound_blueprints (email);
 CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_created_at ON inbound_blueprints (created_at DESC);
+"""
+
+
+SCHEDULER_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS helix_brain_scheduler (
+    industry_id SERIAL PRIMARY KEY,
+    industry_name VARCHAR(100) UNIQUE NOT NULL,
+    bottleneck_profile TEXT NOT NULL,
+    pain_tokens TEXT[] NOT NULL,
+    target_region VARCHAR(100) DEFAULT 'Texas',
+    is_active BOOLEAN DEFAULT TRUE,
+    last_targeted_at TIMESTAMP DEFAULT NULL,
+    priority_score INT DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_hbs_last_targeted ON helix_brain_scheduler (last_targeted_at DESC);
+"""
+
+
+SEED_SCHEDULER_SQL = """
+INSERT INTO helix_brain_scheduler (industry_name, bottleneck_profile, pain_tokens, target_region)
+VALUES
+('Home Services', 'Inbound emergency calls rolling to voicemail.', ARRAY['hvac', 'plumbing'], 'Texas'),
+('Accounting Firms', 'Manual client intake document tracking friction.', ARRAY['accounting', 'bookkeeping'], 'California'),
+('Medical Clinics', 'Open chair utilization inefficiencies.', ARRAY['dental', 'medical spa'], 'Florida')
+ON CONFLICT (industry_name) DO NOTHING;
 """
 
 
@@ -106,6 +144,11 @@ async def lifespan(app: FastAPI):
     try:
         await app.state.db_pool.open(wait=True)
         await ensure_inbound_blueprints_table()
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(SCHEDULER_TABLE_SQL)
+                await cur.execute(SEED_SCHEDULER_SQL)
+            await conn.commit()
     except Exception as exc:
         print(
             "\n[helix] CLOUD CONNECTION FAILED — possible causes: wrong credentials, "
@@ -121,6 +164,72 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Helix Log Intake API", lifespan=lifespan)
+
+
+async def analyze_and_orchestrate_log(
+    agent_name: str,
+    log_level: str,
+    message: str,
+    metadata: dict | None,
+) -> None:
+    metadata_dict = metadata if isinstance(metadata, dict) else {}
+    normalized_message = message.lower()
+    industry_name = metadata_dict.get("industry_name") or metadata_dict.get("industry")
+
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                if (
+                    agent_name == "vanguard"
+                    and metadata_dict.get("event") in {"campaign_drop", "link_click"}
+                ):
+                    if industry_name:
+                        await cur.execute(
+                            """
+                            UPDATE helix_brain_scheduler
+                            SET priority_score = priority_score + 1
+                            WHERE industry_name = %s AND is_active = TRUE;
+                            """,
+                            (industry_name,),
+                        )
+                        print(
+                            "[orchestrator] vanguard scale sync: "
+                            f"raised priority for industry={industry_name}"
+                        )
+                    else:
+                        print(
+                            "[orchestrator] vanguard scale sync skipped: "
+                            "missing industry_name in metadata"
+                        )
+
+                has_infra_block = any(
+                    token in normalized_message
+                    for token in ("instantly", "billing", "infrastructure", "blocked")
+                )
+                if log_level == "ERROR" and has_infra_block:
+                    if industry_name:
+                        await cur.execute(
+                            """
+                            UPDATE helix_brain_scheduler
+                            SET priority_score = GREATEST(priority_score - 1, 1),
+                                is_active = FALSE
+                            WHERE industry_name = %s;
+                            """,
+                            (industry_name,),
+                        )
+                        print(
+                            "[orchestrator] quarantine gate: "
+                            f"paused track and reduced priority for industry={industry_name}"
+                        )
+                    else:
+                        print(
+                            "[orchestrator] quarantine gate skipped: "
+                            "missing industry_name in metadata"
+                        )
+
+            await conn.commit()
+    except Exception as exc:
+        print(f"[orchestrator] background log analysis failed: {exc}")
 
 
 @app.post("/api/v1/logs")
@@ -147,6 +256,15 @@ async def ingest_log(payload: LogIngestSchema):
                 )
                 row = await cur.fetchone()
             await conn.commit()
+
+        asyncio.create_task(
+            analyze_and_orchestrate_log(
+                payload.agent_name,
+                payload.log_level,
+                payload.message,
+                payload.metadata,
+            )
+        )
 
         return {"status": "success", "logged_id": row[0]}
     except Exception as exc:
@@ -248,6 +366,151 @@ async def inbound_blueprints(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to ingest inbound blueprint: {exc}",
+        ) from exc
+
+
+@app.post("/api/v1/scheduler/rotate")
+async def rotate_scheduler_target(
+    payload: SchedulerTargetUpdateModel,
+    x_inbound_key: str | None = Header(default=None),
+):
+    expected_key = os.getenv("INBOUND_API_KEY")
+    if expected_key and not (
+        x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE helix_brain_scheduler
+                    SET target_region = %s,
+                        last_targeted_at = NOW()
+                    WHERE industry_name = %s
+                    RETURNING industry_id, industry_name, target_region, last_targeted_at;
+                    """,
+                    (payload.target_region, payload.industry_name),
+                )
+                updated = await cur.fetchone()
+            await conn.commit()
+
+        if updated is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Industry '{payload.industry_name}' not found",
+            )
+
+        return {
+            "status": "success",
+            "industry_id": updated[0],
+            "industry_name": updated[1],
+            "target_region": updated[2],
+            "last_targeted_at": (
+                updated[3].isoformat() if updated[3] is not None else None
+            ),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to rotate scheduler target: {exc}",
+        ) from exc
+
+
+@app.get("/api/v1/scheduler/current")
+async def get_current_scheduler_target(
+    x_inbound_key: str | None = Header(default=None),
+):
+    expected_key = os.getenv("INBOUND_API_KEY")
+    if expected_key and not (
+        x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("""
+                    SELECT industry_id, industry_name, target_region, last_targeted_at, priority_score
+                    FROM helix_brain_scheduler
+                    WHERE is_active = TRUE
+                    ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC
+                    LIMIT 1;
+                    """)
+                row = await cur.fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=404, detail="No active scheduler target found"
+            )
+
+        return {
+            **row,
+            "last_targeted_at": (
+                row["last_targeted_at"].isoformat()
+                if row.get("last_targeted_at")
+                else None
+            ),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch current scheduler target: {exc}",
+        ) from exc
+
+
+@app.post("/api/v1/scheduler/add")
+async def add_scheduler_record(
+    payload: SchedulerRecordIngestModel,
+    x_inbound_key: str | None = Header(default=None),
+):
+    expected_key = os.getenv("INBOUND_API_KEY")
+    if expected_key and not (
+        x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO helix_brain_scheduler (
+                        industry_name,
+                        bottleneck_profile,
+                        pain_tokens,
+                        target_region,
+                        priority_score
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (industry_name) DO UPDATE
+                    SET bottleneck_profile = EXCLUDED.bottleneck_profile,
+                        pain_tokens = EXCLUDED.pain_tokens,
+                        target_region = EXCLUDED.target_region;
+                    """,
+                    (
+                        payload.industry_name,
+                        payload.bottleneck_profile,
+                        payload.pain_tokens,
+                        payload.target_region,
+                        payload.priority_score,
+                    ),
+                )
+            await conn.commit()
+
+        return {
+            "status": "success",
+            "industry_name": payload.industry_name,
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to add scheduler record: {exc}",
         ) from exc
 
 
