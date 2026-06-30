@@ -9,8 +9,6 @@ from typing import Any, Literal, Optional, List
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request, Header
 from fastapi.responses import StreamingResponse
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -18,20 +16,6 @@ from psycopg_pool import AsyncConnectionPool
 import uvicorn
 
 load_dotenv()
-
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    # Retrieve the raw request body to see exactly what was sent
-    body = await request.body()
-    print(f"\n[422 VALIDATION ERROR] Caught a bad payload!")
-    print(f"Errors: {exc.errors()}")
-    print(f"Raw Body Received: {body.decode('utf-8', errors='ignore')}\n")
-
-    return JSONResponse(
-        status_code=422,
-        content={"detail": exc.errors(), "body": body.decode("utf-8", errors="ignore")},
-    )
 
 
 def get_validated_database_url() -> str:
@@ -180,6 +164,23 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Helix Log Intake API", lifespan=lifespan)
+
+
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    body = await request.body()
+    print(f"\n[422 VALIDATION ERROR] Caught a bad payload!")
+    print(f"Errors: {exc.errors()}")
+    print(f"Raw Body Received: {body.decode('utf-8', errors='ignore')}\n")
+
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body": body.decode("utf-8", errors="ignore")},
+    )
 
 
 async def analyze_and_orchestrate_log(
