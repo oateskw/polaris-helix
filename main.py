@@ -179,10 +179,10 @@ async def analyze_and_orchestrate_log(
     try:
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
-                if (
-                    agent_name == "vanguard"
-                    and metadata_dict.get("event") in {"campaign_drop", "link_click"}
-                ):
+                if agent_name == "vanguard" and metadata_dict.get("event") in {
+                    "campaign_drop",
+                    "link_click",
+                }:
                     if industry_name:
                         await cur.execute(
                             """
