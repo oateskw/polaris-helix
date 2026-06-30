@@ -592,13 +592,13 @@ async def expand_target_industries(
                         """
                         INSERT INTO helix_brain_scheduler (
                             industry_name, bottleneck_profile, pain_tokens, target_region, priority_score
-                        ) VALUES (%s, %s, %s::text[], %s, 1) -- 🟢 ADDED THE ::text[] TYPE CAST HERE
+                        ) VALUES (%s, %s, %s::text[], %s, 1) -- 🟢 ADDED ::text[] CASTING HERE
                         ON CONFLICT (industry_name) DO NOTHING;
                         """,
                         (
                             sector["industry_name"],
                             sector["bottleneck_profile"],
-                            sector["pain_tokens"],
+                            sector["pain_tokens"],  # Now safely mapped via the driver
                             sector.get("target_region", "Texas"),
                         ),
                     )
@@ -609,6 +609,12 @@ async def expand_target_industries(
             "discovered_and_added": [s["industry_name"] for s in new_sectors],
         }
     except Exception as e:
+        # 🟢 THIS WILL BLOW UP THE TERMINAL LOGS WITH THE EXACT TRACE AND LINE NUMBER
+        print(
+            f"\n❌ [CRITICAL ENDPOINT FAILURE] /api/v1/scheduler/expand-horizons crashed!"
+        )
+        traceback.print_exc()
+
         raise HTTPException(status_code=500, detail=f"Discovery failed: {e}")
 
 
