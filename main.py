@@ -359,9 +359,6 @@ async def get_latest_agent_log(
     so orchestration layers like Nexus can compute strategic market yields.
     """
     expected_key = os.getenv("INBOUND_API_KEY")
-    helix_api_token = os.getenv(
-        "HELIX_API_TOKEN"
-    )  # Add your standard internal token env check
 
     # Check if the x-inbound-key matches
     inbound_key_valid = bool(
@@ -370,15 +367,8 @@ async def get_latest_agent_log(
         and hmac.compare_digest(x_inbound_key, expected_key)
     )
 
-    # Check if the bearer token matches
-    bearer_token_valid = False
-    if helix_api_token and authorization:
-        scheme, _, token = authorization.partition(" ")
-        if scheme.lower() == "bearer" and token:
-            bearer_token_valid = hmac.compare_digest(token, helix_api_token)
-
     # 🟩 FIXED: Allow either validation path to clear the gateway safely
-    if not (inbound_key_valid or bearer_token_valid):
+    if not inbound_key_valid:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
