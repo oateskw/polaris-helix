@@ -162,6 +162,26 @@ ON CONFLICT (industry_name) DO NOTHING;
 """
 
 
+async def log_helix_state(
+    cur, strategic_mode: str, geo_lock: str, buying_signal: str
+) -> None:
+    """📡 HELIX SYSTEM STATE LOG TRANSMITTER"""
+    metadata_payload = {
+        "strategic_mode": strategic_mode,
+        "geo_lock": geo_lock,
+        "buying_signal": buying_signal,
+    }
+
+    await cur.execute(
+        """
+        INSERT INTO agent_system_logs (agent_name, log_level, message, metadata)
+        VALUES ('helix', 'INFO', 'Global system parameters synchronized.', %s);
+        """,
+        (Jsonb(metadata_payload),),
+    )
+    print(f"[📡 HELIX TELEMETRY] Logged target adjustments: {metadata_payload}")
+
+
 async def ensure_inbound_blueprints_table() -> None:
     async with app.state.db_pool.connection() as conn:
         async with conn.cursor() as cur:
@@ -548,6 +568,15 @@ async def rotate_scheduler_target(
                     (payload.target_region, payload.industry_name),
                 )
                 updated = await cur.fetchone()
+                if updated is not None:
+                    # 🟩 ADDED: Write state telemetry entry directly to logs on parameter rotation
+                    # updated[1] = industry_name, updated[2] = target_region
+                    await log_helix_state(
+                        cur=cur,
+                        strategic_mode=f"Target Cycle: {updated[1]}",
+                        geo_lock=updated[2],
+                        buying_signal=f"#{''.join(updated[1].split()).lower()}life",
+                    )
             await conn.commit()
 
         if updated is None:
@@ -695,6 +724,15 @@ async def expand_target_industries(
                             sector["pain_tokens"],  # Now safely mapped via the driver
                             sector.get("target_region", "Texas"),
                         ),
+                    )
+
+                # 🟩 ADDED: Log state context based on the newly discovered leading sector
+                if new_sectors:
+                    await log_helix_state(
+                        cur=cur,
+                        strategic_mode=f"Expanding: {new_sectors[0]['industry_name']}",
+                        geo_lock=new_sectors[0].get("target_region", "Texas"),
+                        buying_signal=f"#{new_sectors[0]['pain_tokens'][0] if new_sectors[0]['pain_tokens'] else 'automation'}",
                     )
             await conn.commit()
 
