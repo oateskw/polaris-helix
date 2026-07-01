@@ -1,4 +1,5 @@
 import os
+import re
 import traceback
 import asyncio
 import json
@@ -334,6 +335,92 @@ async def ingest_log(payload: LogIngestSchema):
         ) from exc
 
 
+@app.get("/api/v1/logs/latest")
+async def get_latest_agent_log(
+    agent: Literal[
+        "vanguard",
+        "beacon",
+        "echo",
+        "shadow",
+        "aura",
+        "prism",
+        "vector",
+        "nexus",
+        "helix",
+    ],
+    x_inbound_key: str | None = Header(default=None),
+):
+    """
+    🧠 PRE-FLIGHT TELEMETRY HUB
+    Pulls the single most recent chronological execution log for a specific AI worker
+    so orchestration layers like Nexus can compute strategic market yields.
+    """
+    expected_key = os.getenv("INBOUND_API_KEY")
+    if expected_key and not (
+        x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                # Query the latest log entry for the specified worker agent
+                await cur.execute(
+                    """
+                    SELECT id, agent_name, log_level, message, metadata, timestamp
+                    FROM agent_system_logs
+                    WHERE agent_name = %s
+                    ORDER BY id DESC
+                    LIMIT 1;
+                    """,
+                    (agent,),
+                )
+                row = await cur.fetchone()
+
+        if row is None:
+            # Fallback gracefully with 0 records if the agent has never logged metrics before
+            return {
+                "status": "empty",
+                "agent_name": agent,
+                "records_found": 0,
+                "message": "No historical logs available for this agent.",
+            }
+
+        # 🧠 THE PARSING LAYER: Deduce the record count from historical messaging frameworks
+        records_found = 0
+        raw_message = str(row.get("message", ""))
+
+        # Scenario A: Check if it's stored cleanly inside the metadata dictionary properties
+        if isinstance(row.get("metadata"), dict) and "records_found" in row["metadata"]:
+            records_found = int(row["metadata"]["records_found"])
+        # Scenario B: Extract via regular expressions if stored inside historical sweep string logs
+        # E.g., matches "... Processed rows: 10" or "... Processed 10 proactive interceptions"
+        else:
+            match_str = re.search(
+                r"(?:processed rows:|processed)\s*(\d+)", raw_message, re.IGNORECASE
+            )
+            if match_str:
+                records_found = int(match_str.group(1))
+
+        return {
+            "id": row["id"],
+            "agent_name": row["agent_name"],
+            "log_level": row["log_level"],
+            "message": raw_message,
+            "records_found": records_found,
+            "timestamp": row["timestamp"].isoformat(),
+        }
+
+    except Exception as exc:
+        print(
+            f"\n❌ [CRITICAL ENDPOINT FAILURE] /api/v1/logs/latest crashed for agent={agent}!"
+        )
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch latest agent metrics: {exc}"
+        ) from exc
+
+
 @app.post("/api/v1/ingest")
 async def ingest_leads(
     leads: List[LeadIngestModel],
@@ -544,6 +631,8 @@ async def expand_target_industries(
             existing_industries = [row[0] for row in existing_rows]
 
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+    anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+
     if not anthropic_key:
         raise HTTPException(
             status_code=500, detail="Missing Anthropic Key for industry discovery"
@@ -571,7 +660,7 @@ async def expand_target_industries(
 
     try:
         message = ai_client.messages.create(
-            model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
+            model=anthropic_model,
             max_tokens=1000,
             temperature=0.7,
             messages=[{"role": "user", "content": prompt}],
