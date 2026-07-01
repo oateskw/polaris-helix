@@ -617,7 +617,7 @@ async def get_current_scheduler_target(
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute("""
-                    SELECT industry_id, industry_name, target_region, last_targeted_at, priority_score
+                    SELECT industry_id, industry_name, bottleneck_profile, pain_tokens, target_region, last_targeted_at, priority_score
                     FROM helix_brain_scheduler
                     WHERE is_active = TRUE
                     ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC
