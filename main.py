@@ -349,6 +349,9 @@ async def get_latest_agent_log(
         "helix",
     ],
     x_inbound_key: str | None = Header(default=None),
+    authorization: str | None = Header(
+        default=None
+    ),  # 🟩 ADDED: Accept Authorization header
 ):
     """
     🧠 PRE-FLIGHT TELEMETRY HUB
@@ -356,15 +359,31 @@ async def get_latest_agent_log(
     so orchestration layers like Nexus can compute strategic market yields.
     """
     expected_key = os.getenv("INBOUND_API_KEY")
-    if expected_key and not (
-        x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
-    ):
+    helix_api_token = os.getenv(
+        "HELIX_API_TOKEN"
+    )  # Add your standard internal token env check
+
+    # Check if the x-inbound-key matches
+    inbound_key_valid = bool(
+        expected_key
+        and x_inbound_key
+        and hmac.compare_digest(x_inbound_key, expected_key)
+    )
+
+    # Check if the bearer token matches
+    bearer_token_valid = False
+    if helix_api_token and authorization:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and token:
+            bearer_token_valid = hmac.compare_digest(token, helix_api_token)
+
+    # 🟩 FIXED: Allow either validation path to clear the gateway safely
+    if not (inbound_key_valid or bearer_token_valid):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                # Query the latest log entry for the specified worker agent
                 await cur.execute(
                     """
                     SELECT id, agent_name, log_level, message, metadata, timestamp
@@ -378,7 +397,6 @@ async def get_latest_agent_log(
                 row = await cur.fetchone()
 
         if row is None:
-            # Fallback gracefully with 0 records if the agent has never logged metrics before
             return {
                 "status": "empty",
                 "agent_name": agent,
@@ -386,15 +404,12 @@ async def get_latest_agent_log(
                 "message": "No historical logs available for this agent.",
             }
 
-        # 🧠 THE PARSING LAYER: Deduce the record count from historical messaging frameworks
+        # 🧠 THE PARSING LAYER
         records_found = 0
         raw_message = str(row.get("message", ""))
 
-        # Scenario A: Check if it's stored cleanly inside the metadata dictionary properties
         if isinstance(row.get("metadata"), dict) and "records_found" in row["metadata"]:
             records_found = int(row["metadata"]["records_found"])
-        # Scenario B: Extract via regular expressions if stored inside historical sweep string logs
-        # E.g., matches "... Processed rows: 10" or "... Processed 10 proactive interceptions"
         else:
             match_str = re.search(
                 r"(?:processed rows:|processed)\s*(\d+)", raw_message, re.IGNORECASE
