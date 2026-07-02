@@ -19,6 +19,31 @@ import uvicorn
 
 load_dotenv()
 
+# Strict Allowed Vendor Categories list for MoltSet Validation Mapping
+MOLTSET_ALLOWED_CATEGORIES = [
+    "Information Technology",
+    "Professional and Business Services",
+    "Finance and Banking",
+    "Education",
+    "Health and Pharmaceuticals",
+    "Manufacturing",
+    "Government and Public Administration",
+    "Retail",
+    "Food and Beverage",
+    "Creative Arts and Entertainment",
+    "Non-Profit and Social Services",
+    "Transportation and Logistics",
+    "Construction",
+    "Tourism and Hospitality",
+    "Energy",
+    "Marketing & Advertising",
+    "Telecommunications",
+    "Real Estate",
+    "Automotive",
+    "Media and Publishing",
+    "Agriculture",
+]
+
 
 def get_validated_database_url() -> str:
     """Return a validated, SSL-enforced DATABASE_URL or raise descriptively."""
@@ -31,6 +56,44 @@ def get_validated_database_url() -> str:
     if "?sslmode=require" not in url:
         url = url + "?sslmode=require"
     return url
+
+
+def run_deterministic_moltset_mapping(ai_client: Anthropic, industry_name: str) -> str:
+    """Uses a rigid, zero-creativity LLM node to resolve dynamic niches into vendor schemas."""
+
+    prompt = f"""You are a strict data normalization engine built for API infrastructure pipelines.
+    Map this specific business niche or industry name: "{industry_name}"
+    To exactly ONE parent category from this strictly authorized vendor list: {MOLTSET_ALLOWED_CATEGORIES}
+    
+    CRITICAL RULES:
+    - Output ONLY the exact text string of the matching category from the list.
+    - Do NOT include any punctuation, quotes, introduction, explanation, or conversational prose.
+    - Do NOT wrap the answer in Markdown formatting or backticks.
+    - If no clear match exists, map it to the closest logical operational bucket (Default: Professional and Business Services).
+    
+    Example Output: Finance and Banking"""
+    try:
+        message = ai_client.messages.create(
+            model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
+            max_tokens=50,
+            temperature=0.0,  # Strict mathematical focus matching automation rules
+            messages=[{"role": "user", "content": prompt}],
+        )
+        chosen_category = (
+            message.content[0]
+            .text.strip()
+            .replace('"', "")
+            .replace("'", "")
+            .replace("`", "")
+            .strip()
+        )
+        if chosen_category in MOLTSET_ALLOWED_CATEGORIES:
+            return chosen_category
+    except Exception as e:
+        print(
+            f"⚠️ [MOLTSET INTEGRATION MAPPING DROP] Internal classification failed: {e}"
+        )
+    return "Professional and Business Services"
 
 
 class LogIngestSchema(BaseModel):
@@ -49,12 +112,10 @@ class LogIngestSchema(BaseModel):
     message: str
     metadata: dict[str, Any] | None = None
 
-    # 🛡️ THE INTERCEPTOR LAYER: Cleans up the body before Pydantic checks fields
     @model_validator(mode="before")
     @classmethod
     def self_heal_legacy_payloads(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            # 1. Handle legacy "agent" to "agent_name" mapping if it ever shows up again
             if "agent" in data and "agent_name" not in data:
                 raw_agent = str(data.pop("agent")).lower()
                 if "vector" in raw_agent:
@@ -64,18 +125,15 @@ class LogIngestSchema(BaseModel):
                 else:
                     data["agent_name"] = raw_agent
 
-            # 2. 🎯 FIXES YOUR CURRENT ERROR: Inject a message if the caller didn't provide one
             if "message" not in data or not data["message"]:
                 event_name = data.get("event", "generic_background_telemetry")
                 data["message"] = f"Background pipeline activity: {event_name}"
 
-            # 3. Clean up the rest of the payload data into the metadata block
             if "metadata" not in data or data["metadata"] is None:
                 known_fields = {"agent_name", "log_level", "message"}
                 data["metadata"] = {
                     k: v for k, v in data.items() if k not in known_fields
                 }
-
         return data
 
 
@@ -131,16 +189,16 @@ CREATE TABLE IF NOT EXISTS inbound_blueprints (
     email                  TEXT         NOT NULL,
     created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
-
 CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_email ON inbound_blueprints (email);
 CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_created_at ON inbound_blueprints (created_at DESC);
 """
 
-
+# Upgraded to include strict vendor tracking arrays natively
 SCHEDULER_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS helix_brain_scheduler (
     industry_id SERIAL PRIMARY KEY,
     industry_name VARCHAR(100) UNIQUE NOT NULL,
+    moltset_category VARCHAR(100) DEFAULT 'Professional and Business Services',
     bottleneck_profile TEXT NOT NULL,
     pain_tokens TEXT[] NOT NULL,
     target_region VARCHAR(100) DEFAULT 'Texas',
@@ -151,13 +209,12 @@ CREATE TABLE IF NOT EXISTS helix_brain_scheduler (
 CREATE INDEX IF NOT EXISTS idx_hbs_last_targeted ON helix_brain_scheduler (last_targeted_at DESC);
 """
 
-
 SEED_SCHEDULER_SQL = """
-INSERT INTO helix_brain_scheduler (industry_name, bottleneck_profile, pain_tokens, target_region)
+INSERT INTO helix_brain_scheduler (industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region)
 VALUES
-('Home Services', 'Inbound emergency calls rolling to voicemail.', ARRAY['hvac', 'plumbing'], 'Texas'),
-('Accounting Firms', 'Manual client intake document tracking friction.', ARRAY['accounting', 'bookkeeping'], 'California'),
-('Medical Clinics', 'Open chair utilization inefficiencies.', ARRAY['dental', 'medical spa'], 'Florida')
+('Home Services', 'Professional and Business Services', 'Inbound emergency calls rolling to voicemail.', ARRAY['hvac', 'plumbing'], 'Texas'),
+('Accounting Firms', 'Professional and Business Services', 'Manual client intake document tracking friction.', ARRAY['accounting', 'bookkeeping'], 'California'),
+('Medical Clinics', 'Health and Pharmaceuticals', 'Open chair utilization inefficiencies.', ARRAY['dental', 'medical spa'], 'Florida')
 ON CONFLICT (industry_name) DO NOTHING;
 """
 
@@ -171,7 +228,6 @@ async def log_helix_state(
         "geo_lock": geo_lock,
         "buying_signal": buying_signal,
     }
-
     await cur.execute(
         """
         INSERT INTO agent_system_logs (agent_name, log_level, message, metadata)
@@ -193,31 +249,32 @@ async def ensure_inbound_blueprints_table() -> None:
 async def lifespan(app: FastAPI):
     database_url = get_validated_database_url()
 
-    # 🎯 SELF-HEALING ASYNC CONNECTION POOL CONFIGURATION
     app.state.db_pool = AsyncConnectionPool(
         conninfo=database_url,
         open=False,
-        # Forces the pool to test the socket before lending it to an API route
         check=AsyncConnectionPool.check_connection,
-        # Automatically drops and recreates idle connections older than 4.5 minutes
         max_idle=270.0,
     )
+
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+    app.state.ai_client = Anthropic(api_key=anthropic_key) if anthropic_key else None
+
     try:
         await app.state.db_pool.open(wait=True)
         await ensure_inbound_blueprints_table()
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(SCHEDULER_TABLE_SQL)
+                # Apply column patch if missing on active serverless connections safely
+                await cur.execute(
+                    "ALTER TABLE helix_brain_scheduler ADD COLUMN IF NOT EXISTS moltset_category VARCHAR(100) DEFAULT 'Professional and Business Services';"
+                )
                 await cur.execute(SEED_SCHEDULER_SQL)
             await conn.commit()
     except Exception as exc:
-        print(
-            "\n[helix] CLOUD CONNECTION FAILED — possible causes: wrong credentials, "
-            "DNS resolution failure, or network timeout. Full trace:\n"
-        )
+        print("\n[helix] CLOUD CONNECTION FAILED — Full trace:\n")
         traceback.print_exc()
-        print(f"\n[helix] Error detail: {exc}\n")
-        raise
+        raise exc
     try:
         yield
     finally:
@@ -236,8 +293,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     body = await request.body()
     print(f"\n[422 VALIDATION ERROR] Caught a bad payload!")
     print(f"Errors: {exc.errors()}")
-    print(f"Raw Body Received: {body.decode('utf-8', errors='ignore')}\n")
-
     return JSONResponse(
         status_code=422,
         content={"detail": exc.errors(), "body": body.decode("utf-8", errors="ignore")},
@@ -270,15 +325,6 @@ async def analyze_and_orchestrate_log(
                             """,
                             (industry_name,),
                         )
-                        print(
-                            "[orchestrator] vanguard scale sync: "
-                            f"raised priority for industry={industry_name}"
-                        )
-                    else:
-                        print(
-                            "[orchestrator] vanguard scale sync skipped: "
-                            "missing industry_name in metadata"
-                        )
 
                 has_infra_block = any(
                     token in normalized_message
@@ -295,16 +341,6 @@ async def analyze_and_orchestrate_log(
                             """,
                             (industry_name,),
                         )
-                        print(
-                            "[orchestrator] quarantine gate: "
-                            f"paused track and reduced priority for industry={industry_name}"
-                        )
-                    else:
-                        print(
-                            "[orchestrator] quarantine gate skipped: "
-                            "missing industry_name in metadata"
-                        )
-
             await conn.commit()
     except Exception as exc:
         print(f"[orchestrator] background log analysis failed: {exc}")
@@ -343,16 +379,11 @@ async def ingest_log(payload: LogIngestSchema):
                 payload.metadata,
             )
         )
-
         return {"status": "success", "logged_id": row[0]}
     except Exception as exc:
-        # 🟢 This will print the EXACT python/SQL error to your Render console logs!
         print(f"\n❌ [CRITICAL ENDPOINT FAILURE] /api/v1/logs crashed!")
         traceback.print_exc()
-
-        raise HTTPException(
-            status_code=500, detail=f"Failed to log event: {exc}"
-        ) from exc
+        raise HTTPException(status_code=500, detail=f"Failed to log event: {exc}")
 
 
 @app.get("/api/v1/logs/latest")
@@ -369,25 +400,14 @@ async def get_latest_agent_log(
         "helix",
     ],
     x_inbound_key: str | None = Header(default=None),
-    authorization: str | None = Header(
-        default=None
-    ),  # 🟩 ADDED: Accept Authorization header
+    authorization: str | None = Header(default=None),
 ):
-    """
-    🧠 PRE-FLIGHT TELEMETRY HUB
-    Pulls the single most recent chronological execution log for a specific AI worker
-    so orchestration layers like Nexus can compute strategic market yields.
-    """
     expected_key = os.getenv("INBOUND_API_KEY")
-
-    # Check if the x-inbound-key matches
     inbound_key_valid = bool(
         expected_key
         and x_inbound_key
         and hmac.compare_digest(x_inbound_key, expected_key)
     )
-
-    # 🟩 FIXED: Allow either validation path to clear the gateway safely
     if not inbound_key_valid:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -414,7 +434,6 @@ async def get_latest_agent_log(
                 "message": "No historical logs available for this agent.",
             }
 
-        # 🧠 THE PARSING LAYER
         records_found = 0
         raw_message = str(row.get("message", ""))
 
@@ -435,15 +454,10 @@ async def get_latest_agent_log(
             "records_found": records_found,
             "timestamp": row["timestamp"].isoformat(),
         }
-
     except Exception as exc:
-        print(
-            f"\n❌ [CRITICAL ENDPOINT FAILURE] /api/v1/logs/latest crashed for agent={agent}!"
-        )
-        traceback.print_exc()
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch latest agent metrics: {exc}"
-        ) from exc
+        )
 
 
 @app.post("/api/v1/ingest")
@@ -479,12 +493,9 @@ async def ingest_leads(
                         ),
                     )
             await conn.commit()
-
         return {"status": "success", "processed": len(leads)}
     except Exception as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to ingest leads: {exc}"
-        ) from exc
+        raise HTTPException(status_code=500, detail=f"Failed to ingest leads: {exc}")
 
 
 @app.post("/api/v1/inbound-blueprints")
@@ -498,26 +509,13 @@ async def inbound_blueprints(
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    print(
-        "[ALERT][PRIORITY=HIGH] Inbound blueprint received "
-        f"name={payload.name} company={payload.company_name} email={payload.email} "
-        f"annual_financial_bleed={payload.annual_financial_bleed}"
-    )
-
     try:
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
                     INSERT INTO inbound_blueprints (
-                        headcount,
-                        weekly_hours_wasted,
-                        annual_wasted_hours,
-                        annual_financial_bleed,
-                        friction_points,
-                        name,
-                        company_name,
-                        email
+                        headcount, weekly_hours_wasted, annual_wasted_hours, annual_financial_bleed, friction_points, name, company_name, email
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
                     """,
@@ -533,13 +531,11 @@ async def inbound_blueprints(
                     ),
                 )
             await conn.commit()
-
         return {"status": "success"}
     except Exception as exc:
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to ingest inbound blueprint: {exc}",
-        ) from exc
+            status_code=500, detail=f"Failed to ingest inbound blueprint: {exc}"
+        )
 
 
 @app.post("/api/v1/scheduler/rotate")
@@ -553,24 +549,29 @@ async def rotate_scheduler_target(
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    # 🟩 ON INGESTION: Run LLM category mapping prior to updating database
+    resolved_category = "Professional and Business Services"
+    if app.state.ai_client:
+        resolved_category = run_deterministic_moltset_mapping(
+            app.state.ai_client, payload.industry_name
+        )
+
     try:
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
-                # 🟢 Automatically uses the current target_region if payload's region is omitted or blank
                 await cur.execute(
                     """
                     UPDATE helix_brain_scheduler
                     SET target_region = COALESCE(NULLIF(%s, ''), target_region),
+                        moltset_category = %s,
                         last_targeted_at = NOW()
                     WHERE industry_name = %s
-                    RETURNING industry_id, industry_name, target_region, last_targeted_at;
+                    RETURNING industry_id, industry_name, target_region, last_targeted_at, moltset_category;
                     """,
-                    (payload.target_region, payload.industry_name),
+                    (payload.target_region, resolved_category, payload.industry_name),
                 )
                 updated = await cur.fetchone()
                 if updated is not None:
-                    # 🟩 ADDED: Write state telemetry entry directly to logs on parameter rotation
-                    # updated[1] = industry_name, updated[2] = target_region
                     await log_helix_state(
                         cur=cur,
                         strategic_mode=f"Target Cycle: {updated[1]}",
@@ -581,8 +582,7 @@ async def rotate_scheduler_target(
 
         if updated is None:
             raise HTTPException(
-                status_code=404,
-                detail=f"Industry '{payload.industry_name}' not found",
+                status_code=404, detail=f"Industry '{payload.industry_name}' not found"
             )
 
         return {
@@ -590,6 +590,7 @@ async def rotate_scheduler_target(
             "industry_id": updated[0],
             "industry_name": updated[1],
             "target_region": updated[2],
+            "moltset_category": updated[4],
             "last_targeted_at": (
                 updated[3].isoformat() if updated[3] is not None else None
             ),
@@ -598,9 +599,8 @@ async def rotate_scheduler_target(
         raise
     except Exception as exc:
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to rotate scheduler target: {exc}",
-        ) from exc
+            status_code=500, detail=f"Failed to rotate scheduler target: {exc}"
+        )
 
 
 @app.get("/api/v1/scheduler/current")
@@ -617,7 +617,7 @@ async def get_current_scheduler_target(
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute("""
-                    SELECT industry_id, industry_name, bottleneck_profile, pain_tokens, target_region, last_targeted_at, priority_score
+                    SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region, last_targeted_at, priority_score
                     FROM helix_brain_scheduler
                     WHERE is_active = TRUE
                     ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC
@@ -642,9 +642,8 @@ async def get_current_scheduler_target(
         raise
     except Exception as exc:
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch current scheduler target: {exc}",
-        ) from exc
+            status_code=500, detail=f"Failed to fetch current scheduler target: {exc}"
+        )
 
 
 @app.post("/api/v1/scheduler/expand-horizons")
@@ -657,7 +656,6 @@ async def expand_target_industries(
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Fetch what we already have so we don't generate duplicates
     async with app.state.db_pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("SELECT industry_name FROM helix_brain_scheduler;")
@@ -667,17 +665,15 @@ async def expand_target_industries(
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
     anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5")
 
-    if not anthropic_key:
+    if not anthropic_key or not app.state.ai_client:
         raise HTTPException(
             status_code=500, detail="Missing Anthropic Key for industry discovery"
         )
 
-    ai_client = Anthropic(api_key=anthropic_key)
-
     prompt = f"""You are a B2B market expansion strategist specializing in AI Automation Agents.
     Current targets already in database: {existing_industries}
 
-    Task: Identify exactly 3 new, highly-specific industry verticals or niches where AI agents can heavily solve an operational operational bottleneck (e.g., 'Boutique Law Firms', 'Property Management Companies', 'E-commerce Logistics').
+    Task: Identify exactly 3 new, highly-specific industry verticals or niches where AI agents can heavily solve an operational bottleneck.
     
     Rules:
     - Do not repeat or overlap with the current targets.
@@ -693,40 +689,43 @@ async def expand_target_industries(
     ]"""
 
     try:
-        message = ai_client.messages.create(
+        message = app.state.ai_client.messages.create(
             model=anthropic_model,
             max_tokens=1000,
             temperature=0.7,
             messages=[{"role": "user", "content": prompt}],
         )
 
-        # Simple string cleaning
         raw_json = message.content[0].text.strip()
         if raw_json.startswith("```"):
             raw_json = "\n".join(raw_json.splitlines()[1:-1]).strip()
 
         new_sectors = json.loads(raw_json)
 
-        # Inject the discovered sectors dynamically into the brain table
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
                 for sector in new_sectors:
+                    # 🟩 AUTOMATED ITERATION: Run mapping logic to ensure newly minted categories match schemas perfectly
+                    resolved_cat = run_deterministic_moltset_mapping(
+                        app.state.ai_client, sector["industry_name"]
+                    )
+
                     await cur.execute(
                         """
                         INSERT INTO helix_brain_scheduler (
-                            industry_name, bottleneck_profile, pain_tokens, target_region, priority_score
-                        ) VALUES (%s, %s, %s::text[], %s, 1) -- 🟢 ADDED ::text[] CASTING HERE
+                            industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region, priority_score
+                        ) VALUES (%s, %s, %s, %s::text[], %s, 1)
                         ON CONFLICT (industry_name) DO NOTHING;
                         """,
                         (
                             sector["industry_name"],
+                            resolved_cat,
                             sector["bottleneck_profile"],
-                            sector["pain_tokens"],  # Now safely mapped via the driver
+                            sector["pain_tokens"],
                             sector.get("target_region", "Texas"),
                         ),
                     )
 
-                # 🟩 ADDED: Log state context based on the newly discovered leading sector
                 if new_sectors:
                     await log_helix_state(
                         cur=cur,
@@ -735,18 +734,15 @@ async def expand_target_industries(
                         buying_signal=f"#{new_sectors[0]['pain_tokens'][0] if new_sectors[0]['pain_tokens'] else 'automation'}",
                     )
             await conn.commit()
-
         return {
             "status": "success",
             "discovered_and_added": [s["industry_name"] for s in new_sectors],
         }
     except Exception as e:
-        # 🟢 THIS WILL BLOW UP THE TERMINAL LOGS WITH THE EXACT TRACE AND LINE NUMBER
         print(
             f"\n❌ [CRITICAL ENDPOINT FAILURE] /api/v1/scheduler/expand-horizons crashed!"
         )
         traceback.print_exc()
-
         raise HTTPException(status_code=500, detail=f"Discovery failed: {e}")
 
 
@@ -761,26 +757,30 @@ async def add_scheduler_record(
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    resolved_category = "Professional and Business Services"
+    if app.state.ai_client:
+        resolved_category = run_deterministic_moltset_mapping(
+            app.state.ai_client, payload.industry_name
+        )
+
     try:
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
                     INSERT INTO helix_brain_scheduler (
-                        industry_name,
-                        bottleneck_profile,
-                        pain_tokens,
-                        target_region,
-                        priority_score
+                        industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region, priority_score
                     )
                     VALUES (%s, %s, %s, %s, %s)
                     ON CONFLICT (industry_name) DO UPDATE
                     SET bottleneck_profile = EXCLUDED.bottleneck_profile,
                         pain_tokens = EXCLUDED.pain_tokens,
+                        moltset_category = EXCLUDED.moltset_category,
                         target_region = EXCLUDED.target_region;
                     """,
                     (
                         payload.industry_name,
+                        resolved_category,
                         payload.bottleneck_profile,
                         payload.pain_tokens,
                         payload.target_region,
@@ -788,16 +788,11 @@ async def add_scheduler_record(
                     ),
                 )
             await conn.commit()
-
-        return {
-            "status": "success",
-            "industry_name": payload.industry_name,
-        }
+        return {"status": "success", "industry_name": payload.industry_name}
     except Exception as exc:
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to add scheduler record: {exc}",
-        ) from exc
+            status_code=500, detail=f"Failed to add scheduler record: {exc}"
+        )
 
 
 @app.get("/api/v1/stream")
@@ -807,7 +802,6 @@ async def stream_logs(
 ):
     async def log_publisher(agent_name: Optional[str] = None):
         last_seen_id = 0
-
         try:
             while True:
                 if await request.is_disconnected():
@@ -835,7 +829,6 @@ async def stream_logs(
                                 """,
                                 (last_seen_id,),
                             )
-
                         rows = await cur.fetchall()
 
                 if rows:
@@ -857,10 +850,7 @@ async def stream_logs(
     return StreamingResponse(
         log_publisher(agent_name=agent_name),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -878,15 +868,13 @@ async def get_unprocessed_leads(
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute("""
-                    SELECT id, email, first_name, last_name, company, title,
-                           website, industry, status, created_at
+                    SELECT id, email, first_name, last_name, company, title, website, industry, status, created_at
                     FROM cold_leads
-                    WHERE status = 'scraped'
+                    WHERE status = 'social_hook_captured' OR status = 'scraped'
                     ORDER BY created_at ASC
                     LIMIT 50;
                     """)
                 rows = await cur.fetchall()
-
         return [
             {
                 **row,
@@ -899,7 +887,7 @@ async def get_unprocessed_leads(
     except Exception as exc:
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch unprocessed leads: {exc}"
-        ) from exc
+        )
 
 
 @app.patch("/api/v1/leads/{lead_id}")
@@ -917,7 +905,6 @@ async def update_lead_status(
         and x_inbound_key
         and hmac.compare_digest(x_inbound_key, expected_key)
     )
-
     bearer_token_valid = False
     if helix_api_token and authorization:
         scheme, _, token = authorization.partition(" ")
@@ -945,16 +932,13 @@ async def update_lead_status(
 
         if updated is None:
             raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
-
-        print(f"[STATUS UPDATE] Lead {lead_id} transitioned to {payload.status}")
-
         return {"status": "success"}
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(
             status_code=500, detail=f"Failed to update lead status: {exc}"
-        ) from exc
+        )
 
 
 if __name__ == "__main__":
