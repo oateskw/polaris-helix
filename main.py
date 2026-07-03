@@ -299,6 +299,35 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
+# Add this endpoint in main.py to allow Nexus to read vendor health states dynamically
+@app.get("/api/v1/oracle/vendor-health")
+async def get_vendor_health(x_inbound_key: str | None = Header(default=None)):
+    expected_key = os.getenv("INBOUND_API_KEY")
+    if expected_key and not (
+        x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                # Updated table name to follow helix_ prefixing rules
+                await cur.execute(
+                    "SELECT vendor_name, credits_remaining, is_circuit_broken FROM helix_infrastructure_oracle_ledger;"
+                )
+                rows = await cur.fetchall()
+        return {
+            row["vendor_name"]: {
+                "credits": float(row["credits_remaining"]),
+                "isolated": row["is_circuit_broken"],
+            }
+            for row in rows
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Oracle read failure: {exc}")
+
+
+# Upgrade your existing background worker to act as an active infrastructure healer
 async def analyze_and_orchestrate_log(
     agent_name: str,
     log_level: str,
@@ -312,17 +341,56 @@ async def analyze_and_orchestrate_log(
     try:
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
+
+                # --- NEW FEATURE: PHANTOMBUSTER CREDIT INTERCEPTION ---
+                has_pb_credit_error = any(
+                    token in normalized_message
+                    for token in (
+                        "phantombuster",
+                        "credit limit",
+                        "payment required",
+                        "exhausted",
+                        "api_key_expired",
+                    )
+                )
+
+                if log_level == "ERROR" and has_pb_credit_error:
+                    # 1. Trip the specific vendor circuit breaker in the helix_ prefixed ledger table
+                    await cur.execute("""
+                        UPDATE helix_infrastructure_oracle_ledger
+                        SET is_circuit_broken = TRUE,
+                            credits_remaining = 0,
+                            last_updated_at = NOW()
+                        WHERE vendor_name = 'PhantomBusters';
+                        """)
+                    print(
+                        "🚨 [ORACLE CIRCUIT BREAKER] PhantomBusters isolated due to credit exhaustion."
+                    )
+
+                    # 2. Automatically de-activate current scheduling tasks dependent on this tool
+                    if industry_name:
+                        await cur.execute(
+                            """
+                            UPDATE helix_brain_scheduler
+                            SET is_active = FALSE,
+                                priority_score = GREATEST(priority_score - 2, 1)
+                            WHERE industry_name = %s;
+                            """,
+                            (industry_name,),
+                        )
+
+                    # 3. Securely forward an emergency alert payload directly to Telegram channels
+                    # (Assuming an internal helper method or API client maps to your Telegram Bot infrastructure)
+                    # await send_telegram_alert("⚠️ *CRITICAL:* PhantomBuster out of credits! Beacon isolated safely.")
+
+                # --- PRE-EXISTING VANGUARD ORCHESTRATION ---
                 if agent_name == "vanguard" and metadata_dict.get("event") in {
                     "campaign_drop",
                     "link_click",
                 }:
                     if industry_name:
                         await cur.execute(
-                            """
-                            UPDATE helix_brain_scheduler
-                            SET priority_score = priority_score + 1
-                            WHERE industry_name = %s AND is_active = TRUE;
-                            """,
+                            "UPDATE helix_brain_scheduler SET priority_score = priority_score + 1 WHERE industry_name = %s AND is_active = TRUE;",
                             (industry_name,),
                         )
 
@@ -333,12 +401,7 @@ async def analyze_and_orchestrate_log(
                 if log_level == "ERROR" and has_infra_block:
                     if industry_name:
                         await cur.execute(
-                            """
-                            UPDATE helix_brain_scheduler
-                            SET priority_score = GREATEST(priority_score - 1, 1),
-                                is_active = FALSE
-                            WHERE industry_name = %s;
-                            """,
+                            "UPDATE helix_brain_scheduler SET priority_score = GREATEST(priority_score - 1, 1), is_active = FALSE WHERE industry_name = %s;",
                             (industry_name,),
                         )
             await conn.commit()
