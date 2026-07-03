@@ -316,10 +316,11 @@ async def evaluate_ecosystem_demand_and_signal_nexus() -> None:
                 f"🧠 [HELIX ORACLE] Demand threshold crossed (Ready: {ready_count}, Abandoned: {abandoned_count}). Awakening Nexus!"
             )
 
+            # 🧠 Updated key to match the new biological naming convention
             nexus_webhook_url = os.getenv(
-                "NEXUS_WORKER_URL", "http://localhost:8002/api/v1/nexus/awaken"
+                "NEXUS_NERVOUS_IMPULSE_URL", "https://polaris-nexus.onrender.com/"
             )
-            headers = {"X-Nexus-Auth-Token": os.getenv("NEXUS_AUTH_TOKEN", "")}
+            headers = {"X-Nexus-Auth-Token": os.getenv("INBOUND_API_KEY", "")}
             payload = {
                 "trigger_reason": "volumetric_threshold_satisfied",
                 "batch_size": ready_count,
@@ -328,7 +329,11 @@ async def evaluate_ecosystem_demand_and_signal_nexus() -> None:
 
             # Fire-and-forget impulse to Nexus to keep Helix API completely non-blocking
             asyncio.create_task(
-                async_http_post_proxy(nexus_webhook_url, headers, payload)
+                async_http_post_proxy(
+                    nexus_webhook_url.rstrip("/") + "/api/v1/nexus/awaken",
+                    headers,
+                    payload,
+                )
             )
 
     except Exception as exc:
