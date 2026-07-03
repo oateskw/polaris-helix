@@ -4,6 +4,7 @@ import traceback
 import asyncio
 import json
 import hmac
+import requests
 from anthropic import Anthropic
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional, List
@@ -288,6 +289,59 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 
+# Expanded helper method inside main.py
+async def evaluate_ecosystem_demand_and_signal_nexus() -> None:
+    """🧠 THE BRAIN'S INTENT TRACKER
+    Queries the reservoir state to check if processing thresholds are met,
+    then dynamically fires a nervous impulse to Nexus out-of-band.
+    """
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                # 1. Query the live staging state to check for addressable fuel
+                cur.execute(
+                    "SELECT COUNT(*) FROM cold_leads WHERE status = 'ready_to_send';"
+                )
+                ready_count = (await cur.fetchone())[0]
+
+                # 2. Check for immediate abandonment rescue sessions
+                cur.execute(
+                    "SELECT COUNT(*) FROM cold_leads WHERE status = 'pending' AND processed_at < NOW() - INTERVAL '15 minutes';"
+                )
+                abandoned_count = (await cur.fetchone())[0]
+
+        # 3. Dynamic Threshold Evaluation Gate
+        if ready_count >= 25 or abandoned_count > 0:
+            print(
+                f"🧠 [HELIX ORACLE] Demand threshold crossed (Ready: {ready_count}, Abandoned: {abandoned_count}). Awakening Nexus!"
+            )
+
+            nexus_webhook_url = os.getenv(
+                "NEXUS_WORKER_URL", "http://localhost:8002/api/v1/nexus/awaken"
+            )
+            headers = {"X-Nexus-Auth-Token": os.getenv("NEXUS_AUTH_TOKEN", "")}
+            payload = {
+                "trigger_reason": "volumetric_threshold_satisfied",
+                "batch_size": ready_count,
+                "rescue_mode": abandoned_count > 0,
+            }
+
+            # Fire-and-forget impulse to Nexus to keep Helix API completely non-blocking
+            asyncio.create_task(
+                async_http_post_proxy(nexus_webhook_url, headers, payload)
+            )
+
+    except Exception as exc:
+        print(f"⚠️ Helix intent tracker failure: {exc}")
+
+
+async def async_http_post_proxy(url: str, headers: dict, json_data: dict):
+    try:
+        requests.post(url, headers=headers, json=json_data, timeout=5)
+    except Exception:
+        pass  # Soft failure boundary preserved to guarantee platform uptime
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     body = await request.body()
@@ -342,7 +396,7 @@ async def analyze_and_orchestrate_log(
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
 
-                # --- NEW FEATURE: PHANTOMBUSTER CREDIT INTERCEPTION ---
+                # --- PHANTOMBUSTER CREDIT INTERCEPTION ---
                 has_pb_credit_error = any(
                     token in normalized_message
                     for token in (
@@ -355,33 +409,41 @@ async def analyze_and_orchestrate_log(
                 )
 
                 if log_level == "ERROR" and has_pb_credit_error:
-                    # 1. Trip the specific vendor circuit breaker in the helix_ prefixed ledger table
                     await cur.execute("""
                         UPDATE helix_infrastructure_oracle_ledger
-                        SET is_circuit_broken = TRUE,
-                            credits_remaining = 0,
-                            last_updated_at = NOW()
+                        SET is_circuit_broken = TRUE, credits_remaining = 0, last_updated_at = NOW()
                         WHERE vendor_name = 'PhantomBusters';
                         """)
                     print(
                         "🚨 [ORACLE CIRCUIT BREAKER] PhantomBusters isolated due to credit exhaustion."
                     )
 
-                    # 2. Automatically de-activate current scheduling tasks dependent on this tool
                     if industry_name:
                         await cur.execute(
-                            """
-                            UPDATE helix_brain_scheduler
-                            SET is_active = FALSE,
-                                priority_score = GREATEST(priority_score - 2, 1)
-                            WHERE industry_name = %s;
-                            """,
+                            "UPDATE helix_brain_scheduler SET is_active = FALSE, priority_score = GREATEST(priority_score - 2, 1) WHERE industry_name = %s;",
                             (industry_name,),
                         )
 
-                    # 3. Securely forward an emergency alert payload directly to Telegram channels
-                    # (Assuming an internal helper method or API client maps to your Telegram Bot infrastructure)
-                    # await send_telegram_alert("⚠️ *CRITICAL:* PhantomBuster out of credits! Beacon isolated safely.")
+                # --- NEW: MYEMAILVERIFIER CREDIT INTERCEPTION ---
+                has_mev_credit_error = any(
+                    token in normalized_message
+                    for token in (
+                        "myemailverifier",
+                        "insufficient credits",
+                        "out of tokens",
+                        "token balance low",
+                    )
+                )
+
+                if log_level == "ERROR" and has_mev_credit_error:
+                    await cur.execute("""
+                        UPDATE helix_infrastructure_oracle_ledger
+                        SET is_circuit_broken = TRUE, credits_remaining = 0, last_updated_at = NOW()
+                        WHERE vendor_name = 'MyEmailVerifier';
+                        """)
+                    print(
+                        "🚨 [ORACLE CIRCUIT BREAKER] MyEmailVerifier isolated! Outbound email gates closed."
+                    )
 
                 # --- PRE-EXISTING VANGUARD ORCHESTRATION ---
                 if agent_name == "vanguard" and metadata_dict.get("event") in {
@@ -434,6 +496,7 @@ async def ingest_log(payload: LogIngestSchema):
                 row = await cur.fetchone()
             await conn.commit()
 
+        # Run background analysis for errors or campaign updates
         asyncio.create_task(
             analyze_and_orchestrate_log(
                 payload.agent_name,
@@ -442,6 +505,10 @@ async def ingest_log(payload: LogIngestSchema):
                 payload.metadata,
             )
         )
+
+        # --- NEW: Trigger the automated pre-flight intent tracker ---
+        asyncio.create_task(evaluate_ecosystem_demand_and_signal_nexus())
+
         return {"status": "success", "logged_id": row[0]}
     except Exception as exc:
         print(f"\n❌ [CRITICAL ENDPOINT FAILURE] /api/v1/logs crashed!")
