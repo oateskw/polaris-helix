@@ -386,7 +386,7 @@ async def get_vendor_health(x_inbound_key: str | None = Header(default=None)):
         raise HTTPException(status_code=500, detail=f"Oracle read failure: {exc}")
 
 
-# Upgrade your existing background worker to act as an active infrastructure healer
+# Proactive Burn Rate & Credit Tracking Engine inside main.py
 async def analyze_and_orchestrate_log(
     agent_name: str,
     log_level: str,
@@ -401,7 +401,27 @@ async def analyze_and_orchestrate_log(
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
 
-                # --- PHANTOMBUSTER CREDIT INTERCEPTION ---
+                # ─── 1. PROACTIVE TRACKING: DEDUCT ON SUCCESSFUL RUNS ───
+                if log_level == "INFO" and agent_name == "nexus":
+                    # When Nexus reports a successful run, deduct the standard PhantomBuster execution cost
+                    # Let's assume a standard profile scrape run burns roughly 10 minutes of execution time
+                    if "execution status: success" in normalized_message:
+                        await cur.execute("""
+                            UPDATE helix_infrastructure_oracle_ledger
+                            SET credits_remaining = GREATEST(credits_remaining - 10.00, 0),
+                                is_circuit_broken = CASE WHEN credits_remaining - 10.00 <= 0 THEN TRUE ELSE is_circuit_broken END,
+                                last_updated_at = NOW()
+                            WHERE vendor_name = 'PhantomBusters'
+                            RETURNING credits_remaining, is_circuit_broken;
+                            """)
+                        ledger_check = await cur.fetchone()
+                        if ledger_check and ledger_check[1]:
+                            print(
+                                "🚨 [PROACTIVE HEALER] PhantomBuster calculated tokens dropped to 0. Circuit breaker automatically closed!"
+                            )
+                            # Optional: trigger_telegram_alert("⚠️ *Oracle Warning:* Calculated PhantomBuster minutes exhausted. Pipeline isolated preemptively.")
+
+                # ─── 2. REACTIVE TRACKING: FALLBACK ERROR INTERCEPTION ───
                 has_pb_credit_error = any(
                     token in normalized_message
                     for token in (
@@ -416,7 +436,9 @@ async def analyze_and_orchestrate_log(
                 if log_level == "ERROR" and has_pb_credit_error:
                     await cur.execute("""
                         UPDATE helix_infrastructure_oracle_ledger
-                        SET is_circuit_broken = TRUE, credits_remaining = 0, last_updated_at = NOW()
+                        SET is_circuit_broken = TRUE,
+                            credits_remaining = 0,
+                            last_updated_at = NOW()
                         WHERE vendor_name = 'PhantomBusters';
                         """)
                     print(
@@ -429,7 +451,7 @@ async def analyze_and_orchestrate_log(
                             (industry_name,),
                         )
 
-                # --- NEW: MYEMAILVERIFIER CREDIT INTERCEPTION ---
+                # --- MYEMAILVERIFIER CREDIT INTERCEPTION ---
                 has_mev_credit_error = any(
                     token in normalized_message
                     for token in (
