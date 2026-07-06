@@ -238,6 +238,215 @@ async def ensure_inbound_blueprints_table() -> None:
         await conn.commit()
 
 
+# ─── ⏰ GLOBAL SCHEDULING MATRIX FOR PERPETUAL AWARENESS ───
+DAILY_EXECUTION_ROUTERS = {
+    0: ["harvester", "nexus", "beacon", "listener"],  # 📅 MONDAY
+    1: ["listener", "vanguard"],  # 📅 TUESDAY
+    2: ["harvester", "nexus", "beacon", "listener"],  # 📅 WEDNESDAY
+    3: ["listener", "vanguard"],  # 📅 THURSDAY
+    4: ["listener", "vanguard"],  # 📅 FRIDAY
+    5: [],  # 🏖️ SATURDAY
+    6: [],  # 🏖️ SUNDAY
+}
+
+
+async def perpetual_awareness_loop():
+    """🧠 THE UNBROKEN HEARTBEAT (WITH CIRCUIT BREAKER AWARENESS)
+    Monitors the calendar out-of-band and pushes sync requests down the mesh
+    only if downstream vendor infrastructure is verified as healthy.
+    """
+    print(
+        "🚀 [PERPETUAL BRAIN ENGINE] Heartbeat loop active and watching the timeline..."
+    )
+
+    last_executed_date = None
+    target_hour = 8  # ⏰ 8:00 AM Execution Lock
+
+    while True:
+        try:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            current_date_str = now.strftime("%Y-%m-%d")
+            current_weekday = now.weekday()
+
+            if now.hour == target_hour and current_date_str != last_executed_date:
+                print(f"\n☀️ [HEARTBEAT AWAKEN] Executing cycle for {current_date_str}")
+
+                active_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
+                if not active_agents_list:
+                    last_executed_date = current_date_str
+                    await asyncio.sleep(60)
+                    continue
+
+                # ─── 🛡️ CIRCUIT BREAKER PRE-FLIGHT CHECK ───
+                # Fetch dynamic infrastructure isolation states straight from the internal ledger
+                vendor_isolation_matrix = {}
+                async with app.state.db_pool.connection() as conn:
+                    async with conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute(
+                            "SELECT vendor_name, is_circuit_broken FROM helix_infrastructure_oracle_ledger;"
+                        )
+                        rows = await cur.fetchall()
+                        for row in rows:
+                            vendor_isolation_matrix[row["vendor_name"]] = row[
+                                "is_circuit_broken"
+                            ]
+
+                is_pb_isolated = vendor_isolation_matrix.get("PhantomBusters", False)
+                is_mev_isolated = vendor_isolation_matrix.get("MyEmailVerifier", False)
+
+                async with app.state.db_pool.connection() as conn:
+                    async with conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute("""
+                            SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                            FROM helix_brain_scheduler
+                            WHERE is_active = TRUE
+                            ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC
+                            LIMIT 1;
+                        """)
+                        active_strategy = await cur.fetchone()
+
+                        if active_strategy:
+                            await cur.execute(
+                                "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
+                                (active_strategy["industry_id"],),
+                            )
+                    await conn.commit()
+
+                if active_strategy:
+                    master_token = os.getenv("HELIX_AUTH_TOKEN", "")
+
+                    # 🚀 HARVESTER EXECUTION STEP
+                    if "harvester" in active_agents_list:
+                        harvester_endpoint = os.getenv(
+                            "HARVESTER_API_URL",
+                            "https://polaris-vanguard-harvester-udf7.onrender.com",
+                        ).rstrip("/")
+                        asyncio.create_task(
+                            async_http_post_proxy(
+                                f"{harvester_endpoint}/api/v1/harvester/execute",
+                                {
+                                    "X-Harvester-Auth-Token": master_token,
+                                    "Content-Type": "application/json",
+                                },
+                                {
+                                    "industry_id": active_strategy["industry_id"],
+                                    "industry_name": active_strategy["industry_name"],
+                                    "moltset_category": active_strategy[
+                                        "moltset_category"
+                                    ],
+                                    "target_region": active_strategy["target_region"],
+                                    "bottleneck_profile": active_strategy[
+                                        "bottleneck_profile"
+                                    ],
+                                },
+                            )
+                        )
+
+                    # 🚀 NEXUS EXECUTION STEP (Respects Anthropic/Circuit Breaker tracking internally)
+                    if "nexus" in active_agents_list:
+                        nexus_endpoint = os.getenv(
+                            "NEXUS_NERVOUS_IMPULSE_URL",
+                            "https://polaris-nexus.onrender.com",
+                        ).rstrip("/")
+                        asyncio.create_task(
+                            async_http_post_proxy(
+                                f"{nexus_endpoint}/api/v1/nexus/awaken",
+                                {
+                                    "X-Nexus-Auth-Token": master_token,
+                                    "Content-Type": "application/json",
+                                },
+                                {
+                                    "trigger_reason": "perpetual_awareness_heartbeat",
+                                    "batch_size": 25,
+                                    "rescue_mode": False,
+                                    "industry_id": active_strategy["industry_id"],
+                                    "industry_name": active_strategy["industry_name"],
+                                    "target_region": active_strategy["target_region"],
+                                    "bottleneck_profile": active_strategy[
+                                        "bottleneck_profile"
+                                    ],
+                                    "pain_tokens": active_strategy["pain_tokens"],
+                                },
+                            )
+                        )
+
+                    # 🚀 BEACON AGENT INTERCEPTION
+                    if "beacon" in active_agents_list:
+                        if is_pb_isolated:
+                            print(
+                                "🚨 [ORACLE INTERCEPTION] PhantomBuster circuit broken! Skipping Beacon Agent run."
+                            )
+                        else:
+                            beacon_endpoint = os.getenv(
+                                "BEACON_API_URL",
+                                "https://polaris-beacon-agent.onrender.com",
+                            ).rstrip("/")
+                            asyncio.create_task(
+                                async_http_post_proxy(
+                                    f"{beacon_endpoint}/api/v1/beacon/execute",
+                                    {
+                                        "X-Beacon-Auth-Token": master_token,
+                                        "Content-Type": "application/json",
+                                    },
+                                    {
+                                        "industry_id": active_strategy["industry_id"],
+                                        "industry_name": active_strategy[
+                                            "industry_name"
+                                        ],
+                                        "target_region": active_strategy[
+                                            "target_region"
+                                        ],
+                                        "bottleneck_profile": active_strategy[
+                                            "bottleneck_profile"
+                                        ],
+                                    },
+                                )
+                            )
+
+                    # 🚀 BEACON COMMENT LISTENER STEP
+                    if "listener" in active_agents_list:
+                        listener_endpoint = os.getenv(
+                            "LISTENER_API_URL",
+                            "https://polaris-beacon-listener.onrender.com",
+                        ).rstrip("/")
+                        asyncio.create_task(
+                            async_http_post_proxy(
+                                f"{listener_endpoint}/api/v1/listener/sweep",
+                                {"X-Listener-Auth-Token": master_token},
+                                {},
+                            )
+                        )
+
+                    # 🚀 VANGUARD OUTBOUND DISPATCH STEP
+                    if "vanguard" in active_agents_list:
+                        if is_mev_isolated:
+                            print(
+                                "🚨 [ORACLE INTERCEPTION] MyEmailVerifier circuit broken! Skipping Vanguard sweep."
+                            )
+                        else:
+                            vanguard_endpoint = os.getenv(
+                                "VANGUARD_API_URL",
+                                "https://polaris-vanguard-core.onrender.com",
+                            ).rstrip("/")
+                            asyncio.create_task(
+                                async_http_post_proxy(
+                                    f"{vanguard_endpoint}/api/v1/dispatch/sweep",
+                                    {"X-Vanguard-Auth-Token": master_token},
+                                    {},
+                                )
+                            )
+
+                last_executed_date = current_date_str
+                print(
+                    f"✅ [HEARTBEAT COMPLETE] Cycle completed seamlessly for date: {last_executed_date}\n"
+                )
+
+        except Exception as loop_crash:
+            print(f"⚠️ Perpetual thread anomaly bypassed: {loop_crash}")
+
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database_url = get_validated_database_url()
@@ -261,6 +470,10 @@ async def lifespan(app: FastAPI):
                 )
                 await cur.execute(SEED_SCHEDULER_SQL)
             await conn.commit()
+
+        # Engage the perpetual thread immediately out-of-band upon server start
+        asyncio.create_task(perpetual_awareness_loop())
+
     except Exception as exc:
         print("\n[helix] CLOUD CONNECTION FAILED — Full trace:\n")
         traceback.print_exc()
