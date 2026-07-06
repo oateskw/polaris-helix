@@ -11,6 +11,9 @@
 		},
 		{
 			"path": "../polaris-vector"
+		},
+		{
+			"path": "../polaris_website"
 		}
 	]
 }

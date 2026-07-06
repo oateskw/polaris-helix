@@ -157,6 +157,8 @@ class BlueprintInboundModel(BaseModel):
     name: str
     company_name: str
     email: str
+    status: Optional[str] = "raw_calculation_captured"
+    industry_name: Optional[str] = "Unassigned"
 
 
 class SchedulerTargetUpdateModel(BaseModel):
@@ -172,21 +174,24 @@ class SchedulerRecordIngestModel(BaseModel):
     priority_score: int = 1
 
 
-INBOUND_BLUEPRINTS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS inbound_blueprints (
-    id                     BIGSERIAL    PRIMARY KEY,
-    headcount              INTEGER      NOT NULL,
-    weekly_hours_wasted    INTEGER      NOT NULL,
-    annual_wasted_hours    INTEGER      NOT NULL,
+HELIX_INBOUND_BLUEPRINTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS helix_inbound_blueprints (
+    id                     BIGSERIAL        PRIMARY KEY,
+    headcount              INTEGER          NOT NULL,
+    weekly_hours_wasted    INTEGER          NOT NULL,
+    annual_wasted_hours    INTEGER          NOT NULL,
     annual_financial_bleed DOUBLE PRECISION NOT NULL,
-    friction_points        JSONB        NOT NULL,
-    name                   TEXT         NOT NULL,
-    company_name           TEXT         NOT NULL,
-    email                  TEXT         NOT NULL,
-    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    friction_points        JSONB            NOT NULL,
+    name                   TEXT             NOT NULL,
+    company_name           TEXT             NOT NULL,
+    email                  TEXT             NOT NULL,
+    status                 VARCHAR(50)      NOT NULL DEFAULT 'raw_calculation_captured',
+    industry_name          VARCHAR(100)     DEFAULT 'Unassigned',
+    created_at             TIMESTAMPTZ      NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_email ON inbound_blueprints (email);
-CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_created_at ON inbound_blueprints (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_helix_inbound_blueprints_email ON helix_inbound_blueprints (email);
+CREATE INDEX IF NOT EXISTS idx_helix_inbound_blueprints_status ON helix_inbound_blueprints (status);
+CREATE INDEX IF NOT EXISTS idx_helix_inbound_blueprints_created_at ON helix_inbound_blueprints (created_at DESC);
 """
 
 SCHEDULER_TABLE_SQL = """
@@ -235,7 +240,9 @@ async def log_helix_state(
 async def ensure_inbound_blueprints_table() -> None:
     async with app.state.db_pool.connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(INBOUND_BLUEPRINTS_TABLE_SQL)
+            await cur.execute(
+                HELIX_INBOUND_BLUEPRINTS_TABLE_SQL
+            )  # <-- Updated Variable Name
         await conn.commit()
 
 
@@ -948,10 +955,12 @@ async def inbound_blueprints(
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
-                    INSERT INTO inbound_blueprints (
-                        headcount, weekly_hours_wasted, annual_wasted_hours, annual_financial_bleed, friction_points, name, company_name, email
+                    INSERT INTO helix_inbound_blueprints (
+                        headcount, weekly_hours_wasted, annual_wasted_hours, 
+                        annual_financial_bleed, friction_points, name, 
+                        company_name, email, status, industry_name
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
                     """,
                     (
                         payload.headcount,
@@ -962,6 +971,8 @@ async def inbound_blueprints(
                         payload.name,
                         payload.company_name,
                         payload.email,
+                        payload.status,
+                        payload.industry_name,
                     ),
                 )
             await conn.commit()
