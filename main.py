@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional, List
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request, Header
+from fastapi import FastAPI, HTTPException, Query, Request, Header, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, model_validator
 from psycopg.rows import dict_row
@@ -20,7 +20,6 @@ import uvicorn
 
 load_dotenv()
 
-# Strict Allowed Vendor Categories list for MoltSet Validation Mapping
 MOLTSET_ALLOWED_CATEGORIES = [
     "Information Technology",
     "Professional and Business Services",
@@ -47,7 +46,6 @@ MOLTSET_ALLOWED_CATEGORIES = [
 
 
 def get_validated_database_url() -> str:
-    """Return a validated, SSL-enforced DATABASE_URL or raise descriptively."""
     url = os.getenv("DATABASE_URL", "")
     if not url or not url.startswith("postgresql://"):
         raise ValueError(
@@ -60,8 +58,6 @@ def get_validated_database_url() -> str:
 
 
 def run_deterministic_moltset_mapping(ai_client: Anthropic, industry_name: str) -> str:
-    """Uses a rigid, zero-creativity LLM node to resolve dynamic niches into vendor schemas."""
-
     prompt = f"""You are a strict data normalization engine built for API infrastructure pipelines.
     Map this specific business niche or industry name: "{industry_name}"
     To exactly ONE parent category from this strictly authorized vendor list: {MOLTSET_ALLOWED_CATEGORIES}
@@ -77,7 +73,7 @@ def run_deterministic_moltset_mapping(ai_client: Anthropic, industry_name: str) 
         message = ai_client.messages.create(
             model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
             max_tokens=50,
-            temperature=0.0,  # Strict mathematical focus matching automation rules
+            temperature=0.0,
             messages=[{"role": "user", "content": prompt}],
         )
         chosen_category = (
@@ -125,11 +121,9 @@ class LogIngestSchema(BaseModel):
                     data["agent_name"] = "nexus"
                 else:
                     data["agent_name"] = raw_agent
-
             if "message" not in data or not data["message"]:
                 event_name = data.get("event", "generic_background_telemetry")
                 data["message"] = f"Background pipeline activity: {event_name}"
-
             if "metadata" not in data or data["metadata"] is None:
                 known_fields = {"agent_name", "log_level", "message"}
                 data["metadata"] = {
@@ -194,7 +188,6 @@ CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_email ON inbound_blueprints (e
 CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_created_at ON inbound_blueprints (created_at DESC);
 """
 
-# Upgraded to include strict vendor tracking arrays natively
 SCHEDULER_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS helix_brain_scheduler (
     industry_id SERIAL PRIMARY KEY,
@@ -223,7 +216,6 @@ ON CONFLICT (industry_name) DO NOTHING;
 async def log_helix_state(
     cur, strategic_mode: str, geo_lock: str, buying_signal: str
 ) -> None:
-    """📡 HELIX SYSTEM STATE LOG TRANSMITTER"""
     metadata_payload = {
         "strategic_mode": strategic_mode,
         "geo_lock": geo_lock,
@@ -249,14 +241,12 @@ async def ensure_inbound_blueprints_table() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database_url = get_validated_database_url()
-
     app.state.db_pool = AsyncConnectionPool(
         conninfo=database_url,
         open=False,
         check=AsyncConnectionPool.check_connection,
         max_idle=270.0,
     )
-
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
     app.state.ai_client = Anthropic(api_key=anthropic_key) if anthropic_key else None
 
@@ -266,7 +256,6 @@ async def lifespan(app: FastAPI):
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(SCHEDULER_TABLE_SQL)
-                # Apply column patch if missing on active serverless connections safely
                 await cur.execute(
                     "ALTER TABLE helix_brain_scheduler ADD COLUMN IF NOT EXISTS moltset_category VARCHAR(100) DEFAULT 'Professional and Business Services';"
                 )
@@ -284,67 +273,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Helix Log Intake API", lifespan=lifespan)
 
-
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 
-# Expanded helper method inside main.py
-async def evaluate_ecosystem_demand_and_signal_nexus() -> None:
-    """🧠 THE BRAIN'S INTENT TRACKER
-    Queries the reservoir state to check if processing thresholds are met,
-    then dynamically fires a nervous impulse to Nexus out-of-band.
-    """
-    try:
-        async with app.state.db_pool.connection() as conn:
-            async with conn.cursor() as cur:
-                # 1. Query the live staging state to check for addressable fuel
-                cur.execute(
-                    "SELECT COUNT(*) FROM cold_leads WHERE status = 'ready_to_send';"
-                )
-                ready_count = (await cur.fetchone())[0]
-
-                # 2. Check for immediate abandonment rescue sessions
-                cur.execute(
-                    "SELECT COUNT(*) FROM cold_leads WHERE status = 'pending' AND processed_at < NOW() - INTERVAL '15 minutes';"
-                )
-                abandoned_count = (await cur.fetchone())[0]
-
-        # 3. Dynamic Threshold Evaluation Gate
-        if ready_count >= 25 or abandoned_count > 0:
-            print(
-                f"🧠 [HELIX ORACLE] Demand threshold crossed (Ready: {ready_count}, Abandoned: {abandoned_count}). Awakening Nexus!"
-            )
-
-            # 🧠 Updated key to match the new biological naming convention
-            nexus_webhook_url = os.getenv(
-                "NEXUS_NERVOUS_IMPULSE_URL", "https://polaris-nexus.onrender.com/"
-            )
-            headers = {"X-Nexus-Auth-Token": os.getenv("INBOUND_API_KEY", "")}
-            payload = {
-                "trigger_reason": "volumetric_threshold_satisfied",
-                "batch_size": ready_count,
-                "rescue_mode": abandoned_count > 0,
-            }
-
-            # Fire-and-forget impulse to Nexus to keep Helix API completely non-blocking
-            asyncio.create_task(
-                async_http_post_proxy(
-                    nexus_webhook_url.rstrip("/") + "/api/v1/nexus/awaken",
-                    headers,
-                    payload,
-                )
-            )
-
-    except Exception as exc:
-        print(f"⚠️ Helix intent tracker failure: {exc}")
-
-
 async def async_http_post_proxy(url: str, headers: dict, json_data: dict):
     try:
-        requests.post(url, headers=headers, json=json_data, timeout=5)
-    except Exception:
-        pass  # Soft failure boundary preserved to guarantee platform uptime
+        # Wrap requests into an execution pool to cleanly dispatch non-blocking signals
+        requests.post(url, headers=headers, json=json_data, timeout=10)
+    except Exception as e:
+        print(f"⚠️ Proxy communication delay to edge endpoint: {url} | Details: {e}")
 
 
 @app.exception_handler(RequestValidationError)
@@ -358,7 +296,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
-# Add this endpoint in main.py to allow Nexus to read vendor health states dynamically
 @app.get("/api/v1/oracle/vendor-health")
 async def get_vendor_health(x_inbound_key: str | None = Header(default=None)):
     expected_key = os.getenv("INBOUND_API_KEY")
@@ -370,7 +307,6 @@ async def get_vendor_health(x_inbound_key: str | None = Header(default=None)):
     try:
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                # Updated table name to follow helix_ prefixing rules
                 await cur.execute(
                     "SELECT vendor_name, credits_remaining, is_circuit_broken FROM helix_infrastructure_oracle_ledger;"
                 )
@@ -386,12 +322,8 @@ async def get_vendor_health(x_inbound_key: str | None = Header(default=None)):
         raise HTTPException(status_code=500, detail=f"Oracle read failure: {exc}")
 
 
-# Proactive Burn Rate & Credit Tracking Engine inside main.py
 async def analyze_and_orchestrate_log(
-    agent_name: str,
-    log_level: str,
-    message: str,
-    metadata: dict | None,
+    agent_name: str, log_level: str, message: str, metadata: dict | None
 ) -> None:
     metadata_dict = metadata if isinstance(metadata, dict) else {}
     normalized_message = message.lower()
@@ -400,11 +332,7 @@ async def analyze_and_orchestrate_log(
     try:
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
-
-                # ─── 1. PROACTIVE TRACKING: DEDUCT ON SUCCESSFUL RUNS ───
                 if log_level == "INFO" and agent_name == "nexus":
-                    # When Nexus reports a successful run, deduct the standard PhantomBuster execution cost
-                    # Let's assume a standard profile scrape run burns roughly 10 minutes of execution time
                     if "execution status: success" in normalized_message:
                         await cur.execute("""
                             UPDATE helix_infrastructure_oracle_ledger
@@ -417,11 +345,9 @@ async def analyze_and_orchestrate_log(
                         ledger_check = await cur.fetchone()
                         if ledger_check and ledger_check[1]:
                             print(
-                                "🚨 [PROACTIVE HEALER] PhantomBuster calculated tokens dropped to 0. Circuit breaker automatically closed!"
+                                "🚨 [PROACTIVE HEALER] PhantomBuster tokens hit 0. Isolated."
                             )
-                            # Optional: trigger_telegram_alert("⚠️ *Oracle Warning:* Calculated PhantomBuster minutes exhausted. Pipeline isolated preemptively.")
 
-                # ─── 2. REACTIVE TRACKING: FALLBACK ERROR INTERCEPTION ───
                 has_pb_credit_error = any(
                     token in normalized_message
                     for token in (
@@ -432,26 +358,18 @@ async def analyze_and_orchestrate_log(
                         "api_key_expired",
                     )
                 )
-
                 if log_level == "ERROR" and has_pb_credit_error:
                     await cur.execute("""
                         UPDATE helix_infrastructure_oracle_ledger
-                        SET is_circuit_broken = TRUE,
-                            credits_remaining = 0,
-                            last_updated_at = NOW()
+                        SET is_circuit_broken = TRUE, credits_remaining = 0, last_updated_at = NOW()
                         WHERE vendor_name = 'PhantomBusters';
                         """)
-                    print(
-                        "🚨 [ORACLE CIRCUIT BREAKER] PhantomBusters isolated due to credit exhaustion."
-                    )
-
                     if industry_name:
                         await cur.execute(
                             "UPDATE helix_brain_scheduler SET is_active = FALSE, priority_score = GREATEST(priority_score - 2, 1) WHERE industry_name = %s;",
                             (industry_name,),
                         )
 
-                # --- MYEMAILVERIFIER CREDIT INTERCEPTION ---
                 has_mev_credit_error = any(
                     token in normalized_message
                     for token in (
@@ -461,18 +379,13 @@ async def analyze_and_orchestrate_log(
                         "token balance low",
                     )
                 )
-
                 if log_level == "ERROR" and has_mev_credit_error:
                     await cur.execute("""
                         UPDATE helix_infrastructure_oracle_ledger
                         SET is_circuit_broken = TRUE, credits_remaining = 0, last_updated_at = NOW()
                         WHERE vendor_name = 'MyEmailVerifier';
                         """)
-                    print(
-                        "🚨 [ORACLE CIRCUIT BREAKER] MyEmailVerifier isolated! Outbound email gates closed."
-                    )
 
-                # --- PRE-EXISTING VANGUARD ORCHESTRATION ---
                 if agent_name == "vanguard" and metadata_dict.get("event") in {
                     "campaign_drop",
                     "link_click",
@@ -523,24 +436,167 @@ async def ingest_log(payload: LogIngestSchema):
                 row = await cur.fetchone()
             await conn.commit()
 
-        # Run background analysis for errors or campaign updates
         asyncio.create_task(
             analyze_and_orchestrate_log(
-                payload.agent_name,
-                payload.log_level,
-                payload.message,
-                payload.metadata,
+                payload.agent_name, payload.log_level, payload.message, payload.metadata
             )
         )
-
-        # --- NEW: Trigger the automated pre-flight intent tracker ---
-        asyncio.create_task(evaluate_ecosystem_demand_and_signal_nexus())
-
         return {"status": "success", "logged_id": row[0]}
     except Exception as exc:
-        print(f"\n❌ [CRITICAL ENDPOINT FAILURE] /api/v1/logs crashed!")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to log event: {exc}")
+
+
+# ─── 🔮 CENTRAL RECEPTOR: UNIFIED STRATEGIC DISPATCH MATRIX ───
+def trigger_downstream_mesh(payload_bundle: dict):
+    """Fires synchronous out-of-band impulses to the stateless agent cluster endpoints."""
+    master_token = os.getenv("HELIX_AUTH_TOKEN", "")
+
+    # 1. Dispatch Assignment to MoltSet Lead Harvester
+    harvester_endpoint = os.getenv(
+        "HARVESTER_API_URL", "https://polaris-vanguard-harvester-udf7.onrender.com"
+    ).rstrip("/")
+    asyncio.create_task(
+        async_http_post_proxy(
+            f"{harvester_endpoint}/api/v1/harvester/execute",
+            {
+                "X-Harvester-Auth-Token": master_token,
+                "Content-Type": "application/json",
+            },
+            {
+                "industry_id": payload_bundle["industry_id"],
+                "industry_name": payload_bundle["industry_name"],
+                "moltset_category": payload_bundle["moltset_category"],
+                "target_region": payload_bundle["target_region"],
+                "bottleneck_profile": payload_bundle["bottleneck_profile"],
+            },
+        )
+    )
+
+    # 2. Dispatch Assignment to Nexus Omni-Strategist
+    nexus_endpoint = os.getenv(
+        "NEXUS_NERVOUS_IMPULSE_URL", "https://polaris-nexus.onrender.com"
+    ).rstrip("/")
+    asyncio.create_task(
+        async_http_post_proxy(
+            f"{nexus_endpoint}/api/v1/nexus/awaken",
+            {"X-Nexus-Auth-Token": master_token, "Content-Type": "application/json"},
+            {
+                "trigger_reason": "centralized_helix_clock_cycle",
+                "batch_size": 25,
+                "rescue_mode": False,
+                "industry_id": payload_bundle["industry_id"],
+                "industry_name": payload_bundle["industry_name"],
+                "target_region": payload_bundle["target_region"],
+                "bottleneck_profile": payload_bundle["bottleneck_profile"],
+                "pain_tokens": payload_bundle["pain_tokens"],
+            },
+        )
+    )
+
+    # 3. Dispatch Assignment to Beacon Social Marketing Agent
+    beacon_endpoint = os.getenv(
+        "BEACON_API_URL", "https://polaris-beacon-agent.onrender.com"
+    ).rstrip("/")
+    asyncio.create_task(
+        async_http_post_proxy(
+            f"{beacon_endpoint}/api/v1/beacon/execute",
+            {"X-Beacon-Auth-Token": master_token, "Content-Type": "application/json"},
+            {
+                "industry_id": payload_bundle["industry_id"],
+                "industry_name": payload_bundle["industry_name"],
+                "target_region": payload_bundle["target_region"],
+                "bottleneck_profile": payload_bundle["bottleneck_profile"],
+            },
+        )
+    )
+
+    # 4. Trigger Thread Comment Listener Sweep Check-in
+    listener_endpoint = os.getenv(
+        "LISTENER_API_URL", "https://polaris-beacon-listener.onrender.com"
+    ).rstrip("/")
+    asyncio.create_task(
+        async_http_post_proxy(
+            f"{listener_endpoint}/api/v1/listener/sweep",
+            {"X-Listener-Auth-Token": master_token},
+            {},
+        )
+    )
+
+    # 5. Trigger Vanguard Core Email Campaign Sweep
+    vanguard_endpoint = os.getenv(
+        "VANGUARD_API_URL", "https://polaris-vanguard-core.onrender.com"
+    ).rstrip("/")
+    asyncio.create_task(
+        async_http_post_proxy(
+            f"{vanguard_endpoint}/api/v1/dispatch/sweep",
+            {"X-Vanguard-Auth-Token": master_token},
+            {},
+        )
+    )
+
+
+@app.post("/api/v1/orchestrator/run-cycle")
+async def execute_orchestrated_master_cycle(
+    background_tasks: BackgroundTasks,
+    x_helix_auth_token: Optional[str] = Header(default=None),
+):
+    """🌐 THE CONTROL CENTER PLANE
+    Queries the database pool, secures the oldest active niche, rotates the timestamps,
+    and pushes synchronized payloads down to the entire agent cluster natively.
+    """
+    expected_token = os.getenv("HELIX_AUTH_TOKEN")
+    if expected_token and not (
+        x_helix_auth_token and hmac.compare_digest(x_helix_auth_token, expected_token)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized System Call")
+
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                # 1. Atomic Strategy Retrieval
+                await cur.execute("""
+                    SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                    FROM helix_brain_scheduler
+                    WHERE is_active = TRUE
+                    ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC
+                    LIMIT 1;
+                """)
+                active_strategy = await cur.fetchone()
+
+                if not active_strategy:
+                    return {
+                        "status": "idle",
+                        "message": "Zero active targeting strategies configured in the ledger database.",
+                    }
+
+                # 2. Complete the state transformation rotation loop inside Helix natively
+                await cur.execute(
+                    "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
+                    (active_strategy["industry_id"],),
+                )
+
+                await log_helix_state(
+                    cur=cur,
+                    strategic_mode=f"Master Sync Impulse: {active_strategy['industry_name']}",
+                    geo_lock=active_strategy["target_region"],
+                    buying_signal=f"#{''.join(active_strategy['industry_name'].split()).lower()}life",
+                )
+            await conn.commit()
+
+        # 3. Offload simultaneous network requests to an asynchronous background pool
+        background_tasks.add_task(trigger_downstream_mesh, active_strategy)
+
+        return {
+            "status": "orchestration_cycle_pushed",
+            "active_strategy": active_strategy["industry_name"],
+            "moltset_category": active_strategy["moltset_category"],
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Master orchestration engine failure: {exc}"
+        )
 
 
 @app.get("/api/v1/logs/latest")
@@ -619,8 +675,7 @@ async def get_latest_agent_log(
 
 @app.post("/api/v1/ingest")
 async def ingest_leads(
-    leads: List[LeadIngestModel],
-    x_ingest_key: str | None = Header(default=None),
+    leads: List[LeadIngestModel], x_ingest_key: str | None = Header(default=None)
 ):
     expected_key = os.getenv("INGEST_API_KEY")
     if expected_key and not (
@@ -657,8 +712,7 @@ async def ingest_leads(
 
 @app.post("/api/v1/inbound-blueprints")
 async def inbound_blueprints(
-    payload: BlueprintInboundModel,
-    x_inbound_key: str | None = Header(default=None),
+    payload: BlueprintInboundModel, x_inbound_key: str | None = Header(default=None)
 ):
     expected_key = os.getenv("INBOUND_API_KEY")
     if expected_key and not (
@@ -706,7 +760,6 @@ async def rotate_scheduler_target(
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # 🟩 ON INGESTION: Run LLM category mapping prior to updating database
     resolved_category = "Professional and Business Services"
     if app.state.ai_client:
         resolved_category = run_deterministic_moltset_mapping(
@@ -804,9 +857,7 @@ async def get_current_scheduler_target(
 
 
 @app.post("/api/v1/scheduler/expand-horizons")
-async def expand_target_industries(
-    x_inbound_key: str | None = Header(default=None),
-):
+async def expand_target_industries(x_inbound_key: str | None = Header(default=None)):
     expected_key = os.getenv("INBOUND_API_KEY")
     if expected_key and not (
         x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
@@ -862,11 +913,9 @@ async def expand_target_industries(
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
                 for sector in new_sectors:
-                    # 🟩 AUTOMATED ITERATION: Run mapping logic to ensure newly minted categories match schemas perfectly
                     resolved_cat = run_deterministic_moltset_mapping(
                         app.state.ai_client, sector["industry_name"]
                     )
-
                     await cur.execute(
                         """
                         INSERT INTO helix_brain_scheduler (
@@ -882,7 +931,6 @@ async def expand_target_industries(
                             sector.get("target_region", "Texas"),
                         ),
                     )
-
                 if new_sectors:
                     await log_helix_state(
                         cur=cur,
@@ -896,9 +944,6 @@ async def expand_target_industries(
             "discovered_and_added": [s["industry_name"] for s in new_sectors],
         }
     except Exception as e:
-        print(
-            f"\n❌ [CRITICAL ENDPOINT FAILURE] /api/v1/scheduler/expand-horizons crashed!"
-        )
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Discovery failed: {e}")
 
@@ -1012,9 +1057,7 @@ async def stream_logs(
 
 
 @app.get("/api/v1/leads/unprocessed")
-async def get_unprocessed_leads(
-    x_inbound_key: str | None = Header(default=None),
-):
+async def get_unprocessed_leads(x_inbound_key: str | None = Header(default=None)):
     expected_key = os.getenv("INBOUND_API_KEY")
     if expected_key and not (
         x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
