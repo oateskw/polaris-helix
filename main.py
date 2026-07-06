@@ -94,6 +94,22 @@ def run_deterministic_moltset_mapping(ai_client: Anthropic, industry_name: str) 
     return "Professional and Business Services"
 
 
+def send_telegram_broadcast(message: str):
+    """Sends immediate scheduling sync alerts from Helix to Telegram."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"⚠️ Telegram broadcast failed: {e}")
+
+
 class LogIngestSchema(BaseModel):
     agent_name: Literal[
         "vanguard",
@@ -281,6 +297,12 @@ async def perpetual_awareness_loop():
 
                 active_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
                 if not active_agents_list:
+                    send_telegram_broadcast(
+                        f"☀️ *HELIX CENTRAL ENGINE AWAKENED*\n"
+                        f"📅 Date: `{current_date_str}`\n"
+                        f"⚙️ Tasking the following downstream agents: `{active_agents_list}`"
+                    )
+
                     last_executed_date = current_date_str
                     await asyncio.sleep(60)
                     continue
