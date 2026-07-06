@@ -753,8 +753,11 @@ async def trigger_downstream_mesh(payload_bundle: dict):
     asyncio.create_task(
         async_http_post_proxy(
             f"{vanguard_endpoint}/api/v1/dispatch/sweep",
-            {"X-Vanguard-Auth-Token": master_token},
-            {},
+            {
+                "X-Vanguard-Auth-Token": master_token,  # Ensure token matches
+                "Content-Type": "application/json",
+            },
+            {},  # Pass an empty payload body since Vanguard handles logic out-of-band
         )
     )
 
