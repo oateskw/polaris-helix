@@ -673,7 +673,7 @@ async def ingest_log(payload: LogIngestSchema):
 # ─── 🔮 CENTRAL RECEPTOR: UNIFIED STRATEGIC DISPATCH MATRIX ───
 def trigger_downstream_mesh(payload_bundle: dict):
     """Fires synchronous out-of-band impulses to the stateless agent cluster endpoints."""
-    master_token = os.getenv("HELIX_AUTH_TOKEN", "")
+    master_token = os.getenv("INBOUND_API_KEY", "")
 
     # 1. Dispatch Assignment to MoltSet Lead Harvester
     harvester_endpoint = os.getenv(
