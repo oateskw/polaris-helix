@@ -380,36 +380,29 @@ async def perpetual_awareness_loop():
 
                     # 🚀 BEACON AGENT INTERCEPTION
                     if "beacon" in active_agents_list:
-                        if is_pb_isolated:
-                            print(
-                                "🚨 [ORACLE INTERCEPTION] PhantomBuster circuit broken! Skipping Beacon Agent run."
+                        # 🟩 FIXED: Removed the 'is_pb_isolated' condition.
+                        # The content engine doesn't rely on PhantomBusters!
+                        beacon_endpoint = os.getenv(
+                            "BEACON_API_URL",
+                            "https://polaris-beacon-agent.onrender.com",
+                        ).rstrip("/")
+                        asyncio.create_task(
+                            async_http_post_proxy(
+                                f"{beacon_endpoint}/api/v1/beacon/execute",
+                                {
+                                    "X-Beacon-Auth-Token": master_token,
+                                    "Content-Type": "application/json",
+                                },
+                                {
+                                    "industry_id": active_strategy["industry_id"],
+                                    "industry_name": active_strategy["industry_name"],
+                                    "target_region": active_strategy["target_region"],
+                                    "bottleneck_profile": active_strategy[
+                                        "bottleneck_profile"
+                                    ],
+                                },
                             )
-                        else:
-                            beacon_endpoint = os.getenv(
-                                "BEACON_API_URL",
-                                "https://polaris-beacon-agent.onrender.com",
-                            ).rstrip("/")
-                            asyncio.create_task(
-                                async_http_post_proxy(
-                                    f"{beacon_endpoint}/api/v1/beacon/execute",
-                                    {
-                                        "X-Beacon-Auth-Token": master_token,
-                                        "Content-Type": "application/json",
-                                    },
-                                    {
-                                        "industry_id": active_strategy["industry_id"],
-                                        "industry_name": active_strategy[
-                                            "industry_name"
-                                        ],
-                                        "target_region": active_strategy[
-                                            "target_region"
-                                        ],
-                                        "bottleneck_profile": active_strategy[
-                                            "bottleneck_profile"
-                                        ],
-                                    },
-                                )
-                            )
+                        )
 
                     # 🚀 BEACON COMMENT LISTENER STEP
                     if "listener" in active_agents_list:
