@@ -5,6 +5,12 @@
 		},
 		{
 			"path": "../polaris-beacon"
+		},
+		{
+			"path": "../polaris-vanguard"
+		},
+		{
+			"path": "../polaris-vector"
 		}
 	]
 }
