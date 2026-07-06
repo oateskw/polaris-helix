@@ -437,6 +437,15 @@ async def perpetual_awareness_loop():
                                 )
                             )
 
+                    # 🟩 ADD THIS NEW BLOCK RIGHT HERE NATIVELY:
+                    if (
+                        current_weekday == 4
+                    ):  # If it is Friday, automatically expand market targets for next week
+                        print(
+                            "🔮 [PERPETUAL BRAIN] Friday detected. Tasking Claude to discover 3 new industry verticals..."
+                        )
+                        asyncio.create_task(expand_target_industries())
+
                 last_executed_date = current_date_str
                 print(
                     f"✅ [HEARTBEAT COMPLETE] Cycle completed seamlessly for date: {last_executed_date}\n"
