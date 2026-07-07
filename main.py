@@ -226,11 +226,46 @@ async def log_helix_state(
 
 
 DAILY_EXECUTION_ROUTERS = {
-    0: ["nexus", "beacon", "harvester", "vanguard", "listener"],  # 📅 MONDAY
-    1: ["nexus", "beacon", "harvester", "vanguard", "listener"],  # 📅 TUESDAY
-    2: ["nexus", "beacon", "harvester", "vanguard", "listener"],  # 📅 WEDNESDAY
-    3: ["nexus", "beacon", "harvester", "vanguard", "listener"],  # 📅 THURSDAY
-    4: ["nexus", "beacon", "harvester", "vanguard", "listener"],  # 📅 FRIDAY
+    0: [
+        "nexus",
+        "beacon",
+        "harvester",
+        "vanguard",
+        "beacon_monitor",
+        "listener",
+    ],  # 📅 MONDAY
+    1: [
+        "nexus",
+        "beacon",
+        "harvester",
+        "vanguard",
+        "beacon_monitor",
+        "listener",
+    ],  # 📅 TUESDAY
+    2: [
+        "nexus",
+        "beacon",
+        "harvester",
+        "vanguard",
+        "beacon_monitor",
+        "listener",
+    ],  # 📅 WEDNESDAY
+    3: [
+        "nexus",
+        "beacon",
+        "harvester",
+        "vanguard",
+        "beacon_monitor",
+        "listener",
+    ],  # 📅 THURSDAY
+    4: [
+        "nexus",
+        "beacon",
+        "harvester",
+        "vanguard",
+        "beacon_monitor",
+        "listener",
+    ],  # 📅 FRIDAY
     5: ["harvester", "listener"],  # 🏖️ SATURDAY
     6: ["harvester", "listener"],  # 🏖️ SUNDAY
 }
@@ -500,9 +535,9 @@ async def trigger_downstream_mesh_with_payload(
     master_token = os.getenv("INBOUND_API_KEY", "")
 
     if "harvester" in agent_list:
-        if isolation_matrix.get("PhantomBusters", False):
+        if isolation_matrix.get("Moltset", False):
             send_telegram_broadcast(
-                "Skipping Lead Harvester execution loop. PhantomBusters circuit breaker is TRIPPED.",
+                "Skipping Lead Harvester execution loop. Moltset circuit breaker is TRIPPED.",
                 "critical",
             )
         else:
@@ -583,6 +618,37 @@ async def trigger_downstream_mesh_with_payload(
                 },
             )
         )
+
+    if "beacon_monitor" in agent_list:
+        # Check the isolation matrix to protect API limits and handle infrastructure self-healing
+        if isolation_matrix.get("PhantomBusters", False):
+            send_telegram_broadcast(
+                "Skipping Beacon Monitor lead scraping cycle. PhantomBusters circuit breaker is TRIPPED.",
+                "critical",
+            )
+        else:
+            url = os.getenv(
+                "BEACON_MONITOR_API_URL", "https://polaris-beacon-monitor.onrender.com"
+            ).rstrip("/")
+            asyncio.create_task(
+                async_http_post_proxy(
+                    f"{url}/api/v1/beacon/execute",  # Or whatever activation endpoint your monitor uses
+                    {
+                        "X-Beacon-Auth-Token": master_token,
+                        "Content-Type": "application/json",
+                    },
+                    {
+                        "industry_id": strategy["industry_id"],
+                        "industry_name": strategy["industry_name"],
+                        "target_region": strategy["target_region"],
+                        "bottleneck_profile": strategy["bottleneck_profile"],
+                    },
+                )
+            )
+            send_telegram_broadcast(
+                "Beacon Monitor lead scraping cycle successfully deployed down-mesh.",
+                "verbose",
+            )
 
     if "listener" in agent_list:
         url = os.getenv(
