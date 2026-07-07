@@ -6,6 +6,7 @@ import json
 import hmac
 import requests
 import datetime
+import psycopg
 from anthropic import Anthropic
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional, List
@@ -1161,6 +1162,153 @@ async def get_current_scheduler_target(
             row["last_targeted_at"].isoformat() if row.get("last_targeted_at") else None
         ),
     }
+
+
+@app.get("/api/v1/orchestrator/dashboard-diagnostics")
+async def get_dashboard_diagnostics(
+    x_helix_auth_token: Optional[str] = Header(default=None),
+):
+    """
+    🧠 HELIX CENTRAL BRAIN TELEMETRY
+    Aggregates real-time state configurations, maps daily pipeline achievements,
+    and exposes infrastructure circuit breakers directly from the oracle ledgers.
+    """
+    expected = os.getenv("HELIX_AUTH_TOKEN")
+    if expected and not (
+        x_helix_auth_token and hmac.compare_digest(x_helix_auth_token, expected)
+    ):
+        raise HTTPException(
+            status_code=401, detail="Unauthorized Dashboard Gateway Access."
+        )
+
+    utc_now = datetime.datetime.now(datetime.timezone.utc)
+    est_now = utc_now + datetime.timedelta(hours=-5)
+
+    diagnostics = {
+        "timestamp": est_now.isoformat(),
+        "todays_achievements": {},
+        "infrastructure_logjams": {},
+        "pipeline_progress": {},
+    }
+
+    try:
+        # 1. Gather logs and infrastructure health from the Main DB (DATABASE_URL)
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+
+                # Pull metrics on what components completed tasks today
+                await cur.execute("""
+                    SELECT agent_name, COUNT(*) as action_count, MAX(message) as last_milestone
+                    FROM agent_system_logs 
+                    WHERE timestamp >= CURRENT_DATE AND log_level = 'INFO'
+                    GROUP BY agent_name;
+                """)
+                achievements = await cur.fetchall()
+                for row in achievements:
+                    diagnostics["todays_achievements"][row["agent_name"]] = {
+                        "status": "COMPLETE" if row["action_count"] > 0 else "IDLE",
+                        "actions_logged": row["action_count"],
+                        "last_seen_milestone": row["last_milestone"],
+                    }
+
+                # Pull circuit breaker status maps from the infrastructure ledger
+                # Pre-flight check handles checking if standard nodes are suppressed or isolated
+                try:
+                    await cur.execute("""
+                        SELECT vendor_name, credits_remaining, is_circuit_broken 
+                        FROM helix_infrastructure_oracle_ledger;
+                    """)
+                    vendors = await cur.fetchall()
+                    for v in vendors:
+                        status_label = (
+                            "BLOCKED" if v["is_circuit_broken"] else "OPERATIONAL"
+                        )
+                        reason = "Healthy parameters"
+                        action = "None required"
+
+                        if (
+                            v["vendor_name"] == "PhantomBusters"
+                            and v["is_circuit_broken"]
+                        ):
+                            reason = "API tokens exhausted or execution limit reached. Downstream triggers suppressed."
+                            action = "Upgrade account to the $56 Starter Plan (20-hour monthly execution ceiling)."
+                        elif (
+                            v["vendor_name"] == "MyEmailVerifier"
+                            and v["is_circuit_broken"]
+                        ):
+                            reason = "Validation credit ledger reporting depletion. Outbound campaigns paused."
+                            action = "Replenish verification balance to restore campaign flow."
+                        elif v["vendor_name"] == "Moltset" and v["is_circuit_broken"]:
+                            reason = (
+                                "Enterprise data limits hit or API token key invalid."
+                            )
+                            action = "Verify account token billing profiles on Moltset console."
+
+                        diagnostics["infrastructure_logjams"][v["vendor_name"]] = {
+                            "status": status_label,
+                            "credits": (
+                                float(v["credits_remaining"])
+                                if v["credits_remaining"] is not None
+                                else 0.0
+                            ),
+                            "bottleneck_reason": reason,
+                            "required_resolution": action,
+                        }
+                except Exception as inner_db:
+                    diagnostics["infrastructure_logjams"][
+                        "error"
+                    ] = f"Oracle ledger unreadable: {inner_db}"
+
+        # 2. Gather staging thresholds from the Outbound DB (VANGUARD_DATABASE_URL)
+        vanguard_url = os.getenv("VANGUARD_DATABASE_URL")
+        if vanguard_url:
+            if "?sslmode=require" not in vanguard_url:
+                vanguard_url += "?sslmode=require"
+
+            async with await psycopg.AsyncConnection.connect(vanguard_url) as v_conn:
+                async with v_conn.cursor() as v_cur:
+                    # Count leads still marked as raw scraped targets
+                    await v_cur.execute(
+                        "SELECT COUNT(*) FROM cold_leads WHERE status = 'scraped';"
+                    )
+                    scraped_row = await v_cur.fetchone()
+                    scraped_count = scraped_row[0] if scraped_row else 0
+
+                    # Count leads successfully processed and advanced by Vector
+                    await v_cur.execute(
+                        "SELECT COUNT(*) FROM cold_leads WHERE status = 'ready_to_send';"
+                    )
+                    ready_row = await v_cur.fetchone()
+                    ready_count = ready_row[0] if ready_row else 0
+
+                    vector_status = "STALLED / STAGING" if scraped_count > 0 else "IDLE"
+                    vector_reason = "None"
+                    if vector_status == "STALLED / STAGING":
+                        vector_reason = f"{scraped_count} leads successfully mined. Processing held because outbound accounts are locked in Instantly warmup matrix."
+
+                    diagnostics["pipeline_progress"] = {
+                        "harvester_reservoir": {
+                            "status": "ACTIVE",
+                            "leads_cached_raw": scraped_count,
+                        },
+                        "vector_enrichment": {
+                            "status": vector_status,
+                            "leads_enriched_ready": ready_count,
+                            "stalled_reason": vector_reason,
+                        },
+                    }
+        else:
+            diagnostics["pipeline_progress"][
+                "error"
+            ] = "VANGUARD_DATABASE_URL environment variable is missing."
+
+        return diagnostics
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, detail=f"Dashboard telemetry compilation failure: {str(e)}"
+        )
 
 
 if __name__ == "__main__":
