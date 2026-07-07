@@ -332,7 +332,7 @@ async def sync_external_vendor_credits(db_pool):
 # ─── 🧠 THE UNBROKEN CENTRAL HEARTBEAT (DST AWARE / ACTIVE ORCHESTRATOR) ───
 async def perpetual_awareness_loop():
     print(
-        "🚀 [PERPETUAL BRAIN ENGINE] Heartbeat loop active and watching the timeline..."
+        "🚀 [PERPETUAL BRAIN ENGINE] Heartbeat loop active with smart state recovery rules..."
     )
     last_executed_date = None
 
@@ -345,27 +345,43 @@ async def perpetual_awareness_loop():
             current_date_str = est_now.strftime("%Y-%m-%d")
             current_weekday = est_now.weekday()
 
-            if (
-                est_now.hour == 0
-                and est_now.minute <= 30
-                and current_date_str != last_executed_date
-            ):
+            # 1. Fetch the absolute baseline agents scheduled to run on this specific day
+            scheduled_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
+            if not scheduled_agents_list:
                 send_telegram_broadcast(
-                    f"Awakening active execution tracking loop for date: `{current_date_str}` EST",
+                    "Weekend profile encountered. Skipping core worker agents.",
+                    "verbose",
+                )
+                last_executed_date = current_date_str
+                await asyncio.sleep(60)
+                continue
+
+            # 2. Check the database to see what agents have ALREADY executed logs today
+            pending_agents_for_today = []
+            async with app.state.db_pool.connection() as conn:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        "SELECT DISTINCT LOWER(agent_name) as executed_agent FROM agent_system_logs WHERE timestamp >= CURRENT_DATE;"
+                    )
+                    completed_rows = await cur.fetchall()
+                    completed_today_set = {r["executed_agent"] for r in completed_rows}
+
+                    # Deduplicate or group sub-parts (like mapping harvester tasks to the vanguard sequence)
+                    # to pinpoint what operations are genuinely unfulfilled for today
+                    pending_agents_for_today = [
+                        agent
+                        for agent in scheduled_agents_list
+                        if agent not in completed_today_set
+                    ]
+
+            # 3. IF OUTSTANDING STEPS REMAIN AND WE HAVEN'T ALREADY DEPLOYED THIS BULK CYCLE
+            if pending_agents_for_today and current_date_str != last_executed_date:
+                send_telegram_broadcast(
+                    f"Awakening state recovery logic. Detected pending daily tasks: `{pending_agents_for_today}`",
                     "orchestration",
                 )
 
-                active_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
-                if not active_agents_list:
-                    send_telegram_broadcast(
-                        "Weekend profile encountered. Skipping core worker agents.",
-                        "verbose",
-                    )
-                    last_executed_date = current_date_str
-                    await asyncio.sleep(60)
-                    continue
-
-                # ─── 🛡️ CIRCUIT BREAKER PRE-FLIGHT CHECK ───
+                # ─── 🛡️ INFRASTRUCTURE CIRCUIT BREAKER PRE-FLIGHT CHECK ───
                 vendor_isolation_matrix = {}
                 async with app.state.db_pool.connection() as conn:
                     async with conn.cursor(row_factory=dict_row) as cur:
@@ -378,6 +394,7 @@ async def perpetual_awareness_loop():
                                 "is_circuit_broken"
                             ]
 
+                # Extract the top prioritized targeting vertical profile
                 async with app.state.db_pool.connection() as conn:
                     async with conn.cursor(row_factory=dict_row) as cur:
                         await cur.execute("""
@@ -396,11 +413,15 @@ async def perpetual_awareness_loop():
 
                 if active_strategy:
                     send_telegram_broadcast(
-                        f"Secured targeting profile strategy: *{active_strategy['industry_name']}* inside region: `{active_strategy['target_region']}`",
+                        f"Secured recovery target strategy: *{active_strategy['industry_name']}* inside region: `{active_strategy['target_region']}`",
                         "orchestration",
                     )
+
+                    # 🚀 CRITICAL REFACTOR: Trigger ONLY the remaining pending tasks, protecting limits and tokens
                     await trigger_downstream_mesh_with_payload(
-                        active_strategy, active_agents_list, vendor_isolation_matrix
+                        active_strategy,
+                        pending_agents_for_today,
+                        vendor_isolation_matrix,
                     )
 
                 last_executed_date = current_date_str
@@ -408,7 +429,8 @@ async def perpetual_awareness_loop():
 
         except Exception as loop_crash:
             send_telegram_broadcast(
-                f"Perpetual loop exception intercepted: `{loop_crash}`", "critical"
+                f"Perpetual state-aware loop exception intercepted: `{loop_crash}`",
+                "critical",
             )
         await asyncio.sleep(60)
 
