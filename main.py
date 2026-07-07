@@ -264,13 +264,13 @@ async def ensure_inbound_blueprints_table() -> None:
 
 # ─── ⏰ GLOBAL SCHEDULING MATRIX FOR PERPETUAL AWARENESS ───
 DAILY_EXECUTION_ROUTERS = {
-    0: ["harvester", "nexus", "beacon", "listener"],  # 📅 MONDAY
-    1: ["listener", "vanguard"],  # 📅 TUESDAY
-    2: ["harvester", "nexus", "beacon", "listener"],  # 📅 WEDNESDAY
-    3: ["listener", "vanguard"],  # 📅 THURSDAY
-    4: ["listener", "vanguard"],  # 📅 FRIDAY
-    5: [],  # 🏖️ SATURDAY
-    6: [],  # 🏖️ SUNDAY
+    0: ["nexus", "beacon", "harvester", "vanguard", "listener"],  # 📅 MONDAY
+    1: ["nexus", "beacon", "harvester", "vanguard", "listener"],  # 📅 TUESDAY
+    2: ["nexus", "beacon", "harvester", "vanguard", "listener"],  # 📅 WEDNESDAY
+    3: ["nexus", "beacon", "harvester", "vanguard", "listener"],  # 📅 THURSDAY
+    4: ["nexus", "beacon", "harvester", "vanguard", "listener"],  # 📅 FRIDAY
+    5: ["harvester", "listener"],  # 🏖️ SATURDAY
+    6: ["harvester", "listener"],  # 🏖️ SUNDAY
 }
 
 
