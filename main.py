@@ -541,7 +541,9 @@ async def trigger_downstream_mesh_with_payload(
             url = os.getenv(
                 "NEXUS_NERVOUS_IMPULSE_URL", "https://polaris-nexus.onrender.com"
             ).rstrip("/")
-            # 🩹 Fix: Call the proxy directly and await its output
+
+            # ✅ FIXED: Direct await (no asyncio.create_task wrapper!)
+            # ✅ FIXED: Passes BOTH industry_name and target_niche simultaneously to satisfy Nexus's schema!
             nexus_success = await async_http_post_proxy(
                 f"{url}/api/v1/nexus/awaken",
                 {
@@ -899,7 +901,7 @@ async def analyze_and_orchestrate_log(
                                             "industry_name": strategy["industry_name"],
                                             "target_niche": strategy[
                                                 "industry_name"
-                                            ],  # 🩹 Aligned to Target Schema
+                                            ],  # ✅ FIXED: Mapped to satisfy the schema
                                             "target_region": strategy["target_region"],
                                             "bottleneck_profile": strategy[
                                                 "bottleneck_profile"
