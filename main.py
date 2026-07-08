@@ -1,3 +1,4 @@
+from curses import meta
 import os
 import re
 import traceback
@@ -797,6 +798,9 @@ async def analyze_and_orchestrate_log(
     meta = metadata if isinstance(metadata, dict) else {}
     industry = meta.get("industry_name") or meta.get("industry")
 
+    # 🩹 Fix: Combine the message and metadata error text together so nothing gets missed
+    extended_error_context = f"{norm_msg} {str(meta.get('error', '')).lower()}"
+
     try:
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -811,7 +815,7 @@ async def analyze_and_orchestrate_log(
 
                 if log_level == "ERROR":
                     if any(
-                        t in norm_msg
+                        t in extended_error_context
                         for t in (
                             "phantombuster",
                             "credit limit",
@@ -835,7 +839,7 @@ async def analyze_and_orchestrate_log(
                         return
 
                     if any(
-                        t in norm_msg
+                        t in extended_error_context
                         for t in (
                             "myemailverifier",
                             "insufficient credits",
@@ -843,17 +847,17 @@ async def analyze_and_orchestrate_log(
                             "token balance low",
                         )
                     ):
-                        await cur.execute(
-                            "UPDATE helix_infrastructure_oracle_ledger "
-                            "SET is_circuit_broken = TRUE, credits_remaining = 0 "
-                            "WHERE vendor_name = 'MyEmailVerifier';"
-                        )
-                        send_telegram_broadcast(
-                            "🚨 [CIRCUIT BREAKER] MyEmailVerifier depleted. Skipping email sweeps.",
-                            "critical",
-                        )
-                        await conn.commit()
-                        return
+                        async with app.state.db_pool.connection() as conn:
+                            async with conn.cursor() as cur:
+                                await cur.execute(
+                                    "UPDATE helix_infrastructure_oracle_ledger SET is_circuit_broken = TRUE, credits_remaining = 0 WHERE vendor_name = 'MyEmailVerifier';"
+                                )
+                                send_telegram_broadcast(
+                                    "🚨 [CIRCUIT BREAKER] MyEmailVerifier ledger empty. Outbound sweeps hard-stopped.",
+                                    "critical",
+                                )
+                                await conn.commit()
+                                return
 
                     if industry:
                         await cur.execute(
