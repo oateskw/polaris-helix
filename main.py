@@ -619,6 +619,10 @@ async def trigger_downstream_mesh_with_payload(
                 },
             )
         )
+        # 🟢 ADDED NOTIFICATION
+        send_telegram_broadcast(
+            "Beacon task instructions successfully dispatched down-mesh.", "verbose"
+        )
 
     if "beacon_monitor" in agent_list:
         # Check the isolation matrix to protect API limits and handle infrastructure self-healing
@@ -662,6 +666,10 @@ async def trigger_downstream_mesh_with_payload(
                 {},
             )
         )
+        # 🟢 ADDED NOTIFICATION
+        send_telegram_broadcast(
+            "Listener sweep trigger successfully deployed down-mesh.", "verbose"
+        )
 
     if "vanguard" in agent_list:
         if isolation_matrix.get("MyEmailVerifier", False):
@@ -683,6 +691,10 @@ async def trigger_downstream_mesh_with_payload(
                     {},
                 )
             )
+        # 🟢 ADDED NOTIFICATION
+        send_telegram_broadcast(
+            "Vanguard outbound campaign sweep initiated successfully.", "verbose"
+        )
 
 
 async def async_http_post_proxy(
