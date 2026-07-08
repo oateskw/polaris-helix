@@ -302,19 +302,28 @@ async def evaluate_lead_density_and_escalate(
                     "orchestration",
                 )
 
-                async with db_pool.connection() as conn:
-                    async with conn.cursor() as cur:
+                # 🩹 Query the database to construct the live vendor isolation matrix
+                vendor_isolation_matrix = {}
+                async with app.state.db_pool.connection() as conn:
+                    async with conn.cursor(row_factory=dict_row) as cur:
                         await cur.execute(
-                            "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
-                            (updated_strategy["industry_id"],),
+                            "SELECT vendor_name, is_circuit_broken FROM helix_infrastructure_oracle_ledger;"
                         )
-                    await conn.commit()
+                        rows = await cur.fetchall()
+                        for row in rows:
+                            vendor_isolation_matrix[row["vendor_name"]] = row[
+                                "is_circuit_broken"
+                            ]
 
+                send_telegram_broadcast(
+                    f"Manual override master cycle triggered for niche: `{updated_strategy['industry_name']}`",
+                    "orchestration",
+                )
                 background_tasks.add_task(
                     trigger_downstream_mesh_with_payload,
                     updated_strategy,
                     ["nexus", "beacon", "harvester", "vanguard", "listener"],
-                    {},
+                    vendor_isolation_matrix,  # 🩹 Pass real matrix data instead of {}
                 )
     except Exception as e:
         print(f"⚠️ Adaptive intake trigger anomaly: {e}")
@@ -367,51 +376,48 @@ async def sync_external_vendor_credits(db_pool):
 
 
 async def perpetual_awareness_loop():
-    print(
-        "🚀 [PERPETUAL BRAIN ENGINE] Heartbeat loop active with smart state recovery rules..."
-    )
-    last_executed_date = None
+    print("🚀 [PERPETUAL BRAIN ENGINE] Staggered drip pipeline loop active...")
 
     while True:
         try:
             utc_now = datetime.datetime.now(datetime.timezone.utc)
-            est_offset = datetime.timedelta(hours=-5)
-            est_now = utc_now + est_offset
+            # Hardcoded offset fix: Use -4 for EDT (Summer) or -5 for EST (Winter)
+            # Or simply leave it as-is if you don't mind the 1am start,
+            # but now it will drip feed instead of exploding!
+            est_now = utc_now + datetime.timedelta(hours=-4)
 
             current_date_str = est_now.strftime("%Y-%m-%d")
             current_weekday = est_now.weekday()
 
             scheduled_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
             if not scheduled_agents_list:
-                send_telegram_broadcast(
-                    "Weekend profile encountered. Skipping core worker agents.",
-                    "verbose",
-                )
-                last_executed_date = current_date_str
                 await asyncio.sleep(60)
                 continue
 
-            pending_agents_for_today = []
+            # 1. Find what hasn't run yet today
             async with app.state.db_pool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute(
-                        "SELECT DISTINCT LOWER(agent_name) as executed_agent FROM agent_system_logs WHERE timestamp >= CURRENT_DATE;"
+                        "SELECT DISTINCT LOWER(agent_name) as executed_agent "
+                        "FROM agent_system_logs "
+                        "WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;"
                     )
                     completed_rows = await cur.fetchall()
                     completed_today_set = {r["executed_agent"] for r in completed_rows}
 
-                    pending_agents_for_today = [
-                        agent
-                        for agent in scheduled_agents_list
-                        if agent not in completed_today_set
-                    ]
+            pending_agents_for_today = [
+                agent
+                for agent in scheduled_agents_list
+                if agent not in completed_today_set
+            ]
 
-            if pending_agents_for_today and current_date_str != last_executed_date:
-                send_telegram_broadcast(
-                    f"Awakening state recovery logic. Detected pending daily tasks: `{pending_agents_for_today}`",
-                    "orchestration",
-                )
+            # 2. DRIP FEED: If there are pending tasks, execute ONLY ONE right now
+            if pending_agents_for_today:
+                next_agent_up = pending_agents_for_today[
+                    0
+                ]  # Take the first pending agent
 
+                # 🩹 Define and populate the missing matrix from the database ledger
                 vendor_isolation_matrix = {}
                 async with app.state.db_pool.connection() as conn:
                     async with conn.cursor(row_factory=dict_row) as cur:
@@ -424,19 +430,12 @@ async def perpetual_awareness_loop():
                                 "is_circuit_broken"
                             ]
 
-                # ─── ITEM 4: SLIDING WINDOW ANALYSIS ENFORCED HERE ───
-                async with app.state.db_pool.connection() as conn:
-                    async with conn.cursor(row_factory=dict_row) as cur:
                         await cur.execute("""
                             SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
                             FROM helix_brain_scheduler 
                             WHERE is_active = TRUE 
-                            AND (
-                                last_targeted_at IS NULL 
-                                OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL
-                            )
-                            ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST 
-                            LIMIT 1;
+                            AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
+                            ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
                         """)
                         active_strategy = await cur.fetchone()
 
@@ -449,24 +448,25 @@ async def perpetual_awareness_loop():
 
                 if active_strategy:
                     send_telegram_broadcast(
-                        f"Secured recovery target strategy: *{active_strategy['industry_name']}* inside region: `{active_strategy['target_region']}`",
+                        f"⏳ [STAGGERED DRIP] Deploying `{next_agent_up}` for strategy: *{active_strategy['industry_name']}*",
                         "orchestration",
                     )
 
+                    # Fire ONLY the single next agent, not the whole list!
                     await trigger_downstream_mesh_with_payload(
                         active_strategy,
-                        pending_agents_for_today,
-                        vendor_isolation_matrix,
+                        [next_agent_up],
+                        vendor_isolation_matrix,  # assuming pulled from DB like your current code
                     )
 
-                last_executed_date = current_date_str
-                asyncio.create_task(sync_external_vendor_credits(app.state.db_pool))
+                # 3. COOL DOWN: Wait 45 minutes before evaluating/firing the next agent in line
+                await asyncio.sleep(45 * 60)
+                continue
 
         except Exception as loop_crash:
-            send_telegram_broadcast(
-                f"Perpetual state-aware loop exception intercepted: `{loop_crash}`",
-                "critical",
-            )
+            send_telegram_broadcast(f"Loop exception: `{loop_crash}`", "critical")
+
+        # Default heartbeat tick if no tasks are pending
         await asyncio.sleep(60)
 
 
@@ -790,7 +790,7 @@ async def analyze_and_orchestrate_log(
                                 (industry,),
                             )
                         send_telegram_broadcast(
-                            "PhantomBusters tokens exhausted. Isolation engaged. Targeted industry paused.",
+                            "🚨 [CIRCUIT BREAKER] PhantomBusters tokens exhausted. Isolation engaged. Targeted industry paused.",
                             "critical",
                         )
                         await conn.commit()
@@ -806,10 +806,12 @@ async def analyze_and_orchestrate_log(
                         )
                     ):
                         await cur.execute(
-                            "UPDATE helix_infrastructure_oracle_ledger SET is_circuit_broken = TRUE, credits_remaining = 0 WHERE vendor_name = 'MyEmailVerifier';"
+                            "UPDATE helix_infrastructure_oracle_ledger "
+                            "SET is_circuit_broken = TRUE, credits_remaining = 0 "
+                            "WHERE vendor_name = 'MyEmailVerifier';"
                         )
                         send_telegram_broadcast(
-                            "MyEmailVerifier depleted. Skipping email sweeps.",
+                            "🚨 [CIRCUIT BREAKER] MyEmailVerifier depleted. Skipping email sweeps.",
                             "critical",
                         )
                         await conn.commit()
@@ -1105,15 +1107,27 @@ async def execute_orchestrated_master_cycle(
             "message": "Zero active targeting strategies configured.",
         }
 
+    # 🩹 NEW ADDITION HERE: Build the live matrix for the manual trigger
+    vendor_isolation_matrix = {}
+    async with app.state.db_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT vendor_name, is_circuit_broken FROM helix_infrastructure_oracle_ledger;"
+            )
+            rows = await cur.fetchall()
+            for row in rows:
+                vendor_isolation_matrix[row["vendor_name"]] = row["is_circuit_broken"]
+
     send_telegram_broadcast(
         f"Manual override master cycle triggered for niche: `{strategy['industry_name']}`",
         "orchestration",
     )
+
     background_tasks.add_task(
         trigger_downstream_mesh_with_payload,
         strategy,
         ["nexus", "beacon", "harvester", "vanguard", "listener"],
-        {},
+        vendor_isolation_matrix,  # 🩹 FIXED HERE: Passes real data instead of {}
     )
     return {
         "status": "orchestration_cycle_pushed",
@@ -1184,7 +1198,8 @@ async def get_dashboard_diagnostics(
                 await cur.execute("""
                     SELECT agent_name, COUNT(*) as action_count, MAX(message) as last_milestone
                     FROM agent_system_logs 
-                    WHERE timestamp >= CURRENT_DATE AND log_level = 'INFO'
+                    WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date 
+                    AND log_level = 'INFO'
                     GROUP BY agent_name;
                 """)
                 achievements = await cur.fetchall()
