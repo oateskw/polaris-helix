@@ -441,13 +441,23 @@ async def perpetual_awareness_loop():
                                 "is_circuit_broken"
                             ]
 
-                        await cur.execute("""
-                            SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
-                            FROM helix_brain_scheduler 
-                            WHERE is_active = TRUE 
-                            AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
-                            ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
-                        """)
+                        # 🩹 Fix: Allow beacon_monitor and listener to hook into the current active strategy
+                        # even if its last_targeted_at timestamp was just updated by a sister agent.
+                        if next_agent_up in ["beacon_monitor", "listener"]:
+                            await cur.execute("""
+                                SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                FROM helix_brain_scheduler 
+                                WHERE is_active = TRUE 
+                                ORDER BY last_targeted_at DESC NULLS LAST LIMIT 1;
+                            """)
+                        else:
+                            await cur.execute("""
+                                SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                FROM helix_brain_scheduler 
+                                WHERE is_active = TRUE 
+                                AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
+                                ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
+                            """)
                         active_strategy = await cur.fetchone()
 
                         if active_strategy:
