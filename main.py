@@ -396,14 +396,23 @@ async def perpetual_awareness_loop():
                 await asyncio.sleep(60)
                 continue
 
-            # 1. Find what hasn't run yet today
+            # 1. Find what hasn't run yet today using precise message-content separation logic
             async with app.state.db_pool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(
-                        "SELECT DISTINCT LOWER(agent_name) as executed_agent "
-                        "FROM agent_system_logs "
-                        "WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;"
-                    )
+                    await cur.execute("""
+                        SELECT DISTINCT LOWER(
+                            CASE 
+                              WHEN LOWER(agent_name) = 'beacon' AND (message ILIKE '%Monitor%' OR message ILIKE '%background sweep%') THEN 'beacon_monitor'
+                              WHEN LOWER(agent_name) = 'beacon' AND (message ILIKE '%Listener%' OR message ILIKE '%sweep%completed%' OR message ILIKE '%beacon_listener%') THEN 'listener'
+                              WHEN LOWER(agent_name) = 'beacon' AND (message ILIKE '%Publer%' OR message ILIKE '%copy array%' OR message ILIKE '%Flux%') THEN 'beacon'
+                              WHEN (LOWER(agent_name) = 'vanguard' OR LOWER(agent_name) = 'harvester') AND (message ILIKE '%Harvester%' OR message ILIKE '%mined%' OR message ILIKE '%MoltSets%') THEN 'harvester'
+                              WHEN LOWER(agent_name) = 'vanguard' AND (message ILIKE '%dispatch%' OR message ILIKE '%Instantly%' OR message ILIKE '%campaign%') THEN 'vanguard'
+                              ELSE agent_name
+                            END
+                        ) as executed_agent
+                        FROM agent_system_logs 
+                        WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
+                    """)
                     completed_rows = await cur.fetchall()
                     completed_today_set = {r["executed_agent"] for r in completed_rows}
 
