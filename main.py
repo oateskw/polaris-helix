@@ -316,7 +316,8 @@ async def evaluate_lead_density_and_escalate(
                             ]
 
                 send_telegram_broadcast(
-                    f"Manual override master cycle triggered for niche: `{updated_strategy['industry_name']}`",
+                    f"🚀 *REAL-TIME MESH ESCALATION INITIATED*\n"
+                    f"Deploying production pipeline workers automatically for niche: `{updated_strategy['industry_name']}`",
                     "orchestration",
                 )
                 background_tasks.add_task(
@@ -528,6 +529,50 @@ async def trigger_downstream_mesh_with_payload(
 ):
     master_token = os.getenv("INBOUND_API_KEY", "")
 
+    # 1. NEXUS OMNI-STRATEGIST (MUST SUCCEED FIRST)
+    if "nexus" in agent_list:
+        if isolation_matrix.get("Anthropic", False):
+            send_telegram_broadcast(
+                "Skipping Nexus Omni-Strategist sync sequence. Anthropic wallet ledger is isolated.",
+                "critical",
+            )
+        else:
+            url = os.getenv(
+                "NEXUS_NERVOUS_IMPULSE_URL", "https://polaris-nexus.onrender.com"
+            ).rstrip("/")
+            # 🩹 Fix: Call the proxy directly and await its output
+            nexus_success = await async_http_post_proxy(
+                f"{url}/api/v1/nexus/awaken",
+                {
+                    "X-Nexus-Auth-Token": master_token,
+                    "Content-Type": "application/json",
+                },
+                {
+                    "trigger_reason": "perpetual_awareness_heartbeat",
+                    "batch_size": 25,
+                    "rescue_mode": False,
+                    "industry_id": strategy["industry_id"],
+                    "target_niche": strategy["industry_name"],
+                    "target_region": strategy["target_region"],
+                    "bottleneck_profile": strategy["bottleneck_profile"],
+                    "pain_tokens": strategy["pain_tokens"],
+                },
+            )
+
+            if not nexus_success:
+                send_telegram_broadcast(
+                    f"🛑 *CRITICAL ORCHESTRATION HALT*\n"
+                    f"Nexus failed to initialize for strategy: `{strategy['industry_name']}`.\n"
+                    f"Suppressing all downstream mesh tasks (Harvester, Beacon, Vanguard) to prevent corruption.",
+                    "critical",
+                )
+                return  # 🧠 EXIT FUNCTION ENTIRELY. DO NOT RUN ANYTHING ELSE.
+
+            send_telegram_broadcast(
+                "Nexus execution impulse successfully deployed down-mesh.", "verbose"
+            )
+
+    # 2. LEAD HARVESTER
     if "harvester" in agent_list:
         if isolation_matrix.get("Moltset", False):
             send_telegram_broadcast(
@@ -560,39 +605,7 @@ async def trigger_downstream_mesh_with_payload(
                 "verbose",
             )
 
-    if "nexus" in agent_list:
-        if isolation_matrix.get("Anthropic", False):
-            send_telegram_broadcast(
-                "Skipping Nexus Omni-Strategist sync sequence. Anthropic wallet ledger is isolated.",
-                "critical",
-            )
-        else:
-            url = os.getenv(
-                "NEXUS_NERVOUS_IMPULSE_URL", "https://polaris-nexus.onrender.com"
-            ).rstrip("/")
-            asyncio.create_task(
-                async_http_post_proxy(
-                    f"{url}/api/v1/nexus/awaken",
-                    {
-                        "X-Nexus-Auth-Token": master_token,
-                        "Content-Type": "application/json",
-                    },
-                    {
-                        "trigger_reason": "perpetual_awareness_heartbeat",
-                        "batch_size": 25,
-                        "rescue_mode": False,
-                        "industry_id": strategy["industry_id"],
-                        "industry_name": strategy["industry_name"],
-                        "target_region": strategy["target_region"],
-                        "bottleneck_profile": strategy["bottleneck_profile"],
-                        "pain_tokens": strategy["pain_tokens"],
-                    },
-                )
-            )
-            send_telegram_broadcast(
-                "Nexus execution impulse successfully deployed down-mesh.", "verbose"
-            )
-
+    # 3. BEACON TASK DISPATCH
     if "beacon" in agent_list:
         url = os.getenv(
             "BEACON_API_URL", "https://polaris-beacon-agent.onrender.com"
@@ -616,6 +629,7 @@ async def trigger_downstream_mesh_with_payload(
             "Beacon task instructions successfully dispatched down-mesh.", "verbose"
         )
 
+    # 4. BEACON MONITOR
     if "beacon_monitor" in agent_list:
         if isolation_matrix.get("PhantomBusters", False):
             send_telegram_broadcast(
@@ -646,6 +660,7 @@ async def trigger_downstream_mesh_with_payload(
                 "verbose",
             )
 
+    # 5. LISTENER SWEEP
     if "listener" in agent_list:
         url = os.getenv(
             "LISTENER_API_URL", "https://polaris-beacon-listener.onrender.com"
@@ -661,6 +676,7 @@ async def trigger_downstream_mesh_with_payload(
             "Listener sweep trigger successfully deployed down-mesh.", "verbose"
         )
 
+    # 6. VANGUARD OUTBOUND SWEEP
     if "vanguard" in agent_list:
         if isolation_matrix.get("MyEmailVerifier", False):
             send_telegram_broadcast(
@@ -690,7 +706,7 @@ async def trigger_downstream_mesh_with_payload(
 
 async def async_http_post_proxy(
     url: str, headers: dict, json_data: dict, max_retries: int = 3
-):
+) -> bool:  # 🩹 Return a boolean indicator
     """🚀 HIGH-PERFORMANCE PROXY PROBE WITH LIVE EXCEPTION VERIFICATION"""
     backoff = 2.0
     # 🩹 Fix: Drop HTTP2 requirements and extend timeout to 30s to catch sleeping servers
@@ -712,7 +728,7 @@ async def async_http_post_proxy(
                         f"Details: `{error_details}`",
                         "critical",
                     )
-                    return
+                    return False  # 🩹 Failed validation gate
 
                 if response.status_code in [502, 503, 504]:
                     raise httpx.HTTPStatusError(
@@ -720,7 +736,7 @@ async def async_http_post_proxy(
                         request=response.request,
                         response=response,
                     )
-                return
+                return True  # 🩹 Success!
             except Exception as e:
                 # 🩹 Trace the hidden background error directly to your screen
                 send_telegram_broadcast(
@@ -734,6 +750,7 @@ async def async_http_post_proxy(
                     )
                 else:
                     await asyncio.sleep(backoff**attempt)
+        return False  # Failed after max retries
 
 
 @asynccontextmanager
@@ -874,7 +891,9 @@ async def analyze_and_orchestrate_log(
                                             "batch_size": 15,
                                             "rescue_mode": True,
                                             "industry_id": strategy["industry_id"],
-                                            "industry_name": strategy["industry_name"],
+                                            "target_niche": strategy[
+                                                "industry_name"
+                                            ],  # 🩹 Aligned to Target Schema
                                             "target_region": strategy["target_region"],
                                             "bottleneck_profile": strategy[
                                                 "bottleneck_profile"
