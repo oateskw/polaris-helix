@@ -552,6 +552,7 @@ async def trigger_downstream_mesh_with_payload(
                     "batch_size": 25,
                     "rescue_mode": False,
                     "industry_id": strategy["industry_id"],
+                    "industry_name": strategy["industry_name"],
                     "target_niche": strategy["industry_name"],
                     "target_region": strategy["target_region"],
                     "bottleneck_profile": strategy["bottleneck_profile"],
@@ -891,6 +892,7 @@ async def analyze_and_orchestrate_log(
                                             "batch_size": 15,
                                             "rescue_mode": True,
                                             "industry_id": strategy["industry_id"],
+                                            "industry_name": strategy["industry_name"],
                                             "target_niche": strategy[
                                                 "industry_name"
                                             ],  # 🩹 Aligned to Target Schema
