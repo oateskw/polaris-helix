@@ -691,12 +691,28 @@ async def trigger_downstream_mesh_with_payload(
 async def async_http_post_proxy(
     url: str, headers: dict, json_data: dict, max_retries: int = 3
 ):
-    """🚀 HIGH-PERFORMANCE PROXY PROBE"""
+    """🚀 HIGH-PERFORMANCE PROXY PROBE WITH LIVE EXCEPTION VERIFICATION"""
     backoff = 2.0
-    async with httpx.AsyncClient(http2=True, timeout=12.0) as client:
+    # 🩹 Fix: Drop HTTP2 requirements and extend timeout to 30s to catch sleeping servers
+    async with httpx.AsyncClient(http2=False, timeout=30.0) as client:
         for attempt in range(1, max_retries + 1):
             try:
                 response = await client.post(url, headers=headers, json=json_data)
+
+                # 🩹 Catch explicit validation layout errors
+                if response.status_code == 422:
+                    try:
+                        error_details = response.json()
+                    except Exception:
+                        error_details = response.text
+
+                    send_telegram_broadcast(
+                        f"❌ *SCHEMA MISMATCH (422)*\n"
+                        f"Target Node: `{url}` rejected payload validation.\n"
+                        f"Details: `{error_details}`",
+                        "critical",
+                    )
+                    return
 
                 if response.status_code in [502, 503, 504]:
                     raise httpx.HTTPStatusError(
@@ -704,12 +720,16 @@ async def async_http_post_proxy(
                         request=response.request,
                         response=response,
                     )
-
                 return
             except Exception as e:
+                # 🩹 Trace the hidden background error directly to your screen
+                send_telegram_broadcast(
+                    f"⚠️ [PROXY EXCEPTION] Attempt {attempt} failed targeting `{url}`. Error Context: `{str(e)}`",
+                    "verbose",
+                )
                 if attempt == max_retries:
                     send_telegram_broadcast(
-                        f"💥 *MESH NODE UNREACHABLE*\nEndpoint: `{url}` failed all connection attempts.\nFinal Error: `{e}`",
+                        f"💥 *MESH NODE UNREACHABLE*\nEndpoint: `{url}` failed all connection attempts.\nFinal Network Error: `{e}`",
                         "critical",
                     )
                 else:
