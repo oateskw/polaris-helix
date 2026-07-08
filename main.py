@@ -7,6 +7,7 @@ import hmac
 import requests
 import datetime
 import psycopg
+import httpx
 from anthropic import Anthropic
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional, List
@@ -87,28 +88,49 @@ def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
 
 
 def run_deterministic_moltset_mapping(ai_client: Anthropic, industry_name: str) -> str:
-    prompt = f"""Map this specific business niche: "{industry_name}" to exactly ONE category from: {MOLTSET_ALLOWED_CATEGORIES}. Output ONLY the raw string value."""
+    """Uses modern tool/JSON parameters to force Claude to return a valid category."""
     try:
-        message = ai_client.messages.create(
+        response = ai_client.messages.create(
             model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
-            max_tokens=50,
+            max_tokens=100,
             temperature=0.0,
-            messages=[{"role": "user", "content": prompt}],
+            system="You are a data categorization engine. You must map the user input exactly to one of the provided options.",
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Map this business niche: '{industry_name}'",
+                }
+            ],
+            tools=[
+                {
+                    "name": "categorize_industry",
+                    "description": "Output the single best matching industry category.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "category": {
+                                "type": "string",
+                                "enum": MOLTSET_ALLOWED_CATEGORIES,
+                            }
+                        },
+                        "required": ["category"],
+                    },
+                }
+            ],
+            tool_choice={"type": "tool", "name": "categorize_industry"},
         )
-        chosen_category = (
-            message.content[0]
-            .text.strip()
-            .replace('"', "")
-            .replace("'", "")
-            .replace("`", "")
-            .strip()
-        )
-        if chosen_category in MOLTSET_ALLOWED_CATEGORIES:
-            return chosen_category
+
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "categorize_industry":
+                chosen_category = block.input.get("category")
+                if chosen_category in MOLTSET_ALLOWED_CATEGORIES:
+                    return chosen_category
+
     except Exception as e:
         send_telegram_broadcast(
             f"Moltset AI mapping failed for `{industry_name}`: {e}", "critical"
         )
+
     return "Professional and Business Services"
 
 
@@ -190,6 +212,7 @@ class SchedulerRecordIngestModel(BaseModel):
     pain_tokens: List[str]
     target_region: str = "Texas"
     priority_score: int = 1
+    minimum_cooldown_hours: int = 24
 
 
 HELIX_INBOUND_BLUEPRINTS_TABLE_SQL = """
@@ -202,12 +225,14 @@ CREATE TABLE IF NOT EXISTS helix_inbound_blueprints (
 );
 """
 
+# ─── ITEM 4: SCHEMA EXTENSION EMBEDDED ───
 SCHEDULER_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS helix_brain_scheduler (
     industry_id SERIAL PRIMARY KEY, industry_name VARCHAR(100) UNIQUE NOT NULL,
     moltset_category VARCHAR(100) DEFAULT 'Professional and Business Services',
     bottleneck_profile TEXT NOT NULL, pain_tokens TEXT[] NOT NULL, target_region VARCHAR(100) DEFAULT 'Texas',
-    is_active BOOLEAN DEFAULT TRUE, last_targeted_at TIMESTAMP DEFAULT NULL, priority_score INT DEFAULT 1
+    is_active BOOLEAN DEFAULT TRUE, last_targeted_at TIMESTAMP DEFAULT NULL, priority_score INT DEFAULT 1,
+    minimum_cooldown_hours INT DEFAULT 24
 );
 """
 
@@ -227,68 +252,27 @@ async def log_helix_state(
 
 
 DAILY_EXECUTION_ROUTERS = {
-    0: [
-        "nexus",
-        "beacon",
-        "harvester",
-        "vanguard",
-        "beacon_monitor",
-        "listener",
-    ],  # 📅 MONDAY
-    1: [
-        "nexus",
-        "beacon",
-        "harvester",
-        "vanguard",
-        "beacon_monitor",
-        "listener",
-    ],  # 📅 TUESDAY
-    2: [
-        "nexus",
-        "beacon",
-        "harvester",
-        "vanguard",
-        "beacon_monitor",
-        "listener",
-    ],  # 📅 WEDNESDAY
-    3: [
-        "nexus",
-        "beacon",
-        "harvester",
-        "vanguard",
-        "beacon_monitor",
-        "listener",
-    ],  # 📅 THURSDAY
-    4: [
-        "nexus",
-        "beacon",
-        "harvester",
-        "vanguard",
-        "beacon_monitor",
-        "listener",
-    ],  # 📅 FRIDAY
-    5: ["harvester", "listener"],  # 🏖️ SATURDAY
-    6: ["harvester", "listener"],  # 🏖️ SUNDAY
+    0: ["nexus", "beacon", "harvester", "vanguard", "beacon_monitor", "listener"],
+    1: ["nexus", "beacon", "harvester", "vanguard", "beacon_monitor", "listener"],
+    2: ["nexus", "beacon", "harvester", "vanguard", "beacon_monitor", "listener"],
+    3: ["nexus", "beacon", "harvester", "vanguard", "beacon_monitor", "listener"],
+    4: ["nexus", "beacon", "harvester", "vanguard", "beacon_monitor", "listener"],
+    5: ["harvester", "listener"],
+    6: ["harvester", "listener"],
 }
 
 
 async def evaluate_lead_density_and_escalate(
     industry_name: str, influx_count: int, db_pool, background_tasks: BackgroundTasks
 ):
-    """🧠 ADAPTIVE INTAKE TRIGGER
-    Evaluates new data influx density, auto-prioritizes the vertical,
-    and forces an out-of-band emergency execution cycle if intent thresholds are broken.
-    """
+    """🧠 ADAPTIVE INTAKE TRIGGER"""
     if not industry_name or industry_name == "Unassigned":
         return
 
     try:
         async with db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                # 1. Dynamically boost priority based on influx volume
-                boost_weight = min(
-                    influx_count // 5 + 1, 10
-                )  # Caps max single boost at 10 points
+                boost_weight = min(influx_count // 5 + 1, 10)
                 await cur.execute(
                     """
                     UPDATE helix_brain_scheduler 
@@ -310,7 +294,6 @@ async def evaluate_lead_density_and_escalate(
                 "orchestration",
             )
 
-            # 2. EMERGENCY THRESHOLD CHECK: If it's a high-density drop, run it IMMEDIATELY
             if influx_count >= 10:
                 send_telegram_broadcast(
                     f"⚡ *HIGH DENSITY THRESHOLD BROKEN*\n"
@@ -319,7 +302,6 @@ async def evaluate_lead_density_and_escalate(
                     "orchestration",
                 )
 
-                # Atomically set the run timestamp so it rotates cleanly to the back of the line after this emergency execution
                 async with db_pool.connection() as conn:
                     async with conn.cursor() as cur:
                         await cur.execute(
@@ -328,7 +310,6 @@ async def evaluate_lead_density_and_escalate(
                         )
                     await conn.commit()
 
-                # Dispatch downstream agents instantly out-of-band
                 background_tasks.add_task(
                     trigger_downstream_mesh_with_payload,
                     updated_strategy,
@@ -340,32 +321,51 @@ async def evaluate_lead_density_and_escalate(
 
 
 async def sync_external_vendor_credits(db_pool):
-    """Hits live external billing API endpoints to synchronize current infrastructure metadata."""
+    """Hits live vendor endpoints and auto-resurrects infrastructure blocks if balances are healthy."""
     pb_key = os.getenv("PHANTOMBUSTER_API_KEY")
-    if pb_key:
-        try:
-            res = requests.get(
+    if not pb_key:
+        return
+
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
                 "https://api.phantombuster.com/v1/account",
                 headers={"X-PhantomBuster-Key": pb_key},
                 timeout=10,
             )
+
             if res.status_code == 200:
                 credits = res.json().get("orgCodeOrCredits", 100.0)
+
                 async with db_pool.connection() as conn:
                     async with conn.cursor() as cur:
                         await cur.execute(
-                            "UPDATE helix_infrastructure_oracle_ledger SET credits_remaining = %s, last_updated_at = NOW() WHERE vendor_name = 'PhantomBusters';",
+                            """
+                            UPDATE helix_infrastructure_oracle_ledger 
+                            SET credits_remaining = %s, last_updated_at = NOW() 
+                            WHERE vendor_name = 'PhantomBusters'
+                            RETURNING is_circuit_broken;
+                            """,
                             (credits,),
                         )
-                send_telegram_broadcast(
-                    f"Synced PhantomBusters remaining wallet credits: `{credits}`",
-                    "verbose",
-                )
-        except Exception as e:
-            print(f"Vendor credit sync delayed: {e}")
+                        row = await cur.fetchone()
+                        is_broken = row[0] if row else False
+
+                        if credits > 0 and is_broken:
+                            await cur.execute("""
+                                UPDATE helix_infrastructure_oracle_ledger 
+                                SET is_circuit_broken = FALSE 
+                                WHERE vendor_name = 'PhantomBusters';
+                                """)
+                            send_telegram_broadcast(
+                                "🔄 *INFRASTRUCTURE CIRCUIT HEALED*: PhantomBusters has been automatically re-activated.",
+                                "success",
+                            )
+                await conn.commit()
+    except Exception as e:
+        print(f"Vendor credit auto-heal sync delayed: {e}")
 
 
-# ─── 🧠 THE UNBROKEN CENTRAL HEARTBEAT (DST AWARE / ACTIVE ORCHESTRATOR) ───
 async def perpetual_awareness_loop():
     print(
         "🚀 [PERPETUAL BRAIN ENGINE] Heartbeat loop active with smart state recovery rules..."
@@ -381,7 +381,6 @@ async def perpetual_awareness_loop():
             current_date_str = est_now.strftime("%Y-%m-%d")
             current_weekday = est_now.weekday()
 
-            # 1. Fetch the absolute baseline agents scheduled to run on this specific day
             scheduled_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
             if not scheduled_agents_list:
                 send_telegram_broadcast(
@@ -392,7 +391,6 @@ async def perpetual_awareness_loop():
                 await asyncio.sleep(60)
                 continue
 
-            # 2. Check the database to see what agents have ALREADY executed logs today
             pending_agents_for_today = []
             async with app.state.db_pool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cur:
@@ -402,22 +400,18 @@ async def perpetual_awareness_loop():
                     completed_rows = await cur.fetchall()
                     completed_today_set = {r["executed_agent"] for r in completed_rows}
 
-                    # Deduplicate or group sub-parts (like mapping harvester tasks to the vanguard sequence)
-                    # to pinpoint what operations are genuinely unfulfilled for today
                     pending_agents_for_today = [
                         agent
                         for agent in scheduled_agents_list
                         if agent not in completed_today_set
                     ]
 
-            # 3. IF OUTSTANDING STEPS REMAIN AND WE HAVEN'T ALREADY DEPLOYED THIS BULK CYCLE
             if pending_agents_for_today and current_date_str != last_executed_date:
                 send_telegram_broadcast(
                     f"Awakening state recovery logic. Detected pending daily tasks: `{pending_agents_for_today}`",
                     "orchestration",
                 )
 
-                # ─── 🛡️ INFRASTRUCTURE CIRCUIT BREAKER PRE-FLIGHT CHECK ───
                 vendor_isolation_matrix = {}
                 async with app.state.db_pool.connection() as conn:
                     async with conn.cursor(row_factory=dict_row) as cur:
@@ -430,13 +424,19 @@ async def perpetual_awareness_loop():
                                 "is_circuit_broken"
                             ]
 
-                # Extract the top prioritized targeting vertical profile
+                # ─── ITEM 4: SLIDING WINDOW ANALYSIS ENFORCED HERE ───
                 async with app.state.db_pool.connection() as conn:
                     async with conn.cursor(row_factory=dict_row) as cur:
                         await cur.execute("""
                             SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
-                            FROM helix_brain_scheduler WHERE is_active = TRUE
-                            ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC LIMIT 1;
+                            FROM helix_brain_scheduler 
+                            WHERE is_active = TRUE 
+                            AND (
+                                last_targeted_at IS NULL 
+                                OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL
+                            )
+                            ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST 
+                            LIMIT 1;
                         """)
                         active_strategy = await cur.fetchone()
 
@@ -453,7 +453,6 @@ async def perpetual_awareness_loop():
                         "orchestration",
                     )
 
-                    # 🚀 CRITICAL REFACTOR: Trigger ONLY the remaining pending tasks, protecting limits and tokens
                     await trigger_downstream_mesh_with_payload(
                         active_strategy,
                         pending_agents_for_today,
@@ -472,20 +471,16 @@ async def perpetual_awareness_loop():
 
 
 async def process_roi_attribution_boost(email: str, status: str, db_pool):
-    """📈 CLOSED-LOOP ATTRIBUTION ENGINE
-    Tracks positive lead conversion events, reverse-maps them to their industry vertical,
-    and dynamically inflates the priority score so successful niches auto-accelerate.
-    """
+    """📈 CLOSED-LOOP ATTRIBUTION ENGINE"""
     normalized_status = status.lower().strip()
 
-    # Define reward weights based on conversion intent depth
     reward_weight = 0
     if "reply" in normalized_status:
-        reward_weight = 15  # Positive engagement boost
+        reward_weight = 15
     elif "meeting" in normalized_status or "booked" in normalized_status:
-        reward_weight = 40  # High-value milestone bonus
+        reward_weight = 40
     elif "won" in normalized_status or "converted" in normalized_status:
-        reward_weight = 100  # Maximum alignment ceiling
+        reward_weight = 100
 
     if reward_weight == 0:
         return
@@ -493,7 +488,6 @@ async def process_roi_attribution_boost(email: str, status: str, db_pool):
     try:
         async with db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                # 1. Reverse map the email to find the original captured industry niche
                 await cur.execute(
                     "SELECT industry FROM cold_leads WHERE email = %s LIMIT 1;",
                     (email,),
@@ -503,7 +497,6 @@ async def process_roi_attribution_boost(email: str, status: str, db_pool):
                 if lead_row and lead_row["industry"]:
                     target_industry = lead_row["industry"]
 
-                    # 2. Update priority score and reactivate industry if paused
                     await cur.execute(
                         """
                         UPDATE helix_brain_scheduler
@@ -619,13 +612,11 @@ async def trigger_downstream_mesh_with_payload(
                 },
             )
         )
-        # 🟢 ADDED NOTIFICATION
         send_telegram_broadcast(
             "Beacon task instructions successfully dispatched down-mesh.", "verbose"
         )
 
     if "beacon_monitor" in agent_list:
-        # Check the isolation matrix to protect API limits and handle infrastructure self-healing
         if isolation_matrix.get("PhantomBusters", False):
             send_telegram_broadcast(
                 "Skipping Beacon Monitor lead scraping cycle. PhantomBusters circuit breaker is TRIPPED.",
@@ -637,7 +628,7 @@ async def trigger_downstream_mesh_with_payload(
             ).rstrip("/")
             asyncio.create_task(
                 async_http_post_proxy(
-                    f"{url}/api/v1/beacon/execute",  # Or whatever activation endpoint your monitor uses
+                    f"{url}/api/v1/beacon/execute",
                     {
                         "X-Beacon-Auth-Token": master_token,
                         "Content-Type": "application/json",
@@ -666,7 +657,6 @@ async def trigger_downstream_mesh_with_payload(
                 {},
             )
         )
-        # 🟢 ADDED NOTIFICATION
         send_telegram_broadcast(
             "Listener sweep trigger successfully deployed down-mesh.", "verbose"
         )
@@ -691,48 +681,39 @@ async def trigger_downstream_mesh_with_payload(
                     {},
                 )
             )
-        # 🟢 ADDED NOTIFICATION
-        send_telegram_broadcast(
-            "Vanguard outbound campaign sweep initiated successfully.", "verbose"
-        )
+
+            # ✅ Indented to run ONLY on actual successful proxy dispatch
+            send_telegram_broadcast(
+                "Vanguard outbound campaign sweep initiated successfully.", "verbose"
+            )
 
 
 async def async_http_post_proxy(
     url: str, headers: dict, json_data: dict, max_retries: int = 3
 ):
-    """🚀 RESILIENT PROXY PROBE
-    Dispatches proxy commands down-mesh using exponential backoff retries
-    to absorb temporary network spikes or cold starts gracefully.
-    """
-    backoff = 2.0  # Base delay in seconds
-    for attempt in range(1, max_retries + 1):
-        try:
-            # Use a short timeout for the handshake, but allow background execution to process
-            response = requests.post(url, headers=headers, json=json_data, timeout=12)
+    """🚀 HIGH-PERFORMANCE PROXY PROBE"""
+    backoff = 2.0
+    async with httpx.AsyncClient(http2=True, timeout=12.0) as client:
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = await client.post(url, headers=headers, json=json_data)
 
-            # If the edge node returns a bad gateway or server error, trigger a retry
-            if response.status_code in [502, 503, 504]:
-                raise requests.exceptions.RequestException(
-                    f"Edge Node Server Error ({response.status_code})"
-                )
+                if response.status_code in [502, 503, 504]:
+                    raise httpx.HTTPStatusError(
+                        f"Edge Server Error ({response.status_code})",
+                        request=response.request,
+                        response=response,
+                    )
 
-            # Success path
-            return
-        except Exception as e:
-            if attempt == max_retries:
-                send_telegram_broadcast(
-                    f"💥 *MESH NODE UNREACHABLE*\n"
-                    f"Endpoint: `{url}` failed all {max_retries} connection attempts.\n"
-                    f"Final Exception: `{e}`",
-                    "critical",
-                )
-            else:
-                # Calculate exponential delay: 2s, 4s, 8s...
-                sleep_time = backoff**attempt
-                print(
-                    f"⚠️ Proxy connection failed to {url} (Attempt {attempt}/{max_retries}). Retrying in {sleep_time}s..."
-                )
-                await asyncio.sleep(sleep_time)
+                return
+            except Exception as e:
+                if attempt == max_retries:
+                    send_telegram_broadcast(
+                        f"💥 *MESH NODE UNREACHABLE*\nEndpoint: `{url}` failed all connection attempts.\nFinal Error: `{e}`",
+                        "critical",
+                    )
+                else:
+                    await asyncio.sleep(backoff**attempt)
 
 
 @asynccontextmanager
@@ -753,7 +734,7 @@ async def lifespan(app: FastAPI):
                 await cur.execute(HELIX_INBOUND_BLUEPRINTS_TABLE_SQL)
                 await cur.execute(SCHEDULER_TABLE_SQL)
             await conn.commit()
-        asyncio.create_task(perpetual_awareness_loop())
+        app.state.awareness_task = asyncio.create_task(perpetual_awareness_loop())
         send_telegram_broadcast(
             "Helix application cloud lifespan engine initialized successfully.",
             "success",
@@ -762,6 +743,8 @@ async def lifespan(app: FastAPI):
         traceback.print_exc()
         raise exc
     yield
+
+    app.state.awareness_task.cancel()
     await app.state.db_pool.close()
 
 
@@ -780,23 +763,15 @@ async def analyze_and_orchestrate_log(
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
 
-                # Proactive Success Metrics Tracking
                 if log_level == "INFO":
                     if "execution status: success" in norm_msg:
                         send_telegram_broadcast(
                             f"Agent `{agent_name}` reported an internal loop *SUCCESS* status metric.",
                             "success",
                         )
-                        if agent_name == "nexus":
-                            await cur.execute("""
-                                UPDATE helix_infrastructure_oracle_ledger
-                                SET credits_remaining = GREATEST(credits_remaining - 10.00, 0)
-                                WHERE vendor_name = 'PhantomBusters';
-                            """)
+                        # 🛑 FIXED REDUNDANT OVERRIDE HERE (Relying solely on sync_external_vendor_credits instead)
 
-                # Active Infrastructure Self-Healing Circuit Breakers
                 if log_level == "ERROR":
-                    # 1. IMMEDIATE INFRASTRUCTURE CRITICAL BILLING BLOCKS
                     if any(
                         t in norm_msg
                         for t in (
@@ -840,10 +815,7 @@ async def analyze_and_orchestrate_log(
                         await conn.commit()
                         return
 
-                    # 2. TIERED ESCALATION & AUTO-RESCUE FOR EXECUTION CRASHES
-                    # If it's a runtime error rather than a billing block, trigger a localized self-healing re-run
                     if industry:
-                        # Fetch the original scheduling payload to construct a rescue attempt
                         await cur.execute(
                             """
                             SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
@@ -878,7 +850,7 @@ async def analyze_and_orchestrate_log(
                                         {
                                             "trigger_reason": "helix_auto_rescue_escalation",
                                             "batch_size": 15,
-                                            "rescue_mode": True,  # Instructs Nexus to ignore cached blocks and rebuild state
+                                            "rescue_mode": True,
                                             "industry_id": strategy["industry_id"],
                                             "industry_name": strategy["industry_name"],
                                             "target_region": strategy["target_region"],
@@ -924,7 +896,6 @@ async def ingest_leads(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        # Sort leads into their respective industry groups to calculate batch density accurately
         industry_counts = {}
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -951,7 +922,6 @@ async def ingest_leads(
                         )
             await conn.commit()
 
-        # For every industry impacted by this batch data dump, evaluate the adaptive priority boost
         for industry, count in industry_counts.items():
             await evaluate_lead_density_and_escalate(
                 industry, count, app.state.db_pool, background_tasks
@@ -1000,8 +970,6 @@ async def inbound_blueprints(
                 )
             await conn.commit()
 
-        # Inbound blueprint submission represents a direct hot inbound prospect lead.
-        # We instantly enforce a density weight of 10 to guarantee a real-time emergency execution push.
         if payload.industry_name and payload.industry_name != "Unassigned":
             await evaluate_lead_density_and_escalate(
                 payload.industry_name, 10, app.state.db_pool, background_tasks
@@ -1020,7 +988,6 @@ async def update_lead_status_and_attribute(
     email: str = Query(...),
     x_vanguard_key: str | None = Header(default=None),
 ):
-    """Hook endpoint for Vanguard or CRMs to dispatch campaign outcome tracking updates."""
     expected_key = os.getenv("VANGUARD_API_KEY") or os.getenv("INBOUND_API_KEY")
     if expected_key and not (
         x_vanguard_key and hmac.compare_digest(x_vanguard_key, expected_key)
@@ -1041,7 +1008,6 @@ async def update_lead_status_and_attribute(
                 )
             await conn.commit()
 
-        # Fire background tracking script to calculate priority shifts
         asyncio.create_task(
             process_roi_attribution_boost(email, payload.status, app.state.db_pool)
         )
@@ -1113,10 +1079,17 @@ async def execute_orchestrated_master_cycle(
 
     async with app.state.db_pool.connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
+            # ─── ITEM 4: SLIDING WINDOW WINDOW ADDED HERE TO MANUAL CYCLES ───
             await cur.execute("""
                 SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
-                FROM helix_brain_scheduler WHERE is_active = TRUE
-                ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC LIMIT 1;
+                FROM helix_brain_scheduler 
+                WHERE is_active = TRUE 
+                AND (
+                    last_targeted_at IS NULL 
+                    OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL
+                )
+                ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST 
+                LIMIT 1;
             """)
             strategy = await cur.fetchone()
             if strategy:
@@ -1160,10 +1133,16 @@ async def get_current_scheduler_target(
 
     async with app.state.db_pool.connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
+            # ─── ITEM 4: SLIDING WINDOW ALIGNMENT FOR DIAGNOSTIC ENDPOINTS ───
             await cur.execute("""
                 SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region, last_targeted_at, priority_score
-                FROM helix_brain_scheduler WHERE is_active = TRUE
-                ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC LIMIT 1;
+                FROM helix_brain_scheduler 
+                WHERE is_active = TRUE
+                AND (
+                    last_targeted_at IS NULL 
+                    OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL
+                )
+                ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
             """)
             row = await cur.fetchone()
     if not row:
@@ -1180,11 +1159,6 @@ async def get_current_scheduler_target(
 async def get_dashboard_diagnostics(
     x_helix_auth_token: Optional[str] = Header(default=None),
 ):
-    """
-    🧠 HELIX CENTRAL BRAIN TELEMETRY
-    Aggregates real-time state configurations, maps daily pipeline achievements,
-    and exposes infrastructure circuit breakers directly from the oracle ledgers.
-    """
     expected = os.getenv("HELIX_AUTH_TOKEN")
     if expected and not (
         x_helix_auth_token and hmac.compare_digest(x_helix_auth_token, expected)
@@ -1204,11 +1178,9 @@ async def get_dashboard_diagnostics(
     }
 
     try:
-        # 1. Gather logs and infrastructure health from the Main DB (DATABASE_URL)
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
 
-                # Pull metrics on what components completed tasks today
                 await cur.execute("""
                     SELECT agent_name, COUNT(*) as action_count, MAX(message) as last_milestone
                     FROM agent_system_logs 
@@ -1223,8 +1195,6 @@ async def get_dashboard_diagnostics(
                         "last_seen_milestone": row["last_milestone"],
                     }
 
-                # Pull circuit breaker status maps from the infrastructure ledger
-                # Pre-flight check handles checking if standard nodes are suppressed or isolated
                 try:
                     await cur.execute("""
                         SELECT vendor_name, credits_remaining, is_circuit_broken 
@@ -1271,7 +1241,6 @@ async def get_dashboard_diagnostics(
                         "error"
                     ] = f"Oracle ledger unreadable: {inner_db}"
 
-        # 2. Gather staging thresholds from the Outbound DB (VANGUARD_DATABASE_URL)
         vanguard_url = os.getenv("VANGUARD_DATABASE_URL")
         if vanguard_url:
             if "?sslmode=require" not in vanguard_url:
@@ -1279,14 +1248,12 @@ async def get_dashboard_diagnostics(
 
             async with await psycopg.AsyncConnection.connect(vanguard_url) as v_conn:
                 async with v_conn.cursor() as v_cur:
-                    # Count leads still marked as raw scraped targets
                     await v_cur.execute(
                         "SELECT COUNT(*) FROM cold_leads WHERE status = 'scraped';"
                     )
                     scraped_row = await v_cur.fetchone()
                     scraped_count = scraped_row[0] if scraped_row else 0
 
-                    # Count leads successfully processed and advanced by Vector
                     await v_cur.execute(
                         "SELECT COUNT(*) FROM cold_leads WHERE status = 'ready_to_send';"
                     )
