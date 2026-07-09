@@ -12,6 +12,8 @@ import httpx
 from anthropic import Anthropic
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional, List
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request, Header, BackgroundTasks
@@ -48,14 +50,160 @@ MOLTSET_ALLOWED_CATEGORIES = [
     "Agriculture",
 ]
 
+NEW_YORK_TZ = ZoneInfo("America/New_York")
+PHANTOMBUSTER_KEYWORD_STAIRCASE = [25, 12, 8, 5]
+PHANTOMBUSTER_ZERO_RESULT_THRESHOLD = 2
+PHANTOMBUSTER_TUNING_COOLDOWN_MINUTES = 60
+
 
 def get_validated_database_url() -> str:
     url = os.getenv("DATABASE_URL", "")
     if not url or not url.startswith("postgresql://"):
         raise ValueError("Missing or invalid cloud DATABASE_URL.")
-    if "?sslmode=require" not in url:
-        url = url + "?sslmode=require"
+    parsed = urlparse(url)
+    query_map = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if query_map.get("sslmode") != "require":
+        query_map["sslmode"] = "require"
+        url = urlunparse(parsed._replace(query=urlencode(query_map)))
     return url
+
+
+def get_new_york_now() -> datetime.datetime:
+    return datetime.datetime.now(NEW_YORK_TZ)
+
+
+def get_phantombuster_keyword_cap(industry_name: str | None = None) -> int:
+    default_cap = PHANTOMBUSTER_KEYWORD_STAIRCASE[0]
+    if not industry_name:
+        return default_cap
+    remediation_state = getattr(app.state, "phantombuster_remediation", {})
+    industry_state = remediation_state.get(industry_name.lower(), {})
+    keyword_cap = industry_state.get("keyword_cap", default_cap)
+    return max(PHANTOMBUSTER_KEYWORD_STAIRCASE[-1], int(keyword_cap))
+
+
+def apply_phantombuster_zero_result_policy(
+    industry_name: str | None,
+) -> dict[str, Any] | None:
+    """Move an industry through Watch -> Constrained -> Isolated states using bounded keyword caps."""
+    if not industry_name:
+        return None
+
+    key = industry_name.lower().strip()
+    if not key:
+        return None
+
+    remediation_state = getattr(app.state, "phantombuster_remediation", None)
+    if remediation_state is None:
+        app.state.phantombuster_remediation = {}
+        remediation_state = app.state.phantombuster_remediation
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    entry = remediation_state.get(
+        key,
+        {
+            "state": "healthy",
+            "zero_streak": 0,
+            "keyword_cap": PHANTOMBUSTER_KEYWORD_STAIRCASE[0],
+            "cooldown_until": None,
+        },
+    )
+
+    cooldown_until = entry.get("cooldown_until")
+    if isinstance(cooldown_until, datetime.datetime) and now_utc < cooldown_until:
+        return {
+            "state": entry.get("state", "watch"),
+            "industry": industry_name,
+            "keyword_cap": entry.get("keyword_cap", PHANTOMBUSTER_KEYWORD_STAIRCASE[0]),
+            "cooldown_active": True,
+            "cooldown_until": cooldown_until.isoformat(),
+        }
+
+    entry["zero_streak"] = int(entry.get("zero_streak", 0)) + 1
+    current_cap = int(entry.get("keyword_cap", PHANTOMBUSTER_KEYWORD_STAIRCASE[0]))
+
+    if entry["zero_streak"] < PHANTOMBUSTER_ZERO_RESULT_THRESHOLD:
+        entry["state"] = "watch"
+        remediation_state[key] = entry
+        return {
+            "state": "watch",
+            "industry": industry_name,
+            "keyword_cap": current_cap,
+            "zero_streak": entry["zero_streak"],
+            "cooldown_active": False,
+        }
+
+    next_cap = current_cap
+    for stage_cap in PHANTOMBUSTER_KEYWORD_STAIRCASE:
+        if stage_cap < current_cap:
+            next_cap = stage_cap
+            break
+
+    if next_cap < current_cap:
+        entry["state"] = "constrained"
+        entry["keyword_cap"] = next_cap
+        entry["zero_streak"] = 0
+        entry["cooldown_until"] = now_utc + datetime.timedelta(
+            minutes=PHANTOMBUSTER_TUNING_COOLDOWN_MINUTES
+        )
+    else:
+        entry["state"] = "isolated"
+        entry["keyword_cap"] = PHANTOMBUSTER_KEYWORD_STAIRCASE[-1]
+        entry["zero_streak"] = 0
+        entry["cooldown_until"] = now_utc + datetime.timedelta(
+            minutes=PHANTOMBUSTER_TUNING_COOLDOWN_MINUTES
+        )
+
+    remediation_state[key] = entry
+    return {
+        "state": entry["state"],
+        "industry": industry_name,
+        "keyword_cap": entry["keyword_cap"],
+        "zero_streak": entry["zero_streak"],
+        "cooldown_active": False,
+        "cooldown_until": entry["cooldown_until"].isoformat(),
+    }
+
+
+def reset_phantombuster_policy_on_success(industry_name: str | None) -> None:
+    if not industry_name:
+        return
+    remediation_state = getattr(app.state, "phantombuster_remediation", None)
+    if not remediation_state:
+        return
+    key = industry_name.lower().strip()
+    if not key or key not in remediation_state:
+        return
+
+    remediation_state[key] = {
+        "state": "healthy",
+        "zero_streak": 0,
+        "keyword_cap": remediation_state[key].get(
+            "keyword_cap", PHANTOMBUSTER_KEYWORD_STAIRCASE[0]
+        ),
+        "cooldown_until": None,
+    }
+
+
+def is_phantombuster_zero_result_signal(message: str, metadata: dict[str, Any]) -> bool:
+    combined = f"{message} {json.dumps(metadata)}".lower()
+    if "phantombuster" not in combined:
+        return False
+
+    if any(token in combined for token in ("0 results", "zero results", "no results")):
+        return True
+
+    results_count = metadata.get("results_count")
+    if isinstance(results_count, int) and results_count == 0:
+        return True
+    if (
+        isinstance(results_count, str)
+        and results_count.isdigit()
+        and int(results_count) == 0
+    ):
+        return True
+
+    return False
 
 
 def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
@@ -74,16 +222,36 @@ def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
     prefix = prefixes.get(notification_type, "📡")
     formatted_message = f"{prefix}\n{message}"
 
+    async def _send() -> None:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={
+                        "chat_id": chat_id,
+                        "text": formatted_message,
+                        "parse_mode": "Markdown",
+                    },
+                )
+        except Exception as e:
+            print(f"⚠️ Telegram broadcast failed: {e}")
+
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": formatted_message,
-                "parse_mode": "Markdown",
-            },
-            timeout=5,
-        )
+        loop = asyncio.get_running_loop()
+        loop.create_task(_send())
+    except RuntimeError:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": formatted_message,
+                    "parse_mode": "Markdown",
+                },
+                timeout=5,
+            )
+        except Exception as e:
+            print(f"⚠️ Telegram broadcast failed: {e}")
     except Exception as e:
         print(f"⚠️ Telegram broadcast failed: {e}")
 
@@ -124,7 +292,10 @@ def run_deterministic_moltset_mapping(ai_client: Anthropic, industry_name: str) 
         for block in response.content:
             if block.type == "tool_use" and block.name == "categorize_industry":
                 chosen_category = block.input.get("category")
-                if chosen_category in MOLTSET_ALLOWED_CATEGORIES:
+                if (
+                    isinstance(chosen_category, str)
+                    and chosen_category in MOLTSET_ALLOWED_CATEGORIES
+                ):
                     return chosen_category
 
     except Exception as e:
@@ -382,11 +553,7 @@ async def perpetual_awareness_loop():
 
     while True:
         try:
-            utc_now = datetime.datetime.now(datetime.timezone.utc)
-            # Hardcoded offset fix: Use -4 for EDT (Summer) or -5 for EST (Winter)
-            # Or simply leave it as-is if you don't mind the 1am start,
-            # but now it will drip feed instead of exploding!
-            est_now = utc_now + datetime.timedelta(hours=-4)
+            est_now = get_new_york_now()
 
             current_date_str = est_now.strftime("%Y-%m-%d")
             current_weekday = est_now.weekday()
@@ -663,11 +830,13 @@ async def trigger_downstream_mesh_with_payload(
             url = os.getenv(
                 "BEACON_MONITOR_API_URL", "https://polaris-beacon-monitor.onrender.com"
             ).rstrip("/")
+            keyword_cap = get_phantombuster_keyword_cap(strategy.get("industry_name"))
             asyncio.create_task(
                 async_http_post_proxy(
                     f"{url}/api/v1/beacon/execute",
                     {
                         "X-Beacon-Auth-Token": master_token,
+                        "X-Helix-Keyword-Cap": str(keyword_cap),
                         "Content-Type": "application/json",
                     },
                     {
@@ -737,9 +906,13 @@ async def async_http_post_proxy(
         for attempt in range(1, max_retries + 1):
             try:
                 response = await client.post(url, headers=headers, json=json_data)
+                status_code = response.status_code
+
+                if 200 <= status_code < 300:
+                    return True
 
                 # 🩹 Catch explicit validation layout errors
-                if response.status_code == 422:
+                if status_code == 422:
                     try:
                         error_details = response.json()
                     except Exception:
@@ -753,13 +926,38 @@ async def async_http_post_proxy(
                     )
                     return False  # 🩹 Failed validation gate
 
-                if response.status_code in [502, 503, 504]:
+                # 408/429 are commonly transient and should be retried.
+                if status_code in (408, 429):
                     raise httpx.HTTPStatusError(
-                        f"Edge Server Error ({response.status_code})",
+                        f"Retryable Client Status ({status_code})",
                         request=response.request,
                         response=response,
                     )
-                return True  # 🩹 Success!
+
+                if 400 <= status_code < 500:
+                    response_excerpt = (response.text or "")[:300]
+                    send_telegram_broadcast(
+                        f"⚠️ *DOWNSTREAM CLIENT REJECTION*\n"
+                        f"Target Node: `{url}` returned status `{status_code}`.\n"
+                        f"Payload was not accepted.\n"
+                        f"Excerpt: `{response_excerpt}`",
+                        "critical",
+                    )
+                    return False
+
+                if status_code in [502, 503, 504] or 500 <= status_code < 600:
+                    raise httpx.HTTPStatusError(
+                        f"Edge Server Error ({status_code})",
+                        request=response.request,
+                        response=response,
+                    )
+
+                send_telegram_broadcast(
+                    f"⚠️ *UNEXPECTED DOWNSTREAM RESPONSE*\n"
+                    f"Target Node: `{url}` returned status `{status_code}`.",
+                    "verbose",
+                )
+                return False
             except Exception as e:
                 # 🩹 Trace the hidden background error directly to your screen
                 send_telegram_broadcast(
@@ -786,6 +984,7 @@ async def lifespan(app: FastAPI):
     )
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
     app.state.ai_client = Anthropic(api_key=anthropic_key) if anthropic_key else None
+    app.state.phantombuster_remediation = {}
 
     try:
         await app.state.db_pool.open(wait=True)
@@ -811,30 +1010,47 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Helix Strategic Orchestration Core API", lifespan=lifespan)
 
 
-# --- TELEMETRY LOG ANALYSIS AND AUTONOMOUS PROACTIVE SELF-HEALING ---
 async def analyze_and_orchestrate_log(
     agent_name: str, log_level: str, message: str, metadata: dict | None
 ) -> None:
     norm_msg = message.lower()
+    normalized_log_level = str(log_level or "INFO").upper()
     meta = metadata if isinstance(metadata, dict) else {}
     industry = meta.get("industry_name") or meta.get("industry")
 
-    # 🩹 Fix: Combine the message and metadata error text together so nothing gets missed
-    extended_error_context = f"{norm_msg} {str(meta.get('error', '')).lower()}"
+    # FIX: Recursively scan everything inside metadata to prevent missing nested tokens
+    meta_string_dump = json.dumps(meta).lower()
+    extended_error_context = f"{norm_msg} {meta_string_dump}"
 
     try:
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
 
-                if log_level == "INFO":
+                if normalized_log_level == "INFO":
                     if "execution status: success" in norm_msg:
                         send_telegram_broadcast(
                             f"Agent `{agent_name}` reported an internal loop *SUCCESS* status metric.",
                             "success",
                         )
-                        # 🛑 FIXED REDUNDANT OVERRIDE HERE (Relying solely on sync_external_vendor_credits instead)
 
-                if log_level == "ERROR":
+                    if "phantombuster" in extended_error_context:
+                        if is_phantombuster_zero_result_signal(message, meta):
+                            policy_state = apply_phantombuster_zero_result_policy(
+                                industry
+                            )
+                            if policy_state:
+                                send_telegram_broadcast(
+                                    f"🧭 *PHANTOMBUSTER POLICY ADJUSTMENT*\n"
+                                    f"Industry: `{policy_state['industry']}`\n"
+                                    f"State: `{policy_state['state']}`\n"
+                                    f"Keyword cap: `{policy_state['keyword_cap']}`",
+                                    "orchestration",
+                                )
+                        else:
+                            reset_phantombuster_policy_on_success(industry)
+
+                if normalized_log_level == "ERROR":
+                    # Expanded checks to catch variations of credit exhaustions
                     if any(
                         t in extended_error_context
                         for t in (
@@ -842,11 +1058,14 @@ async def analyze_and_orchestrate_log(
                             "credit limit",
                             "exhausted",
                             "api_key_expired",
+                            "execution ceiling",
                         )
                     ):
-                        await cur.execute(
-                            "UPDATE helix_infrastructure_oracle_ledger SET is_circuit_broken = TRUE, credits_remaining = 0 WHERE vendor_name = 'PhantomBusters';"
-                        )
+                        await cur.execute("""
+                            UPDATE helix_infrastructure_oracle_ledger 
+                            SET is_circuit_broken = TRUE, credits_remaining = 0 
+                            WHERE vendor_name = 'PhantomBusters';
+                        """)
                         if industry:
                             await cur.execute(
                                 "UPDATE helix_brain_scheduler SET is_active = FALSE WHERE industry_name = %s;",
@@ -868,18 +1087,19 @@ async def analyze_and_orchestrate_log(
                             "token balance low",
                         )
                     ):
-                        async with app.state.db_pool.connection() as conn:
-                            async with conn.cursor() as cur:
-                                await cur.execute(
-                                    "UPDATE helix_infrastructure_oracle_ledger SET is_circuit_broken = TRUE, credits_remaining = 0 WHERE vendor_name = 'MyEmailVerifier';"
-                                )
-                                send_telegram_broadcast(
-                                    "🚨 [CIRCUIT BREAKER] MyEmailVerifier ledger empty. Outbound sweeps hard-stopped.",
-                                    "critical",
-                                )
-                                await conn.commit()
-                                return
+                        await cur.execute("""
+                            UPDATE helix_infrastructure_oracle_ledger 
+                            SET is_circuit_broken = TRUE, credits_remaining = 0 
+                            WHERE vendor_name = 'MyEmailVerifier';
+                        """)
+                        send_telegram_broadcast(
+                            "🚨 [CIRCUIT BREAKER] MyEmailVerifier ledger empty. Outbound sweeps hard-stopped.",
+                            "critical",
+                        )
+                        await conn.commit()
+                        return
 
+                    # Default fallback logic for industry auto-healing rescues
                     if industry:
                         await cur.execute(
                             """
@@ -918,9 +1138,7 @@ async def analyze_and_orchestrate_log(
                                             "rescue_mode": True,
                                             "industry_id": strategy["industry_id"],
                                             "industry_name": strategy["industry_name"],
-                                            "target_niche": strategy[
-                                                "industry_name"
-                                            ],  # ✅ FIXED: Mapped to satisfy the schema
+                                            "target_niche": strategy["industry_name"],
                                             "target_region": strategy["target_region"],
                                             "bottleneck_profile": strategy[
                                                 "bottleneck_profile"
@@ -1247,8 +1465,7 @@ async def get_dashboard_diagnostics(
             status_code=401, detail="Unauthorized Dashboard Gateway Access."
         )
 
-    utc_now = datetime.datetime.now(datetime.timezone.utc)
-    est_now = utc_now + datetime.timedelta(hours=-5)
+    est_now = get_new_york_now()
 
     diagnostics = {
         "timestamp": est_now.isoformat(),
