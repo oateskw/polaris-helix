@@ -72,6 +72,22 @@ CREATE TABLE IF NOT EXISTS helix_brain_scheduler (
 );
 
 CREATE INDEX IF NOT EXISTS idx_hbs_last_targeted ON helix_brain_scheduler (last_targeted_at);
+
+CREATE TABLE IF NOT EXISTS helix_infrastructure_oracle_ledger (
+    vendor_name VARCHAR(50) PRIMARY KEY,
+    credits_remaining NUMERIC(10, 2) NOT NULL DEFAULT 100.00,
+    credit_unit VARCHAR(20) NOT NULL DEFAULT 'USD',
+    is_circuit_broken BOOLEAN DEFAULT FALSE,
+    last_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO helix_infrastructure_oracle_ledger
+    (vendor_name, credits_remaining, credit_unit, is_circuit_broken)
+VALUES
+    ('MyEmailVerifier', 100.00, 'Tokens', FALSE),
+    ('PhantomBusters', 1200.00, 'Minutes', FALSE),
+    ('MoltSet', 200.00, 'Tokens', FALSE)
+ON CONFLICT (vendor_name) DO NOTHING;
 """
 
 

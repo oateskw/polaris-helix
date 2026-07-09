@@ -3,6 +3,7 @@ import os
 import re
 import traceback
 import asyncio
+import random
 import json
 import hmac
 import requests
@@ -10,7 +11,7 @@ import datetime
 import psycopg
 import httpx
 from anthropic import Anthropic
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal, Optional, List
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo
@@ -54,6 +55,13 @@ NEW_YORK_TZ = ZoneInfo("America/New_York")
 PHANTOMBUSTER_KEYWORD_STAIRCASE = [25, 12, 8, 5]
 PHANTOMBUSTER_ZERO_RESULT_THRESHOLD = 2
 PHANTOMBUSTER_TUNING_COOLDOWN_MINUTES = 60
+VENDOR_PHANTOMBUSTERS = "PhantomBusters"
+VENDOR_MYEMAILVERIFIER = "MyEmailVerifier"
+VENDOR_MOLTSET = "Moltset"
+VENDOR_ANTHROPIC = "Anthropic"
+LEDGER_QUERYABLE_VENDORS = (VENDOR_MYEMAILVERIFIER, VENDOR_PHANTOMBUSTERS)
+CREDIT_SYNC_INTERVAL_SECONDS = 8 * 60 * 60
+CREDIT_SYNC_JITTER_SECONDS = 10 * 60
 
 
 def get_validated_database_url() -> str:
@@ -408,6 +416,120 @@ CREATE TABLE IF NOT EXISTS helix_brain_scheduler (
 );
 """
 
+HELIX_INFRASTRUCTURE_ORACLE_LEDGER_SQL = """
+CREATE TABLE IF NOT EXISTS helix_infrastructure_oracle_ledger (
+    vendor_name VARCHAR(50) PRIMARY KEY,
+    credits_remaining NUMERIC(10, 2) NOT NULL DEFAULT 100.00,
+    credit_unit VARCHAR(20) NOT NULL DEFAULT 'USD',
+    is_circuit_broken BOOLEAN DEFAULT FALSE,
+    last_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+
+def parse_credit_value(raw_value: Any) -> float | None:
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, (int, float)):
+        return float(raw_value)
+    if isinstance(raw_value, str):
+        cleaned = raw_value.strip().replace(",", "")
+        match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+        if match:
+            return float(match.group(0))
+    return None
+
+
+async def seed_oracle_ledger_rows(db_pool) -> None:
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.executemany(
+                """
+                INSERT INTO helix_infrastructure_oracle_ledger
+                    (vendor_name, credits_remaining, credit_unit, is_circuit_broken)
+                VALUES (%s, 100.00, 'USD', FALSE)
+                ON CONFLICT (vendor_name) DO NOTHING;
+                """,
+                [(vendor_name,) for vendor_name in LEDGER_QUERYABLE_VENDORS],
+            )
+        await conn.commit()
+
+
+async def load_vendor_isolation_matrix(db_pool) -> dict[str, bool]:
+    vendor_isolation_matrix: dict[str, bool] = {}
+    try:
+        async with db_pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT vendor_name, is_circuit_broken FROM helix_infrastructure_oracle_ledger;"
+                )
+                rows = await cur.fetchall()
+                for row in rows:
+                    vendor_isolation_matrix[row["vendor_name"]] = bool(
+                        row["is_circuit_broken"]
+                    )
+
+        if getattr(app.state, "vendor_matrix_degraded", False):
+            app.state.vendor_matrix_degraded = False
+            send_telegram_broadcast(
+                "✅ Vendor isolation matrix recovered. Circuit guardrails are live again.",
+                "success",
+            )
+    except Exception as exc:
+        if not getattr(app.state, "vendor_matrix_degraded", False):
+            app.state.vendor_matrix_degraded = True
+            send_telegram_broadcast(
+                "🚨 Vendor isolation matrix read failed. Running fail-safe with default open matrix until recovery.",
+                "critical",
+            )
+        print(f"⚠️ Vendor isolation matrix load failed: {exc}")
+    return vendor_isolation_matrix
+
+
+async def upsert_vendor_credit_state(
+    db_pool,
+    vendor_name: str,
+    credits_remaining: float | None,
+    is_circuit_broken: bool,
+) -> None:
+    normalized_credits = 0.0 if credits_remaining is None else float(credits_remaining)
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO helix_infrastructure_oracle_ledger
+                    (vendor_name, credits_remaining, credit_unit, is_circuit_broken, last_updated_at)
+                VALUES (%s, %s, 'USD', %s, NOW())
+                ON CONFLICT (vendor_name)
+                DO UPDATE SET
+                    credits_remaining = EXCLUDED.credits_remaining,
+                    is_circuit_broken = EXCLUDED.is_circuit_broken,
+                    credit_unit = EXCLUDED.credit_unit,
+                    last_updated_at = NOW();
+                """,
+                (
+                    vendor_name,
+                    normalized_credits,
+                    is_circuit_broken,
+                ),
+            )
+        await conn.commit()
+
+
+async def mark_vendor_fail_closed(
+    db_pool, vendor_name: str, failure_reason: str
+) -> None:
+    await upsert_vendor_credit_state(
+        db_pool,
+        vendor_name=vendor_name,
+        credits_remaining=0.0,
+        is_circuit_broken=True,
+    )
+    send_telegram_broadcast(
+        f"🚨 [CIRCUIT BREAKER] {vendor_name} credit sync failed. Fail-closed isolation engaged. Reason: {failure_reason[:200]}",
+        "critical",
+    )
+
 
 async def log_helix_state(
     cur, strategic_mode: str, geo_lock: str, buying_signal: str
@@ -475,17 +597,9 @@ async def evaluate_lead_density_and_escalate(
                 )
 
                 # 🩹 Query the database to construct the live vendor isolation matrix
-                vendor_isolation_matrix = {}
-                async with app.state.db_pool.connection() as conn:
-                    async with conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute(
-                            "SELECT vendor_name, is_circuit_broken FROM helix_infrastructure_oracle_ledger;"
-                        )
-                        rows = await cur.fetchall()
-                        for row in rows:
-                            vendor_isolation_matrix[row["vendor_name"]] = row[
-                                "is_circuit_broken"
-                            ]
+                vendor_isolation_matrix = await load_vendor_isolation_matrix(
+                    app.state.db_pool
+                )
 
                 send_telegram_broadcast(
                     f"🚀 *REAL-TIME MESH ESCALATION INITIATED*\n"
@@ -503,9 +617,19 @@ async def evaluate_lead_density_and_escalate(
 
 
 async def sync_external_vendor_credits(db_pool):
-    """Hits live vendor endpoints and auto-resurrects infrastructure blocks if balances are healthy."""
+    """Sync balances for queryable vendors and enforce circuit-breaker state."""
+    await sync_phantombuster_credits(db_pool)
+    await sync_myemailverifier_credits(db_pool)
+
+
+async def sync_phantombuster_credits(db_pool) -> None:
     pb_key = os.getenv("PHANTOMBUSTER_API_KEY")
     if not pb_key:
+        await mark_vendor_fail_closed(
+            db_pool,
+            VENDOR_PHANTOMBUSTERS,
+            "Missing PHANTOMBUSTER_API_KEY",
+        )
         return
 
     try:
@@ -516,36 +640,135 @@ async def sync_external_vendor_credits(db_pool):
                 timeout=10,
             )
 
-            if res.status_code == 200:
-                credits = res.json().get("orgCodeOrCredits", 100.0)
+            if res.status_code != 200:
+                await mark_vendor_fail_closed(
+                    db_pool,
+                    VENDOR_PHANTOMBUSTERS,
+                    f"PhantomBuster returned HTTP {res.status_code}",
+                )
+                return
 
-                async with db_pool.connection() as conn:
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            """
-                            UPDATE helix_infrastructure_oracle_ledger 
-                            SET credits_remaining = %s, last_updated_at = NOW() 
-                            WHERE vendor_name = 'PhantomBusters'
-                            RETURNING is_circuit_broken;
-                            """,
-                            (credits,),
-                        )
-                        row = await cur.fetchone()
-                        is_broken = row[0] if row else False
+            payload = res.json()
+            credits = parse_credit_value(payload.get("orgCodeOrCredits"))
+            if credits is None:
+                await mark_vendor_fail_closed(
+                    db_pool,
+                    VENDOR_PHANTOMBUSTERS,
+                    "Unable to parse orgCodeOrCredits from PhantomBuster response",
+                )
+                return
 
-                        if credits > 0 and is_broken:
-                            await cur.execute("""
-                                UPDATE helix_infrastructure_oracle_ledger 
-                                SET is_circuit_broken = FALSE 
-                                WHERE vendor_name = 'PhantomBusters';
-                                """)
-                            send_telegram_broadcast(
-                                "🔄 *INFRASTRUCTURE CIRCUIT HEALED*: PhantomBusters has been automatically re-activated.",
-                                "success",
-                            )
-                await conn.commit()
+            is_circuit_broken = credits <= 0
+            await upsert_vendor_credit_state(
+                db_pool,
+                vendor_name=VENDOR_PHANTOMBUSTERS,
+                credits_remaining=credits,
+                is_circuit_broken=is_circuit_broken,
+            )
+
+            if not is_circuit_broken:
+                send_telegram_broadcast(
+                    "🔄 *INFRASTRUCTURE CIRCUIT HEALED*: PhantomBusters has been automatically re-activated.",
+                    "success",
+                )
+            else:
+                send_telegram_broadcast(
+                    "🚨 [CIRCUIT BREAKER] PhantomBusters credits are depleted. Isolation engaged.",
+                    "critical",
+                )
     except Exception as e:
-        print(f"Vendor credit auto-heal sync delayed: {e}")
+        await mark_vendor_fail_closed(
+            db_pool,
+            VENDOR_PHANTOMBUSTERS,
+            f"PhantomBuster sync exception: {e}",
+        )
+
+
+async def sync_myemailverifier_credits(db_pool) -> None:
+    mev_key = os.getenv("MYEMAILVERIFIER_API_KEY")
+    if not mev_key:
+        await mark_vendor_fail_closed(
+            db_pool,
+            VENDOR_MYEMAILVERIFIER,
+            "Missing MYEMAILVERIFIER_API_KEY",
+        )
+        return
+
+    endpoint = f"https://client.myemailverifier.com/verifier/getcredits/{mev_key}"
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(endpoint, timeout=10)
+
+            if res.status_code != 200:
+                await mark_vendor_fail_closed(
+                    db_pool,
+                    VENDOR_MYEMAILVERIFIER,
+                    f"MyEmailVerifier returned HTTP {res.status_code}",
+                )
+                return
+
+            payload = res.json()
+            if payload.get("status") is False:
+                failure_message = payload.get(
+                    "message", "MyEmailVerifier rejected request"
+                )
+                await mark_vendor_fail_closed(
+                    db_pool,
+                    VENDOR_MYEMAILVERIFIER,
+                    str(failure_message),
+                )
+                return
+
+            credits = parse_credit_value(
+                payload.get("Credits") or payload.get("credits")
+            )
+            if credits is None:
+                await mark_vendor_fail_closed(
+                    db_pool,
+                    VENDOR_MYEMAILVERIFIER,
+                    "Unable to parse Credits from MyEmailVerifier response",
+                )
+                return
+
+            is_circuit_broken = credits <= 0
+            await upsert_vendor_credit_state(
+                db_pool,
+                vendor_name=VENDOR_MYEMAILVERIFIER,
+                credits_remaining=credits,
+                is_circuit_broken=is_circuit_broken,
+            )
+
+            if not is_circuit_broken:
+                send_telegram_broadcast(
+                    "🔄 *INFRASTRUCTURE CIRCUIT HEALED*: MyEmailVerifier has been automatically re-activated.",
+                    "success",
+                )
+            else:
+                send_telegram_broadcast(
+                    "🚨 [CIRCUIT BREAKER] MyEmailVerifier credits are depleted. Isolation engaged.",
+                    "critical",
+                )
+    except Exception as e:
+        await mark_vendor_fail_closed(
+            db_pool,
+            VENDOR_MYEMAILVERIFIER,
+            f"MyEmailVerifier sync exception: {e}",
+        )
+
+
+async def credit_sync_scheduler_loop(db_pool) -> None:
+    while True:
+        try:
+            jitter_seconds = random.randint(
+                -CREDIT_SYNC_JITTER_SECONDS, CREDIT_SYNC_JITTER_SECONDS
+            )
+            sleep_seconds = max(300, CREDIT_SYNC_INTERVAL_SECONDS + jitter_seconds)
+            await asyncio.sleep(sleep_seconds)
+            await sync_external_vendor_credits(db_pool)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"⚠️ Credit scheduler loop anomaly: {exc}")
 
 
 async def perpetual_awareness_loop():
@@ -596,17 +819,12 @@ async def perpetual_awareness_loop():
                 ]  # Take the first pending agent
 
                 # 🩹 Define and populate the missing matrix from the database ledger
-                vendor_isolation_matrix = {}
+                vendor_isolation_matrix = await load_vendor_isolation_matrix(
+                    app.state.db_pool
+                )
+
                 async with app.state.db_pool.connection() as conn:
                     async with conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute(
-                            "SELECT vendor_name, is_circuit_broken FROM helix_infrastructure_oracle_ledger;"
-                        )
-                        rows = await cur.fetchall()
-                        for row in rows:
-                            vendor_isolation_matrix[row["vendor_name"]] = row[
-                                "is_circuit_broken"
-                            ]
 
                         # 🩹 Fix: Allow beacon_monitor and listener to hook into the current active strategy
                         # even if its last_targeted_at timestamp was just updated by a sister agent.
@@ -718,7 +936,7 @@ async def trigger_downstream_mesh_with_payload(
 
     # 1. NEXUS OMNI-STRATEGIST (MUST SUCCEED FIRST)
     if "nexus" in agent_list:
-        if isolation_matrix.get("Anthropic", False):
+        if isolation_matrix.get(VENDOR_ANTHROPIC, False):
             send_telegram_broadcast(
                 "Skipping Nexus Omni-Strategist sync sequence. Anthropic wallet ledger is isolated.",
                 "critical",
@@ -764,7 +982,7 @@ async def trigger_downstream_mesh_with_payload(
 
     # 2. LEAD HARVESTER
     if "harvester" in agent_list:
-        if isolation_matrix.get("Moltset", False):
+        if isolation_matrix.get(VENDOR_MOLTSET, False):
             send_telegram_broadcast(
                 "Skipping Lead Harvester execution loop. Moltset circuit breaker is TRIPPED.",
                 "critical",
@@ -821,7 +1039,7 @@ async def trigger_downstream_mesh_with_payload(
 
     # 4. BEACON MONITOR
     if "beacon_monitor" in agent_list:
-        if isolation_matrix.get("PhantomBusters", False):
+        if isolation_matrix.get(VENDOR_PHANTOMBUSTERS, False):
             send_telegram_broadcast(
                 "Skipping Beacon Monitor lead scraping cycle. PhantomBusters circuit breaker is TRIPPED.",
                 "critical",
@@ -870,7 +1088,7 @@ async def trigger_downstream_mesh_with_payload(
 
     # 6. VANGUARD OUTBOUND SWEEP
     if "vanguard" in agent_list:
-        if isolation_matrix.get("MyEmailVerifier", False):
+        if isolation_matrix.get(VENDOR_MYEMAILVERIFIER, False):
             send_telegram_broadcast(
                 "Skipping Vanguard outbound campaign sweep. Validation credit ledger reported isolation.",
                 "critical",
@@ -985,6 +1203,7 @@ async def lifespan(app: FastAPI):
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
     app.state.ai_client = Anthropic(api_key=anthropic_key) if anthropic_key else None
     app.state.phantombuster_remediation = {}
+    app.state.vendor_matrix_degraded = False
 
     try:
         await app.state.db_pool.open(wait=True)
@@ -992,7 +1211,14 @@ async def lifespan(app: FastAPI):
             async with conn.cursor() as cur:
                 await cur.execute(HELIX_INBOUND_BLUEPRINTS_TABLE_SQL)
                 await cur.execute(SCHEDULER_TABLE_SQL)
+                await cur.execute(HELIX_INFRASTRUCTURE_ORACLE_LEDGER_SQL)
             await conn.commit()
+
+        await seed_oracle_ledger_rows(app.state.db_pool)
+        await sync_external_vendor_credits(app.state.db_pool)
+        app.state.credit_sync_task = asyncio.create_task(
+            credit_sync_scheduler_loop(app.state.db_pool)
+        )
         app.state.awareness_task = asyncio.create_task(perpetual_awareness_loop())
         send_telegram_broadcast(
             "Helix application cloud lifespan engine initialized successfully.",
@@ -1004,6 +1230,15 @@ async def lifespan(app: FastAPI):
     yield
 
     app.state.awareness_task.cancel()
+    if hasattr(app.state, "credit_sync_task"):
+        app.state.credit_sync_task.cancel()
+
+    with suppress(asyncio.CancelledError):
+        await app.state.awareness_task
+    if hasattr(app.state, "credit_sync_task"):
+        with suppress(asyncio.CancelledError):
+            await app.state.credit_sync_task
+
     await app.state.db_pool.close()
 
 
@@ -1061,11 +1296,18 @@ async def analyze_and_orchestrate_log(
                             "execution ceiling",
                         )
                     ):
-                        await cur.execute("""
+                        await cur.execute(
+                            """
                             UPDATE helix_infrastructure_oracle_ledger 
                             SET is_circuit_broken = TRUE, credits_remaining = 0 
-                            WHERE vendor_name = 'PhantomBusters';
-                        """)
+                            WHERE vendor_name = %s;
+                        """,
+                            (VENDOR_PHANTOMBUSTERS,),
+                        )
+                        await cur.execute(
+                            "UPDATE helix_infrastructure_oracle_ledger SET last_updated_at = NOW() WHERE vendor_name = %s;",
+                            (VENDOR_PHANTOMBUSTERS,),
+                        )
                         if industry:
                             await cur.execute(
                                 "UPDATE helix_brain_scheduler SET is_active = FALSE WHERE industry_name = %s;",
@@ -1087,11 +1329,18 @@ async def analyze_and_orchestrate_log(
                             "token balance low",
                         )
                     ):
-                        await cur.execute("""
+                        await cur.execute(
+                            """
                             UPDATE helix_infrastructure_oracle_ledger 
                             SET is_circuit_broken = TRUE, credits_remaining = 0 
-                            WHERE vendor_name = 'MyEmailVerifier';
-                        """)
+                            WHERE vendor_name = %s;
+                        """,
+                            (VENDOR_MYEMAILVERIFIER,),
+                        )
+                        await cur.execute(
+                            "UPDATE helix_infrastructure_oracle_ledger SET last_updated_at = NOW() WHERE vendor_name = %s;",
+                            (VENDOR_MYEMAILVERIFIER,),
+                        )
                         send_telegram_broadcast(
                             "🚨 [CIRCUIT BREAKER] MyEmailVerifier ledger empty. Outbound sweeps hard-stopped.",
                             "critical",
@@ -1392,15 +1641,7 @@ async def execute_orchestrated_master_cycle(
         }
 
     # 🩹 NEW ADDITION HERE: Build the live matrix for the manual trigger
-    vendor_isolation_matrix = {}
-    async with app.state.db_pool.connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                "SELECT vendor_name, is_circuit_broken FROM helix_infrastructure_oracle_ledger;"
-            )
-            rows = await cur.fetchall()
-            for row in rows:
-                vendor_isolation_matrix[row["vendor_name"]] = row["is_circuit_broken"]
+    vendor_isolation_matrix = await load_vendor_isolation_matrix(app.state.db_pool)
 
     send_telegram_broadcast(
         f"Manual override master cycle triggered for niche: `{strategy['industry_name']}`",
@@ -1507,18 +1748,21 @@ async def get_dashboard_diagnostics(
                         action = "None required"
 
                         if (
-                            v["vendor_name"] == "PhantomBusters"
+                            v["vendor_name"] == VENDOR_PHANTOMBUSTERS
                             and v["is_circuit_broken"]
                         ):
                             reason = "API tokens exhausted or execution limit reached. Downstream triggers suppressed."
                             action = "Upgrade account to the $56 Starter Plan (20-hour monthly execution ceiling)."
                         elif (
-                            v["vendor_name"] == "MyEmailVerifier"
+                            v["vendor_name"] == VENDOR_MYEMAILVERIFIER
                             and v["is_circuit_broken"]
                         ):
                             reason = "Validation credit ledger reporting depletion. Outbound campaigns paused."
                             action = "Replenish verification balance to restore campaign flow."
-                        elif v["vendor_name"] == "Moltset" and v["is_circuit_broken"]:
+                        elif (
+                            v["vendor_name"] == VENDOR_MOLTSET
+                            and v["is_circuit_broken"]
+                        ):
                             reason = (
                                 "Enterprise data limits hit or API token key invalid."
                             )
