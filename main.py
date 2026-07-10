@@ -1429,6 +1429,48 @@ async def analyze_and_orchestrate_log(
                                         )
                     # =====================================================================
 
+                    # =====================================================================
+                    # 🧬 VECTOR ENRICHMENT FLUSH AUTONOMOUS CASCADE
+                    # =====================================================================
+                    if (
+                        agent_name == "vector"
+                        and "vector validation successful" in norm_msg
+                    ):
+                        send_telegram_broadcast(
+                            "⚡ *VECTOR RESERVOIR FLUSH DETECTED*\n"
+                            "Enrichment worker has successfully validated leads. Signaling Vanguard outbound sweep...",
+                            "orchestration",
+                        )
+
+                        # Load live infrastructure matrix
+                        vendor_isolation_matrix = await load_vendor_isolation_matrix(
+                            app.state.db_pool
+                        )
+
+                        # Fetch the active scheduler parameters to preserve contextual tracking
+                        async with app.state.db_pool.connection() as cascade_conn:
+                            async with cascade_conn.cursor(
+                                row_factory=dict_row
+                            ) as cascade_cur:
+                                await cascade_cur.execute("""
+                                    SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                    FROM helix_brain_scheduler 
+                                    WHERE is_active = TRUE 
+                                    ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
+                                """)
+                                active_strategy = await cascade_cur.fetchone()
+
+                        # Fire Vanguard instantly to sweep the newly 'ready_to_send' leads out the door!
+                        if active_strategy:
+                            asyncio.create_task(
+                                trigger_downstream_mesh_with_payload(
+                                    active_strategy,
+                                    ["vanguard"],
+                                    vendor_isolation_matrix,
+                                )
+                            )
+                    # =====================================================================
+
                     if "phantombuster" in extended_error_context:
                         if is_phantombuster_zero_result_signal(message, meta):
                             policy_state = apply_phantombuster_zero_result_policy(
