@@ -326,6 +326,7 @@ class LogIngestSchema(BaseModel):
         "nexus",
         "helix",
         "pulsar",
+        "radar",
     ]
     log_level: str = "INFO"
     message: str
