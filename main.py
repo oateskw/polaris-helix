@@ -1101,7 +1101,7 @@ async def trigger_downstream_mesh_with_payload(
                 async_http_post_proxy(
                     f"{url}/api/v1/radar/execute",
                     {
-                        "X-Beacon-Auth-Token": master_token,
+                        "X-Radar-Auth-Token": master_token,
                         "X-Helix-Keyword-Cap": str(keyword_cap),
                         "Content-Type": "application/json",
                     },
