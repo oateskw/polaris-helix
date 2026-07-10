@@ -1291,6 +1291,76 @@ async def analyze_and_orchestrate_log(
                             "success",
                         )
 
+                    # =====================================================================
+                    # 🧠 CASCADING HARVESTER FEEDBACK LOOP (ORGANIZED CHAOS)
+                    # =====================================================================
+                    if (
+                        agent_name == "vanguard"
+                        and "successfully processed batch" in norm_msg
+                    ):
+                        records_found = int(meta.get("records_found", 0))
+                        status_flag = str(meta.get("status", "")).upper()
+
+                        # If it finished cleanly but didn't hit the 500 cap, fire the next row!
+                        if status_flag == "COMPLETED" and records_found < 500:
+                            send_telegram_broadcast(
+                                f"📉 *PARTIAL HARVEST DETECTED*\n"
+                                f"Last run only secured `{records_found}` unique clean leads.\n"
+                                f"MoltSets limit was NOT met. Helix is autonomously advancing the queue...",
+                                "orchestration",
+                            )
+
+                            # Load the live infrastructure status matrix
+                            vendor_isolation_matrix = (
+                                await load_vendor_isolation_matrix(app.state.db_pool)
+                            )
+
+                            # Spawning explicit dict_row factory to safely parse indices via string keys
+                            async with app.state.db_pool.connection() as cascade_conn:
+                                async with cascade_conn.cursor(
+                                    row_factory=dict_row
+                                ) as cascade_cur:
+
+                                    # Pull the NEXT active strategy from the sliding window scheduler
+                                    await cascade_cur.execute("""
+                                        SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                        FROM helix_brain_scheduler 
+                                        WHERE is_active = TRUE 
+                                        AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
+                                        ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST 
+                                        LIMIT 1;
+                                    """)
+                                    next_strategy = await cascade_cur.fetchone()
+
+                                    if next_strategy:
+                                        # Mark it as targeted so the sliding window slides
+                                        await cascade_cur.execute(
+                                            "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
+                                            (next_strategy["industry_id"],),
+                                        )
+                                        await cascade_conn.commit()
+
+                                        send_telegram_broadcast(
+                                            f"🔄 *AUTONOMOUS QUEUE ADVANCEMENT*\n"
+                                            f"Deploying Harvester next job for niche: *{next_strategy['industry_name']}* ({next_strategy['target_region']})",
+                                            "orchestration",
+                                        )
+
+                                        # Fire ONLY the harvester worker thread for the next target segment
+                                        asyncio.create_task(
+                                            trigger_downstream_mesh_with_payload(
+                                                next_strategy,
+                                                ["harvester"],
+                                                vendor_isolation_matrix,
+                                            )
+                                        )
+                                    else:
+                                        send_telegram_broadcast(
+                                            "🏁 Harvester queue evaluation ended: No further active scheduler target slots open in the sliding window.",
+                                            "orchestration",
+                                        )
+                    # =====================================================================
+
                     if "phantombuster" in extended_error_context:
                         if is_phantombuster_zero_result_signal(message, meta):
                             policy_state = apply_phantombuster_zero_result_policy(
