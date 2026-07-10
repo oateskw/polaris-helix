@@ -1114,11 +1114,11 @@ async def trigger_downstream_mesh_with_payload(
                 )
             )
             send_telegram_broadcast(
-                "Beacon Monitor lead scraping cycle successfully deployed down-mesh.",
+                "Radar lead scraping cycle successfully deployed down-mesh.",
                 "verbose",
             )
 
-    # 5. LISTENER SWEEP
+    # 5. Puslar
     if "pulsar" in agent_list:
         url = os.getenv("PULSAR_API_URL", "https://polaris-pulsar.onrender.com").rstrip(
             "/"
@@ -1131,7 +1131,7 @@ async def trigger_downstream_mesh_with_payload(
             )
         )
         send_telegram_broadcast(
-            "Listener sweep trigger successfully deployed down-mesh.", "verbose"
+            "Pulsar sweep trigger successfully deployed down-mesh.", "verbose"
         )
 
     # 6. VANGUARD OUTBOUND SWEEP
