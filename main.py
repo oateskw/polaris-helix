@@ -551,13 +551,13 @@ async def log_helix_state(
 
 
 DAILY_EXECUTION_ROUTERS = {
-    0: ["nexus", "beacon", "harvester", "vanguard", "beacon_monitor", "listener"],
-    1: ["nexus", "beacon", "harvester", "vanguard", "beacon_monitor", "listener"],
-    2: ["nexus", "beacon", "harvester", "vanguard", "beacon_monitor", "listener"],
-    3: ["nexus", "beacon", "harvester", "vanguard", "beacon_monitor", "listener"],
-    4: ["nexus", "beacon", "harvester", "vanguard", "beacon_monitor", "listener"],
-    5: ["harvester", "listener"],
-    6: ["harvester", "listener"],
+    0: ["nexus", "beacon", "harvester", "vanguard", "radar", "pulsar"],
+    1: ["nexus", "beacon", "harvester", "vanguard", "radar", "pulsar"],
+    2: ["nexus", "beacon", "harvester", "vanguard", "radar", "pulsar"],
+    3: ["nexus", "beacon", "harvester", "vanguard", "radar", "pulsar"],
+    4: ["nexus", "beacon", "harvester", "vanguard", "radar", "pulsar"],
+    5: ["harvester", "pulsar"],
+    6: ["harvester", "pulsar"],
 }
 
 
@@ -614,7 +614,7 @@ async def evaluate_lead_density_and_escalate(
                 background_tasks.add_task(
                     trigger_downstream_mesh_with_payload,
                     updated_strategy,
-                    ["nexus", "beacon", "harvester", "vanguard", "listener"],
+                    ["nexus", "beacon", "harvester", "vanguard", "pulsar"],
                     vendor_isolation_matrix,  # 🩹 Pass real matrix data instead of {}
                 )
     except Exception as e:
@@ -814,9 +814,6 @@ async def perpetual_awareness_loop():
                     await cur.execute("""
                         SELECT DISTINCT LOWER(
                             CASE 
-                              WHEN LOWER(agent_name) = 'beacon' AND (message ILIKE '%Monitor%' OR message ILIKE '%background sweep%') THEN 'beacon_monitor'
-                              WHEN LOWER(agent_name) = 'beacon' AND (message ILIKE '%Listener%' OR message ILIKE '%sweep%completed%' OR message ILIKE '%beacon_listener%') THEN 'listener'
-                              WHEN LOWER(agent_name) = 'beacon' AND (message ILIKE '%Publer%' OR message ILIKE '%copy array%' OR message ILIKE '%Flux%') THEN 'beacon'
                               WHEN (LOWER(agent_name) = 'vanguard' OR LOWER(agent_name) = 'harvester') AND (message ILIKE '%Harvester%' OR message ILIKE '%mined%' OR message ILIKE '%MoltSets%') THEN 'harvester'
                               WHEN LOWER(agent_name) = 'vanguard' AND (message ILIKE '%dispatch%' OR message ILIKE '%Instantly%' OR message ILIKE '%campaign%') THEN 'vanguard'
                               ELSE agent_name
@@ -850,9 +847,8 @@ async def perpetual_awareness_loop():
                         VENDOR_MYEMAILVERIFIER, False
                     ):
                         is_isolated = True
-                    elif (
-                        candidate_agent == "beacon_monitor"
-                        and vendor_isolation_matrix.get(VENDOR_PHANTOMBUSTERS, False)
+                    elif candidate_agent == "radar" and vendor_isolation_matrix.get(
+                        VENDOR_PHANTOMBUSTERS, False
                     ):
                         is_isolated = True
                     elif candidate_agent == "harvester" and vendor_isolation_matrix.get(
@@ -877,7 +873,7 @@ async def perpetual_awareness_loop():
                 if next_agent_up:
                     async with app.state.db_pool.connection() as conn:
                         async with conn.cursor(row_factory=dict_row) as cur:
-                            if next_agent_up in ["beacon_monitor", "listener"]:
+                            if next_agent_up in ["radar", "pulsar"]:
                                 await cur.execute("""
                                     SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
                                     FROM helix_brain_scheduler 
@@ -1089,16 +1085,16 @@ async def trigger_downstream_mesh_with_payload(
             "Beacon task instructions successfully dispatched down-mesh.", "verbose"
         )
 
-    # 4. BEACON MONITOR
-    if "beacon_monitor" in agent_list:
+    # 4. RADAR
+    if "radar" in agent_list:
         if isolation_matrix.get(VENDOR_PHANTOMBUSTERS, False):
             send_telegram_broadcast(
-                "Skipping Beacon Monitor lead scraping cycle. PhantomBusters circuit breaker is TRIPPED.",
+                "Skipping Radar lead scraping cycle. PhantomBusters circuit breaker is TRIPPED.",
                 "critical",
             )
         else:
             url = os.getenv(
-                "BEACON_MONITOR_API_URL", "https://polaris-beacon-monitor.onrender.com"
+                "RADAR_API_URL", "https://polaris-radar.onrender.com"
             ).rstrip("/")
             keyword_cap = get_phantombuster_keyword_cap(strategy.get("industry_name"))
             asyncio.create_task(
@@ -1123,14 +1119,14 @@ async def trigger_downstream_mesh_with_payload(
             )
 
     # 5. LISTENER SWEEP
-    if "listener" in agent_list:
-        url = os.getenv(
-            "LISTENER_API_URL", "https://polaris-beacon-listener.onrender.com"
-        ).rstrip("/")
+    if "pulsar" in agent_list:
+        url = os.getenv("PULSAR_API_URL", "https://polaris-pulsar.onrender.com").rstrip(
+            "/"
+        )
         asyncio.create_task(
             async_http_post_proxy(
-                f"{url}/api/v1/listener/sweep",
-                {"X-Listener-Auth-Token": master_token},
+                f"{url}/api/v1/pulsar/sweep",
+                {"X-Pulsar-Auth-Token": master_token},
                 {},
             )
         )
@@ -1849,7 +1845,7 @@ async def execute_orchestrated_master_cycle(
     background_tasks.add_task(
         trigger_downstream_mesh_with_payload,
         strategy,
-        ["nexus", "beacon", "harvester", "vanguard", "listener"],
+        ["nexus", "beacon", "harvester", "vanguard", "pulsar"],
         vendor_isolation_matrix,  # 🩹 FIXED HERE: Passes real data instead of {}
     )
     return {
