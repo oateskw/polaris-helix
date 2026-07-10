@@ -1436,16 +1436,6 @@ async def analyze_and_orchestrate_log(
                         agent_name == "vector"
                         and "vector batch validation successful" in norm_msg
                     ):
-                        # Extract the dynamic batch size from metadata to make logs highly informative!
-                        flushed_count = meta.get("records_found", "a batch of")
-
-                        send_telegram_broadcast(
-                            f"⚡ *VECTOR RESERVOIR BATCH FLUSHED*\n"
-                            f"Enrichment worker successfully validated `{flushed_count}` leads.\n"
-                            f"Unlocking campaign queue and signaling Vanguard outbound sweep...",
-                            "orchestration",
-                        )
-
                         # Load live infrastructure matrix
                         vendor_isolation_matrix = await load_vendor_isolation_matrix(
                             app.state.db_pool
