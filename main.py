@@ -1285,11 +1285,51 @@ async def analyze_and_orchestrate_log(
             async with conn.cursor() as cur:
 
                 if normalized_log_level == "INFO":
+                    # =====================================================================
+                    # 🛰️ CLOSED-LOOP AGENT POST-RUN VALIDATION HANDOFF
+                    # =====================================================================
                     if "execution status: success" in norm_msg:
                         send_telegram_broadcast(
                             f"Agent `{agent_name}` reported an internal loop *SUCCESS* status metric.",
                             "success",
                         )
+
+                        # Only validate the primary data-ingestion core nodes
+                        if agent_name in ["beacon", "harvester"]:
+                            master_token = os.getenv("INBOUND_API_KEY", "")
+                            nexus_base_url = os.getenv(
+                                "NEXUS_NERVOUS_IMPULSE_URL",
+                                "https://polaris-nexus.onrender.com",
+                            ).rstrip("/")
+
+                            # Construct a clean payload matching Nexus's ValidationRequestSchema
+                            validation_payload = {
+                                "agent_validated": agent_name,
+                                "industry_name": (
+                                    industry if industry else "General Operations"
+                                ),
+                                "target_region": meta.get("target_region")
+                                or meta.get("region")
+                                or "National",
+                            }
+
+                            # Fire an out-of-band non-blocking task straight down to Nexus's validation receptor
+                            asyncio.create_task(
+                                async_http_post_proxy(
+                                    f"{nexus_base_url}/api/v1/nexus/validate",
+                                    {
+                                        "X-Nexus-Auth-Token": master_token,
+                                        "Content-Type": "application/json",
+                                    },
+                                    validation_payload,
+                                )
+                            )
+
+                            send_telegram_broadcast(
+                                f"🔍 *NEXUS AUDIT DEPLOYED*\n"
+                                f"Helix has tasked Nexus to execute post-flight troubleshooting and verification metrics for agent: `{agent_name}`.",
+                                "orchestration",
+                            )
 
                     # =====================================================================
                     # 🧠 CASCADING HARVESTER FEEDBACK LOOP (ORGANIZED CHAOS)
