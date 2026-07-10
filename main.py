@@ -1099,7 +1099,7 @@ async def trigger_downstream_mesh_with_payload(
             keyword_cap = get_phantombuster_keyword_cap(strategy.get("industry_name"))
             asyncio.create_task(
                 async_http_post_proxy(
-                    f"{url}/api/v1/beacon/execute",
+                    f"{url}/api/v1/radar/execute",
                     {
                         "X-Beacon-Auth-Token": master_token,
                         "X-Helix-Keyword-Cap": str(keyword_cap),
