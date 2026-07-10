@@ -491,15 +491,17 @@ async def upsert_vendor_credit_state(
     vendor_name: str,
     credits_remaining: float | None,
     is_circuit_broken: bool,
+    credit_unit: str = "USD",
 ) -> None:
     normalized_credits = 0.0 if credits_remaining is None else float(credits_remaining)
+    normalized_unit = (credit_unit or "USD")[:20]
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
                 """
                 INSERT INTO helix_infrastructure_oracle_ledger
                     (vendor_name, credits_remaining, credit_unit, is_circuit_broken, last_updated_at)
-                VALUES (%s, %s, 'USD', %s, NOW())
+                VALUES (%s, %s, %s, %s, NOW())
                 ON CONFLICT (vendor_name)
                 DO UPDATE SET
                     credits_remaining = EXCLUDED.credits_remaining,
@@ -510,6 +512,7 @@ async def upsert_vendor_credit_state(
                 (
                     vendor_name,
                     normalized_credits,
+                    normalized_unit,
                     is_circuit_broken,
                 ),
             )
@@ -524,6 +527,7 @@ async def mark_vendor_fail_closed(
         vendor_name=vendor_name,
         credits_remaining=0.0,
         is_circuit_broken=True,
+        credit_unit="MINUTES" if vendor_name == VENDOR_PHANTOMBUSTERS else "USD",
     )
     send_telegram_broadcast(
         f"🚨 [CIRCUIT BREAKER] {vendor_name} credit sync failed. Fail-closed isolation engaged. Reason: {failure_reason[:200]}",
@@ -635,7 +639,7 @@ async def sync_phantombuster_credits(db_pool) -> None:
     try:
         async with httpx.AsyncClient() as client:
             res = await client.get(
-                "https://api.phantombuster.com/v1/account",
+                "https://api.phantombuster.com/api/v2/orgs/fetch-resources",
                 headers={"X-PhantomBuster-Key": pb_key},
                 timeout=10,
             )
@@ -649,14 +653,31 @@ async def sync_phantombuster_credits(db_pool) -> None:
                 return
 
             payload = res.json()
-            credits = parse_credit_value(payload.get("orgCodeOrCredits"))
-            if credits is None:
+            monthly_used_ms = parse_credit_value(payload.get("monthlyExecutionTime"))
+            daily_used_ms = parse_credit_value(payload.get("dailyExecutionTime"))
+            plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
+            monthly_limit_ms = parse_credit_value(plan.get("monthlyExecutionTime"))
+            daily_limit_ms = parse_credit_value(plan.get("dailyExecutionTime"))
+
+            remaining_ms: float | None = None
+            if (
+                monthly_used_ms is not None
+                and monthly_limit_ms
+                and monthly_limit_ms > 0
+            ):
+                remaining_ms = max(monthly_limit_ms - monthly_used_ms, 0.0)
+            elif daily_used_ms is not None and daily_limit_ms and daily_limit_ms > 0:
+                remaining_ms = max(daily_limit_ms - daily_used_ms, 0.0)
+
+            if remaining_ms is None:
                 await mark_vendor_fail_closed(
                     db_pool,
                     VENDOR_PHANTOMBUSTERS,
-                    "Unable to parse orgCodeOrCredits from PhantomBuster response",
+                    "Unable to compute remaining execution time from PhantomBuster resources payload",
                 )
                 return
+
+            credits = round(remaining_ms / 60000.0, 2)
 
             is_circuit_broken = credits <= 0
             await upsert_vendor_credit_state(
@@ -664,6 +685,7 @@ async def sync_phantombuster_credits(db_pool) -> None:
                 vendor_name=VENDOR_PHANTOMBUSTERS,
                 credits_remaining=credits,
                 is_circuit_broken=is_circuit_broken,
+                credit_unit="MINUTES",
             )
 
             if not is_circuit_broken:
@@ -736,6 +758,7 @@ async def sync_myemailverifier_credits(db_pool) -> None:
                 vendor_name=VENDOR_MYEMAILVERIFIER,
                 credits_remaining=credits,
                 is_circuit_broken=is_circuit_broken,
+                credit_unit="CREDITS",
             )
 
             if not is_circuit_broken:
