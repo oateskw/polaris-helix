@@ -1430,15 +1430,19 @@ async def analyze_and_orchestrate_log(
                     # =====================================================================
 
                     # =====================================================================
-                    # 🧬 VECTOR ENRICHMENT FLUSH AUTONOMOUS CASCADE
+                    # 🧬 VECTOR ENRICHMENT FLUSH AUTONOMOUS CASCADE (BATCH-LEVEL)
                     # =====================================================================
                     if (
                         agent_name == "vector"
-                        and "vector validation successful" in norm_msg
+                        and "vector batch validation successful" in norm_msg
                     ):
+                        # Extract the dynamic batch size from metadata to make logs highly informative!
+                        flushed_count = meta.get("records_found", "a batch of")
+
                         send_telegram_broadcast(
-                            "⚡ *VECTOR RESERVOIR FLUSH DETECTED*\n"
-                            "Enrichment worker has successfully validated leads. Signaling Vanguard outbound sweep...",
+                            f"⚡ *VECTOR RESERVOIR BATCH FLUSHED*\n"
+                            f"Enrichment worker successfully validated `{flushed_count}` leads.\n"
+                            f"Unlocking campaign queue and signaling Vanguard outbound sweep...",
                             "orchestration",
                         )
 
