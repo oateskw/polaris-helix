@@ -800,8 +800,6 @@ async def perpetual_awareness_loop():
     while True:
         try:
             est_now = get_new_york_now()
-
-            current_date_str = est_now.strftime("%Y-%m-%d")
             current_weekday = est_now.weekday()
 
             scheduled_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
@@ -809,7 +807,7 @@ async def perpetual_awareness_loop():
                 await asyncio.sleep(60)
                 continue
 
-            # 1. Find what hasn't run yet today using precise message-content separation logic
+            # 1. Find what has completed successfully today
             async with app.state.db_pool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute("""
@@ -829,73 +827,103 @@ async def perpetual_awareness_loop():
                     completed_rows = await cur.fetchall()
                     completed_today_set = {r["executed_agent"] for r in completed_rows}
 
+            # Filter out already completed tasks
             pending_agents_for_today = [
                 agent
                 for agent in scheduled_agents_list
                 if agent not in completed_today_set
             ]
 
-            # 2. DRIP FEED: If there are pending tasks, execute ONLY ONE right now
             if pending_agents_for_today:
-                next_agent_up = pending_agents_for_today[
-                    0
-                ]  # Take the first pending agent
-
-                # 🩹 Define and populate the missing matrix from the database ledger
+                # Load the live infrastructure circuit breaker status matrix
                 vendor_isolation_matrix = await load_vendor_isolation_matrix(
                     app.state.db_pool
                 )
 
-                async with app.state.db_pool.connection() as conn:
-                    async with conn.cursor(row_factory=dict_row) as cur:
+                # 🧠 SMART EVALUATION: Scan the pending queue and find the first UNBLOCKED agent
+                next_agent_up = None
+                for candidate_agent in pending_agents_for_today:
+                    is_isolated = False
 
-                        # 🩹 Fix: Allow beacon_monitor and listener to hook into the current active strategy
-                        # even if its last_targeted_at timestamp was just updated by a sister agent.
-                        if next_agent_up in ["beacon_monitor", "listener"]:
-                            await cur.execute("""
-                                SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
-                                FROM helix_brain_scheduler 
-                                WHERE is_active = TRUE 
-                                ORDER BY last_targeted_at DESC NULLS LAST LIMIT 1;
-                            """)
-                        else:
-                            await cur.execute("""
-                                SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
-                                FROM helix_brain_scheduler 
-                                WHERE is_active = TRUE 
-                                AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
-                                ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
-                            """)
-                        active_strategy = await cur.fetchone()
+                    if candidate_agent == "vanguard" and vendor_isolation_matrix.get(
+                        VENDOR_MYEMAILVERIFIER, False
+                    ):
+                        is_isolated = True
+                    elif (
+                        candidate_agent == "beacon_monitor"
+                        and vendor_isolation_matrix.get(VENDOR_PHANTOMBUSTERS, False)
+                    ):
+                        is_isolated = True
+                    elif candidate_agent == "harvester" and vendor_isolation_matrix.get(
+                        VENDOR_MOLTSET, False
+                    ):
+                        is_isolated = True
+                    elif candidate_agent == "nexus" and vendor_isolation_matrix.get(
+                        VENDOR_ANTHROPIC, False
+                    ):
+                        is_isolated = True
 
-                        if active_strategy:
-                            await cur.execute(
-                                "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
-                                (active_strategy["industry_id"],),
-                            )
-                    await conn.commit()
+                    if is_isolated:
+                        # 🩹 BYPASS THE ISOLATION BLOCK: Don't stall the thread, just jump to the next agent!
+                        print(
+                            f"⚠️ [QUEUE BYPASS] Skipping isolated agent '{candidate_agent}' to prevent queue blocking."
+                        )
+                        continue
+                    else:
+                        next_agent_up = candidate_agent
+                        break
 
-                if active_strategy:
-                    send_telegram_broadcast(
-                        f"⏳ [STAGGERED DRIP] Deploying `{next_agent_up}` for strategy: *{active_strategy['industry_name']}*",
-                        "orchestration",
+                if next_agent_up:
+                    async with app.state.db_pool.connection() as conn:
+                        async with conn.cursor(row_factory=dict_row) as cur:
+                            if next_agent_up in ["beacon_monitor", "listener"]:
+                                await cur.execute("""
+                                    SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                    FROM helix_brain_scheduler 
+                                    WHERE is_active = TRUE 
+                                    ORDER BY last_targeted_at DESC NULLS LAST LIMIT 1;
+                                """)
+                            else:
+                                await cur.execute("""
+                                    SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                    FROM helix_brain_scheduler 
+                                    WHERE is_active = TRUE 
+                                    AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
+                                    ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
+                                """)
+                            active_strategy = await cur.fetchone()
+
+                            if active_strategy:
+                                await cur.execute(
+                                    "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
+                                    (active_strategy["industry_id"],),
+                                )
+                        await conn.commit()
+
+                    if active_strategy:
+                        send_telegram_broadcast(
+                            f"⏳ [STAGGERED DRIP] Deploying `{next_agent_up}` for strategy: *{active_strategy['industry_name']}*",
+                            "orchestration",
+                        )
+                        await trigger_downstream_mesh_with_payload(
+                            active_strategy,
+                            [next_agent_up],
+                            vendor_isolation_matrix,
+                        )
+
+                    # Only cool down if a task actually ran
+                    await asyncio.sleep(45 * 60)
+                    continue
+                else:
+                    logger.info(
+                        "🏁 All pending queue items are currently blocked by circuit isolation. Retrying in 5 minutes..."
                     )
-
-                    # Fire ONLY the single next agent, not the whole list!
-                    await trigger_downstream_mesh_with_payload(
-                        active_strategy,
-                        [next_agent_up],
-                        vendor_isolation_matrix,  # assuming pulled from DB like your current code
-                    )
-
-                # 3. COOL DOWN: Wait 45 minutes before evaluating/firing the next agent in line
-                await asyncio.sleep(45 * 60)
-                continue
+                    await asyncio.sleep(5 * 60)
+                    continue
 
         except Exception as loop_crash:
             send_telegram_broadcast(f"Loop exception: `{loop_crash}`", "critical")
 
-        # Default heartbeat tick if no tasks are pending
         await asyncio.sleep(60)
 
 
