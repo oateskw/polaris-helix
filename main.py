@@ -596,8 +596,8 @@ DAILY_EXECUTION_ROUTERS = {
     2: ["nexus", "beacon", "nova", "vanguard", "radar", "pulsar"],
     3: ["nexus", "beacon", "nova", "vanguard", "radar", "pulsar"],
     4: ["nexus", "beacon", "nova", "vanguard", "radar", "pulsar"],
-    5: ["nova", "pulsar"],
-    6: ["nova", "pulsar"],
+    5: ["nexus", "nova", "radar", "pulsar"],
+    6: ["nexus", "nova", "radar", "pulsar"],
 }
 
 
