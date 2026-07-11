@@ -538,6 +538,41 @@ async def mark_vendor_fail_closed(
     )
 
 
+async def write_helix_command_center_log(
+    db_pool,
+    log_level: str,
+    message: str,
+    action_taken: str,
+    target_niche: str = "System Core",
+    extra_metadata: Optional[dict] = None,
+) -> None:
+    """Writes explicit command-center optimized records straight into the system ledger."""
+    metadata_payload = {
+        "command_center_view": {
+            "action_taken": action_taken,
+            "target_niche": target_niche,
+            "execution_timestamp": get_new_york_now().isoformat(),
+        }
+    }
+    if extra_metadata:
+        metadata_payload.update(extra_metadata)
+
+    try:
+        async with db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO agent_system_logs (agent_name, log_level, message, metadata) 
+                    VALUES ('helix', %s, %s, %s);
+                    """,
+                    (log_level, message, Jsonb(metadata_payload)),
+                )
+            await conn.commit()
+    except Exception as e:
+        print(f"⚠️ Failed to write command center log: {e}")
+
+
+# Fixed: Now cleanly executes and commits standard infrastructure updates
 async def log_helix_state(
     cur, strategic_mode: str, geo_lock: str, buying_signal: str
 ) -> None:
@@ -547,7 +582,10 @@ async def log_helix_state(
         "buying_signal": buying_signal,
     }
     await cur.execute(
-        "INSERT INTO agent_system_logs (agent_name, log_level, message, metadata) VALUES ('helix', 'INFO', 'Global system parameters synchronized.', %s);",
+        """
+        INSERT INTO agent_system_logs (agent_name, log_level, message, metadata) 
+        VALUES ('helix', 'INFO', 'Global system parameters synchronized.', %s);
+        """,
         (Jsonb(metadata_payload),),
     )
 
@@ -857,9 +895,15 @@ async def perpetual_awareness_loop():
                         is_isolated = True
 
                     if is_isolated:
-                        # 🩹 BYPASS THE ISOLATION BLOCK: Don't stall the thread, just jump to the next agent!
                         print(
                             f"⚠️ [QUEUE BYPASS] Skipping isolated agent '{candidate_agent}' to prevent queue blocking."
+                        )
+                        await write_helix_command_center_log(
+                            app.state.db_pool,
+                            "WARNING",
+                            message=f"Bypassed agent '{candidate_agent}' in queue due to vendor circuit breaker isolation.",
+                            action_taken="QUEUE_BYPASS",
+                            extra_metadata={"blocked_agent": candidate_agent},
                         )
                         continue
                     else:
@@ -898,6 +942,18 @@ async def perpetual_awareness_loop():
                             f"⏳ [STAGGERED DRIP] Deploying `{next_agent_up}` for strategy: *{active_strategy['industry_name']}*",
                             "orchestration",
                         )
+                        # Write structured command-center telemetry record
+                        await write_helix_command_center_log(
+                            app.state.db_pool,
+                            "INFO",
+                            message=f"Deploying worker agent '{next_agent_up}' to manage targeting loops.",
+                            action_taken=f"LAUNCH_{next_agent_up.upper()}",
+                            target_niche=active_strategy["industry_name"],
+                            extra_metadata={
+                                "strategy_id": active_strategy["industry_id"]
+                            },
+                        )
+
                         await trigger_downstream_mesh_with_payload(
                             active_strategy,
                             [next_agent_up],
@@ -908,8 +964,11 @@ async def perpetual_awareness_loop():
                     await asyncio.sleep(45 * 60)
                     continue
                 else:
-                    logger.info(
-                        "🏁 All pending queue items are currently blocked by circuit isolation. Retrying in 5 minutes..."
+                    await write_helix_command_center_log(
+                        app.state.db_pool,
+                        "INFO",
+                        message="All pending queue items are currently blocked by circuit isolation.",
+                        action_taken="ORCHESTRATOR_STALL_WAIT",
                     )
                     await asyncio.sleep(5 * 60)
                     continue
@@ -990,6 +1049,14 @@ async def trigger_downstream_mesh_with_payload(
                 "NEXUS_NERVOUS_IMPULSE_URL", "https://polaris-nexus.onrender.com"
             ).rstrip("/")
 
+            await write_helix_command_center_log(
+                app.state.db_pool,
+                "INFO",
+                message="Dispatching tactical orchestration impulse to Nexus Omni-Strategist node.",
+                action_taken="DISPATCH_NEXUS_REQUEST",
+                target_niche=strategy["industry_name"],
+            )
+
             # ✅ FIXED: Direct await (no asyncio.create_task wrapper!)
             # ✅ FIXED: Passes BOTH industry_name and target_niche simultaneously to satisfy Nexus's schema!
             nexus_success = await async_http_post_proxy(
@@ -1018,6 +1085,13 @@ async def trigger_downstream_mesh_with_payload(
                     f"Suppressing all downstream mesh tasks (Nova, Beacon, Vanguard) to prevent corruption.",
                     "critical",
                 )
+                await write_helix_command_center_log(
+                    app.state.db_pool,
+                    "ERROR",
+                    message="Nexus initialization error caught. Mesh execution sequence terminated.",
+                    action_taken="ABORT_DOWNSTREAM_MESH",
+                    target_niche=strategy["industry_name"],
+                )
                 return  # 🧠 EXIT FUNCTION ENTIRELY. DO NOT RUN ANYTHING ELSE.
 
             send_telegram_broadcast(
@@ -1036,6 +1110,15 @@ async def trigger_downstream_mesh_with_payload(
                 "NOVA_API_URL",
                 "https://polaris-nova.onrender.com",
             ).rstrip("/")
+
+            await write_helix_command_center_log(
+                app.state.db_pool,
+                "INFO",
+                message="Routing unrestricted lead harvesting job instructions to Nova edge node.",
+                action_taken="DISPATCH_NOVA_REQUEST",
+                target_niche=strategy["industry_name"],
+            )
+
             asyncio.create_task(
                 async_http_post_proxy(
                     f"{url}/api/v1/nova/execute",
@@ -1062,6 +1145,15 @@ async def trigger_downstream_mesh_with_payload(
         url = os.getenv(
             "BEACON_API_URL", "https://polaris-beacon-agent.onrender.com"
         ).rstrip("/")
+
+        await write_helix_command_center_log(
+            app.state.db_pool,
+            "INFO",
+            message="Dispatching structural framework synthesis orders to Beacon.",
+            action_taken="DISPATCH_BEACON_REQUEST",
+            target_niche=strategy["industry_name"],
+        )
+
         asyncio.create_task(
             async_http_post_proxy(
                 f"{url}/api/v1/beacon/execute",
@@ -1093,6 +1185,15 @@ async def trigger_downstream_mesh_with_payload(
                 "RADAR_API_URL", "https://polaris-radar.onrender.com"
             ).rstrip("/")
             keyword_cap = get_phantombuster_keyword_cap(strategy.get("industry_name"))
+
+            await write_helix_command_center_log(
+                app.state.db_pool,
+                "INFO",
+                message=f"Deploying Radar scraping profiles with a bounded keyword threshold of {keyword_cap}.",
+                action_taken="DISPATCH_RADAR_REQUEST",
+                target_niche=strategy["industry_name"],
+            )
+
             asyncio.create_task(
                 async_http_post_proxy(
                     f"{url}/api/v1/radar/execute",
@@ -1119,6 +1220,15 @@ async def trigger_downstream_mesh_with_payload(
         url = os.getenv("PULSAR_API_URL", "https://polaris-pulsar.onrender.com").rstrip(
             "/"
         )
+
+        await write_helix_command_center_log(
+            app.state.db_pool,
+            "INFO",
+            message="Triggering inbound comment monitoring sweep on Pulsar gateway node.",
+            action_taken="DISPATCH_PULSAR_REQUEST",
+            target_niche=strategy["industry_name"],
+        )
+
         asyncio.create_task(
             async_http_post_proxy(
                 f"{url}/api/v1/pulsar/sweep",
@@ -1141,6 +1251,15 @@ async def trigger_downstream_mesh_with_payload(
             url = os.getenv(
                 "VANGUARD_API_URL", "https://polaris-vanguard-core.onrender.com"
             ).rstrip("/")
+
+            await write_helix_command_center_log(
+                app.state.db_pool,
+                "INFO",
+                message="Initiating secure outbound verification and email tracking sweeps via Vanguard.",
+                action_taken="DISPATCH_VANGUARD_REQUEST",
+                target_niche=strategy["industry_name"],
+            )
+
             asyncio.create_task(
                 async_http_post_proxy(
                     f"{url}/api/v1/dispatch/sweep",
@@ -1297,7 +1416,6 @@ async def analyze_and_orchestrate_log(
     meta = metadata if isinstance(metadata, dict) else {}
     industry = meta.get("industry_name") or meta.get("industry")
 
-    # FIX: Recursively scan everything inside metadata to prevent missing nested tokens
     meta_string_dump = json.dumps(meta).lower()
     extended_error_context = f"{norm_msg} {meta_string_dump}"
 
@@ -1315,7 +1433,6 @@ async def analyze_and_orchestrate_log(
                             "success",
                         )
 
-                        # Only validate the primary data-ingestion core nodes
                         if agent_name in ["beacon", "nova"]:
                             master_token = os.getenv("INBOUND_API_KEY", "")
                             nexus_base_url = os.getenv(
@@ -1323,7 +1440,6 @@ async def analyze_and_orchestrate_log(
                                 "https://polaris-nexus.onrender.com",
                             ).rstrip("/")
 
-                            # Construct a clean payload matching Nexus's ValidationRequestSchema
                             validation_payload = {
                                 "agent_validated": agent_name,
                                 "industry_name": (
@@ -1334,7 +1450,6 @@ async def analyze_and_orchestrate_log(
                                 or "National",
                             }
 
-                            # Fire an out-of-band non-blocking task straight down to Nexus's validation receptor
                             asyncio.create_task(
                                 async_http_post_proxy(
                                     f"{nexus_base_url}/api/v1/nexus/validate",
@@ -1346,108 +1461,108 @@ async def analyze_and_orchestrate_log(
                                 )
                             )
 
-                            send_telegram_broadcast(
-                                f"🔍 *NEXUS AUDIT DEPLOYED*\n"
-                                f"Helix has tasked Nexus to execute post-flight troubleshooting and verification metrics for agent: `{agent_name}`.",
-                                "orchestration",
-                            )
-
                     # =====================================================================
-                    # 🧠 CASCADING NOVA FEEDBACK LOOP (ORGANIZED CHAOS)
+                    # 🧠 CASCADING NOVA FEEDBACK LOOP (OPTIMIZED CURSOR REUSE)
                     # =====================================================================
                     if (
-                        agent_name == "vanguard"
+                        agent_name == "nova"
                         and "successfully processed batch" in norm_msg
                     ):
                         records_found = int(meta.get("records_found", 0))
                         status_flag = str(meta.get("status", "")).upper()
 
-                        # If it finished cleanly but didn't hit the 500 cap, fire the next row!
                         if status_flag == "COMPLETED" and records_found < 500:
                             send_telegram_broadcast(
-                                f"📉 *PARTIAL NOVA DETECTED*\n"
-                                f"Last run only secured `{records_found}` unique clean leads.\n"
-                                f"MoltSets limit was NOT met. Helix is autonomously advancing the queue...",
+                                f"📉 *PARTIAL NOVA DETECTED*\nLast run only secured `{records_found}` unique clean leads.\nAdvancing queue...",
                                 "orchestration",
                             )
 
-                            # Load the live infrastructure status matrix
                             vendor_isolation_matrix = (
                                 await load_vendor_isolation_matrix(app.state.db_pool)
                             )
 
-                            # Spawning explicit dict_row factory to safely parse indices via string keys
-                            async with app.state.db_pool.connection() as cascade_conn:
-                                async with cascade_conn.cursor(
-                                    row_factory=dict_row
-                                ) as cascade_cur:
+                            # 🧠 FIXED: Reuse 'conn' instead of requesting a new pool asset
+                            async with conn.cursor(row_factory=dict_row) as cascade_cur:
+                                await cascade_cur.execute("""
+                                    SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                    FROM helix_brain_scheduler 
+                                    WHERE is_active = TRUE 
+                                    AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
+                                    ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST 
+                                    LIMIT 1;
+                                """)
+                                next_strategy = await cascade_cur.fetchone()
 
-                                    # Pull the NEXT active strategy from the sliding window scheduler
-                                    await cascade_cur.execute("""
-                                        SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
-                                        FROM helix_brain_scheduler 
-                                        WHERE is_active = TRUE 
-                                        AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
-                                        ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST 
-                                        LIMIT 1;
-                                    """)
-                                    next_strategy = await cascade_cur.fetchone()
+                                if next_strategy:
+                                    await cascade_cur.execute(
+                                        "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
+                                        (next_strategy["industry_id"],),
+                                    )
+                                    # Let the outer conn.commit() clear everything together cleanly
 
-                                    if next_strategy:
-                                        # Mark it as targeted so the sliding window slides
-                                        await cascade_cur.execute(
-                                            "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
-                                            (next_strategy["industry_id"],),
+                                    asyncio.create_task(
+                                        trigger_downstream_mesh_with_payload(
+                                            next_strategy,
+                                            ["nova"],
+                                            vendor_isolation_matrix,
                                         )
-                                        await cascade_conn.commit()
-
-                                        send_telegram_broadcast(
-                                            f"🔄 *AUTONOMOUS QUEUE ADVANCEMENT*\n"
-                                            f"Deploying Nova next job for niche: *{next_strategy['industry_name']}* ({next_strategy['target_region']})",
-                                            "orchestration",
-                                        )
-
-                                        # Fire ONLY the nova worker thread for the next target segment
-                                        asyncio.create_task(
-                                            trigger_downstream_mesh_with_payload(
-                                                next_strategy,
-                                                ["nova"],
-                                                vendor_isolation_matrix,
-                                            )
-                                        )
-                                    else:
-                                        send_telegram_broadcast(
-                                            "🏁 Nova queue evaluation ended: No further active scheduler target slots open in the sliding window.",
-                                            "orchestration",
-                                        )
-                    # =====================================================================
+                                    )
 
                     # =====================================================================
-                    # 🧬 VECTOR ENRICHMENT FLUSH AUTONOMOUS CASCADE (BATCH-LEVEL)
+                    # 🚀 VANGUARD OUTBOUND SWEEP TELEMETRY (SAFE DIRECT INSERTION)
+                    # =====================================================================
+                    if (
+                        agent_name == "vanguard"
+                        and "campaign sweep completed" in norm_msg
+                    ):
+                        leads_processed = int(
+                            meta.get("leads_sent", 0) or meta.get("records_found", 0)
+                        )
+
+                        # 🧠 FIXED: Instead of calling the pool-heavy write utility, insert directly to cur
+                        metadata_payload = {
+                            "command_center_view": {
+                                "action_taken": "VANGUARD_SWEEP_SUCCESS",
+                                "target_niche": industry or "Staging Reservoir",
+                                "execution_timestamp": get_new_york_now().isoformat(),
+                            }
+                        }
+                        await cur.execute(
+                            """
+                            INSERT INTO agent_system_logs (agent_name, log_level, message, metadata) 
+                            VALUES ('helix', 'INFO', %s, %s);
+                            """,
+                            (
+                                f"Vanguard processed {leads_processed} outbound messages.",
+                                Jsonb(metadata_payload),
+                            ),
+                        )
+
+                        send_telegram_broadcast(
+                            f"📬 *VANGUARD OUTBOUND LAUNCHED*\nSweep finished. Successfully deployed `{leads_processed}` emails.",
+                            "success",
+                        )
+
+                    # =====================================================================
+                    # 🧬 VECTOR ENRICHMENT FLUSH AUTONOMOUS CASCADE
                     # =====================================================================
                     if (
                         agent_name == "vector"
                         and "vector batch validation successful" in norm_msg
                     ):
-                        # Load live infrastructure matrix
                         vendor_isolation_matrix = await load_vendor_isolation_matrix(
                             app.state.db_pool
                         )
 
-                        # Fetch the active scheduler parameters to preserve contextual tracking
-                        async with app.state.db_pool.connection() as cascade_conn:
-                            async with cascade_conn.cursor(
-                                row_factory=dict_row
-                            ) as cascade_cur:
-                                await cascade_cur.execute("""
-                                    SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
-                                    FROM helix_brain_scheduler 
-                                    WHERE is_active = TRUE 
-                                    ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
-                                """)
-                                active_strategy = await cascade_cur.fetchone()
+                        async with conn.cursor(row_factory=dict_row) as cascade_cur:
+                            await cascade_cur.execute("""
+                                SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                FROM helix_brain_scheduler 
+                                WHERE is_active = TRUE 
+                                ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
+                            """)
+                            active_strategy = await cascade_cur.fetchone()
 
-                        # Fire Vanguard instantly to sweep the newly 'ready_to_send' leads out the door!
                         if active_strategy:
                             asyncio.create_task(
                                 trigger_downstream_mesh_with_payload(
@@ -1456,26 +1571,16 @@ async def analyze_and_orchestrate_log(
                                     vendor_isolation_matrix,
                                 )
                             )
-                    # =====================================================================
 
                     if "phantombuster" in extended_error_context:
                         if is_phantombuster_zero_result_signal(message, meta):
                             policy_state = apply_phantombuster_zero_result_policy(
                                 industry
                             )
-                            if policy_state:
-                                send_telegram_broadcast(
-                                    f"🧭 *PHANTOMBUSTER POLICY ADJUSTMENT*\n"
-                                    f"Industry: `{policy_state['industry']}`\n"
-                                    f"State: `{policy_state['state']}`\n"
-                                    f"Keyword cap: `{policy_state['keyword_cap']}`",
-                                    "orchestration",
-                                )
                         else:
                             reset_phantombuster_policy_on_success(industry)
 
                 if normalized_log_level == "ERROR":
-                    # Expanded checks to catch variations of credit exhaustions
                     if any(
                         t in extended_error_context
                         for t in (
@@ -1483,19 +1588,10 @@ async def analyze_and_orchestrate_log(
                             "credit limit",
                             "exhausted",
                             "api_key_expired",
-                            "execution ceiling",
                         )
                     ):
                         await cur.execute(
-                            """
-                            UPDATE helix_infrastructure_oracle_ledger 
-                            SET is_circuit_broken = TRUE, credits_remaining = 0 
-                            WHERE vendor_name = %s;
-                        """,
-                            (VENDOR_PHANTOMBUSTERS,),
-                        )
-                        await cur.execute(
-                            "UPDATE helix_infrastructure_oracle_ledger SET last_updated_at = NOW() WHERE vendor_name = %s;",
+                            "UPDATE helix_infrastructure_oracle_ledger SET is_circuit_broken = TRUE, credits_remaining = 0, last_updated_at = NOW() WHERE vendor_name = %s;",
                             (VENDOR_PHANTOMBUSTERS,),
                         )
                         if industry:
@@ -1503,10 +1599,6 @@ async def analyze_and_orchestrate_log(
                                 "UPDATE helix_brain_scheduler SET is_active = FALSE WHERE industry_name = %s;",
                                 (industry,),
                             )
-                        send_telegram_broadcast(
-                            "🚨 [CIRCUIT BREAKER] PhantomBusters tokens exhausted. Isolation engaged. Targeted industry paused.",
-                            "critical",
-                        )
                         await conn.commit()
                         return
 
@@ -1516,49 +1608,24 @@ async def analyze_and_orchestrate_log(
                             "myemailverifier",
                             "insufficient credits",
                             "out of tokens",
-                            "token balance low",
                         )
                     ):
                         await cur.execute(
-                            """
-                            UPDATE helix_infrastructure_oracle_ledger 
-                            SET is_circuit_broken = TRUE, credits_remaining = 0 
-                            WHERE vendor_name = %s;
-                        """,
+                            "UPDATE helix_infrastructure_oracle_ledger SET is_circuit_broken = TRUE, credits_remaining = 0, last_updated_at = NOW() WHERE vendor_name = %s;",
                             (VENDOR_MYEMAILVERIFIER,),
-                        )
-                        await cur.execute(
-                            "UPDATE helix_infrastructure_oracle_ledger SET last_updated_at = NOW() WHERE vendor_name = %s;",
-                            (VENDOR_MYEMAILVERIFIER,),
-                        )
-                        send_telegram_broadcast(
-                            "🚨 [CIRCUIT BREAKER] MyEmailVerifier ledger empty. Outbound sweeps hard-stopped.",
-                            "critical",
                         )
                         await conn.commit()
                         return
 
-                    # Default fallback logic for industry auto-healing rescues
                     if industry:
                         await cur.execute(
-                            """
-                            SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
-                            FROM helix_brain_scheduler WHERE industry_name = %s LIMIT 1;
-                        """,
+                            "SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region FROM helix_brain_scheduler WHERE industry_name = %s LIMIT 1;",
                             (industry,),
                         )
                         strategy = await cur.fetchone()
 
                         if strategy and agent_name in ["nexus", "nova"]:
-                            send_telegram_broadcast(
-                                f"🩹 *AUTO-HEALING ACTIVATED*\n"
-                                f"Agent `{agent_name}` threw an error during the `{industry}` cycle.\n"
-                                f"Helix is deploying an out-of-band rescue impulse to re-verify execution...",
-                                "orchestration",
-                            )
-
                             master_token = os.getenv("INBOUND_API_KEY", "")
-
                             if agent_name == "nexus":
                                 url = os.getenv(
                                     "NEXUS_NERVOUS_IMPULSE_URL",
@@ -1575,22 +1642,13 @@ async def analyze_and_orchestrate_log(
                                             "trigger_reason": "helix_auto_rescue_escalation",
                                             "batch_size": 15,
                                             "rescue_mode": True,
-                                            "industry_id": strategy["industry_id"],
-                                            "industry_name": strategy["industry_name"],
-                                            "target_niche": strategy["industry_name"],
-                                            "target_region": strategy["target_region"],
-                                            "bottleneck_profile": strategy[
-                                                "bottleneck_profile"
-                                            ],
-                                            "pain_tokens": strategy["pain_tokens"],
+                                            **strategy,
                                         },
                                     )
                                 )
-
                             elif agent_name == "nova":
                                 url = os.getenv(
-                                    "NOVA_API_URL",
-                                    "https://polaris-nova.onrender.com",
+                                    "NOVA_API_URL", "https://polaris-nova.onrender.com"
                                 ).rstrip("/")
                                 asyncio.create_task(
                                     async_http_post_proxy(
