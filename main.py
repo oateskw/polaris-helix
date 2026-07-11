@@ -327,6 +327,7 @@ class LogIngestSchema(BaseModel):
         "helix",
         "pulsar",
         "radar",
+        "nova",
     ]
     log_level: str = "INFO"
     message: str
@@ -552,13 +553,13 @@ async def log_helix_state(
 
 
 DAILY_EXECUTION_ROUTERS = {
-    0: ["nexus", "beacon", "harvester", "vanguard", "radar", "pulsar"],
-    1: ["nexus", "beacon", "harvester", "vanguard", "radar", "pulsar"],
-    2: ["nexus", "beacon", "harvester", "vanguard", "radar", "pulsar"],
-    3: ["nexus", "beacon", "harvester", "vanguard", "radar", "pulsar"],
-    4: ["nexus", "beacon", "harvester", "vanguard", "radar", "pulsar"],
-    5: ["harvester", "pulsar"],
-    6: ["harvester", "pulsar"],
+    0: ["nexus", "beacon", "nova", "vanguard", "radar", "pulsar"],
+    1: ["nexus", "beacon", "nova", "vanguard", "radar", "pulsar"],
+    2: ["nexus", "beacon", "nova", "vanguard", "radar", "pulsar"],
+    3: ["nexus", "beacon", "nova", "vanguard", "radar", "pulsar"],
+    4: ["nexus", "beacon", "nova", "vanguard", "radar", "pulsar"],
+    5: ["nova", "pulsar"],
+    6: ["nova", "pulsar"],
 }
 
 
@@ -615,7 +616,7 @@ async def evaluate_lead_density_and_escalate(
                 background_tasks.add_task(
                     trigger_downstream_mesh_with_payload,
                     updated_strategy,
-                    ["nexus", "beacon", "harvester", "vanguard", "pulsar"],
+                    ["nexus", "beacon", "nova", "vanguard", "pulsar"],
                     vendor_isolation_matrix,  # 🩹 Pass real matrix data instead of {}
                 )
     except Exception as e:
@@ -813,13 +814,7 @@ async def perpetual_awareness_loop():
             async with app.state.db_pool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute("""
-                        SELECT DISTINCT LOWER(
-                            CASE 
-                              WHEN (LOWER(agent_name) = 'vanguard' OR LOWER(agent_name) = 'harvester') AND (message ILIKE '%Harvester%' OR message ILIKE '%mined%' OR message ILIKE '%MoltSets%') THEN 'harvester'
-                              WHEN LOWER(agent_name) = 'vanguard' AND (message ILIKE '%dispatch%' OR message ILIKE '%Instantly%' OR message ILIKE '%campaign%') THEN 'vanguard'
-                              ELSE agent_name
-                            END
-                        ) as executed_agent
+                        SELECT DISTINCT LOWER( agent_name ) as executed_agent
                         FROM agent_system_logs 
                         WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
                     """)
@@ -852,7 +847,7 @@ async def perpetual_awareness_loop():
                         VENDOR_PHANTOMBUSTERS, False
                     ):
                         is_isolated = True
-                    elif candidate_agent == "harvester" and vendor_isolation_matrix.get(
+                    elif candidate_agent == "nova" and vendor_isolation_matrix.get(
                         VENDOR_MOLTSET, False
                     ):
                         is_isolated = True
@@ -1020,7 +1015,7 @@ async def trigger_downstream_mesh_with_payload(
                 send_telegram_broadcast(
                     f"🛑 *CRITICAL ORCHESTRATION HALT*\n"
                     f"Nexus failed to initialize for strategy: `{strategy['industry_name']}`.\n"
-                    f"Suppressing all downstream mesh tasks (Harvester, Beacon, Vanguard) to prevent corruption.",
+                    f"Suppressing all downstream mesh tasks (Nova, Beacon, Vanguard) to prevent corruption.",
                     "critical",
                 )
                 return  # 🧠 EXIT FUNCTION ENTIRELY. DO NOT RUN ANYTHING ELSE.
@@ -1029,23 +1024,23 @@ async def trigger_downstream_mesh_with_payload(
                 "Nexus execution impulse successfully deployed down-mesh.", "verbose"
             )
 
-    # 2. LEAD HARVESTER
-    if "harvester" in agent_list:
+    # 2. NOVA
+    if "nova" in agent_list:
         if isolation_matrix.get(VENDOR_MOLTSET, False):
             send_telegram_broadcast(
-                "Skipping Lead Harvester execution loop. Moltset circuit breaker is TRIPPED.",
+                "Skipping Lead Nova execution loop. Moltset circuit breaker is TRIPPED.",
                 "critical",
             )
         else:
             url = os.getenv(
-                "HARVESTER_API_URL",
-                "https://polaris-vanguard-harvester-udf7.onrender.com",
+                "NOVA_API_URL",
+                "https://polaris-nova.onrender.com",
             ).rstrip("/")
             asyncio.create_task(
                 async_http_post_proxy(
-                    f"{url}/api/v1/harvester/execute",
+                    f"{url}/api/v1/nova/execute",
                     {
-                        "X-Harvester-Auth-Token": master_token,
+                        "X-Nova-Auth-Token": master_token,
                         "Content-Type": "application/json",
                     },
                     {
@@ -1058,7 +1053,7 @@ async def trigger_downstream_mesh_with_payload(
                 )
             )
             send_telegram_broadcast(
-                "Harvester proxy sync call successfully routed to mesh edge node.",
+                "Nova proxy sync call successfully routed to mesh edge node.",
                 "verbose",
             )
 
@@ -1321,7 +1316,7 @@ async def analyze_and_orchestrate_log(
                         )
 
                         # Only validate the primary data-ingestion core nodes
-                        if agent_name in ["beacon", "harvester"]:
+                        if agent_name in ["beacon", "nova"]:
                             master_token = os.getenv("INBOUND_API_KEY", "")
                             nexus_base_url = os.getenv(
                                 "NEXUS_NERVOUS_IMPULSE_URL",
@@ -1358,7 +1353,7 @@ async def analyze_and_orchestrate_log(
                             )
 
                     # =====================================================================
-                    # 🧠 CASCADING HARVESTER FEEDBACK LOOP (ORGANIZED CHAOS)
+                    # 🧠 CASCADING NOVA FEEDBACK LOOP (ORGANIZED CHAOS)
                     # =====================================================================
                     if (
                         agent_name == "vanguard"
@@ -1370,7 +1365,7 @@ async def analyze_and_orchestrate_log(
                         # If it finished cleanly but didn't hit the 500 cap, fire the next row!
                         if status_flag == "COMPLETED" and records_found < 500:
                             send_telegram_broadcast(
-                                f"📉 *PARTIAL HARVEST DETECTED*\n"
+                                f"📉 *PARTIAL NOVA DETECTED*\n"
                                 f"Last run only secured `{records_found}` unique clean leads.\n"
                                 f"MoltSets limit was NOT met. Helix is autonomously advancing the queue...",
                                 "orchestration",
@@ -1408,21 +1403,21 @@ async def analyze_and_orchestrate_log(
 
                                         send_telegram_broadcast(
                                             f"🔄 *AUTONOMOUS QUEUE ADVANCEMENT*\n"
-                                            f"Deploying Harvester next job for niche: *{next_strategy['industry_name']}* ({next_strategy['target_region']})",
+                                            f"Deploying Nova next job for niche: *{next_strategy['industry_name']}* ({next_strategy['target_region']})",
                                             "orchestration",
                                         )
 
-                                        # Fire ONLY the harvester worker thread for the next target segment
+                                        # Fire ONLY the nova worker thread for the next target segment
                                         asyncio.create_task(
                                             trigger_downstream_mesh_with_payload(
                                                 next_strategy,
-                                                ["harvester"],
+                                                ["nova"],
                                                 vendor_isolation_matrix,
                                             )
                                         )
                                     else:
                                         send_telegram_broadcast(
-                                            "🏁 Harvester queue evaluation ended: No further active scheduler target slots open in the sliding window.",
+                                            "🏁 Nova queue evaluation ended: No further active scheduler target slots open in the sliding window.",
                                             "orchestration",
                                         )
                     # =====================================================================
@@ -1554,7 +1549,7 @@ async def analyze_and_orchestrate_log(
                         )
                         strategy = await cur.fetchone()
 
-                        if strategy and agent_name in ["nexus", "harvester"]:
+                        if strategy and agent_name in ["nexus", "nova"]:
                             send_telegram_broadcast(
                                 f"🩹 *AUTO-HEALING ACTIVATED*\n"
                                 f"Agent `{agent_name}` threw an error during the `{industry}` cycle.\n"
@@ -1592,16 +1587,16 @@ async def analyze_and_orchestrate_log(
                                     )
                                 )
 
-                            elif agent_name == "harvester":
+                            elif agent_name == "nova":
                                 url = os.getenv(
-                                    "HARVESTER_API_URL",
-                                    "https://polaris-vanguard-harvester-udf7.onrender.com",
+                                    "NOVA_API_URL",
+                                    "https://polaris-nova.onrender.com",
                                 ).rstrip("/")
                                 asyncio.create_task(
                                     async_http_post_proxy(
-                                        f"{url}/api/v1/harvester/execute",
+                                        f"{url}/api/v1/nova/execute",
                                         {
-                                            "X-Harvester-Auth-Token": master_token,
+                                            "x_nova_auth_token": master_token,
                                             "Content-Type": "application/json",
                                         },
                                         {**strategy, "rescue_mode": True},
@@ -1846,7 +1841,7 @@ async def execute_orchestrated_master_cycle(
     background_tasks.add_task(
         trigger_downstream_mesh_with_payload,
         strategy,
-        ["nexus", "beacon", "harvester", "vanguard", "pulsar"],
+        ["nexus", "beacon", "nova", "vanguard", "pulsar"],
         vendor_isolation_matrix,  # 🩹 FIXED HERE: Passes real data instead of {}
     )
     return {
@@ -2003,7 +1998,7 @@ async def get_dashboard_diagnostics(
                         vector_reason = f"{scraped_count} leads successfully mined. Processing held because outbound accounts are locked in Instantly warmup matrix."
 
                     diagnostics["pipeline_progress"] = {
-                        "harvester_reservoir": {
+                        "nova_reservoir": {
                             "status": "ACTIVE",
                             "leads_cached_raw": scraped_count,
                         },
