@@ -1215,7 +1215,7 @@ async def trigger_downstream_mesh_with_payload(
                 "verbose",
             )
 
-    # 5. Puslar
+    # 5. Pulsar
     if "pulsar" in agent_list:
         url = os.getenv("PULSAR_API_URL", "https://polaris-pulsar.onrender.com").rstrip(
             "/"
@@ -1940,6 +1940,94 @@ async def get_current_scheduler_target(
             row["last_targeted_at"].isoformat() if row.get("last_targeted_at") else None
         ),
     }
+
+
+@app.post("/api/v1/scheduler/rotate")
+async def rotate_scheduler_target(
+    payload: SchedulerTargetUpdateModel,
+    x_inbound_key: str | None = Header(default=None),
+):
+    expected_key = os.getenv("INBOUND_API_KEY")
+    if expected_key and not (
+        x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    resolved_category = "Professional and Business Services"
+    if app.state.ai_client:
+        resolved_category = run_deterministic_moltset_mapping(
+            app.state.ai_client, payload.industry_name
+        )
+
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE helix_brain_scheduler
+                    SET target_region = COALESCE(NULLIF(%s, ''), target_region),
+                        moltset_category = %s,
+                        last_targeted_at = NOW()
+                    WHERE industry_name = %s
+                    RETURNING industry_id, industry_name, target_region, last_targeted_at, moltset_category;
+                    """,
+                    (payload.target_region, resolved_category, payload.industry_name),
+                )
+                updated = await cur.fetchone()
+                if updated is not None:
+                    await log_helix_state(
+                        cur=cur,
+                        strategic_mode=f"Target Cycle: {updated[1]}",
+                        geo_lock=updated[2],
+                        buying_signal=f"#{''.join(updated[1].split()).lower()}life",
+                    )
+            await conn.commit()
+
+        if updated is None:
+            raise HTTPException(
+                status_code=404, detail=f"Industry '{payload.industry_name}' not found"
+            )
+
+        return {
+            "status": "success",
+            "industry_id": updated[0],
+            "industry_name": updated[1],
+            "target_region": updated[2],
+            "moltset_category": updated[4],
+            "last_targeted_at": (
+                updated[3].isoformat() if updated[3] is not None else None
+            ),
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to rotate scheduler target: {exc}"
+        )
+
+
+@app.get("/api/v1/oracle/vendor-health")
+async def get_vendor_health(x_inbound_key: str | None = Header(default=None)):
+    expected_key = os.getenv("INBOUND_API_KEY")
+    if expected_key and not (
+        x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT vendor_name, credits_remaining, is_circuit_broken FROM helix_infrastructure_oracle_ledger;"
+                )
+                rows = await cur.fetchall()
+        return {
+            row["vendor_name"]: {
+                "credits": float(row["credits_remaining"]),
+                "isolated": row["is_circuit_broken"],
+            }
+            for row in rows
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Oracle read failure: {exc}")
 
 
 @app.get("/api/v1/orchestrator/dashboard-diagnostics")
