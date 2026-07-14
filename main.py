@@ -591,13 +591,31 @@ async def log_helix_state(
 
 
 DAILY_EXECUTION_ROUTERS = {
-    0: ["nexus", "beacon", "nova", "vanguard", "radar", "pulsar"],
-    1: ["nexus", "beacon", "nova", "vanguard", "radar", "pulsar"],
-    2: ["nexus", "beacon", "nova", "vanguard", "radar", "pulsar"],
-    3: ["nexus", "beacon", "nova", "vanguard", "radar", "pulsar"],
-    4: ["nexus", "beacon", "nova", "vanguard", "radar", "pulsar"],
-    5: ["nexus", "nova", "radar", "pulsar"],
-    6: ["nexus", "nova", "radar", "pulsar"],
+    0: ["nexus", "nova", "vanguard", "radar", "pulsar"],  # Monday
+    1: ["nexus", "nova", "vanguard", "radar", "pulsar"],  # Tuesday
+    2: ["nexus", "nova", "vanguard", "radar", "pulsar"],  # Wednesday
+    3: ["nexus", "nova", "vanguard", "radar", "pulsar"],  # Thursday
+    4: ["nexus", "nova", "vanguard", "radar", "pulsar"],  # Friday
+    5: ["nexus", "nova", "radar", "pulsar"],  # Saturday
+    6: ["nexus", "nova", "radar", "pulsar"],  # Sunday
+}
+
+# Publer recommended times (America/New_York)
+# Day index mapping: 1 = Tuesday, 2 = Wednesday, 3 = Thursday
+PUBLER_BEACON_SCHEDULE = {
+    1: [
+        datetime.time(7, 0),
+        datetime.time(8, 0),
+    ],  # Tuesday: 2x (e.g., 7:00 AM, 8:00 AM)
+    2: [
+        datetime.time(7, 0),
+        datetime.time(14, 0),
+        datetime.time(19, 0),
+    ],  # Wednesday: 3x (e.g., 7:00 AM, 2:00 PM, 7:00 PM)
+    3: [
+        datetime.time(16, 0),
+        datetime.time(18, 0),
+    ],  # Thursday: 2x (e.g., 4:00 PM, 6:00 PM)
 }
 
 
@@ -843,12 +861,37 @@ async def perpetual_awareness_loop():
             est_now = get_new_york_now()
             current_weekday = est_now.weekday()
 
+            # 1. Grab standard daily scheduled agents for today
             scheduled_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
-            if not scheduled_agents_list:
+
+            # 2. Check if we need to dynamically append 'beacon' based on Publer timeslots
+            should_trigger_beacon = False
+            if current_weekday in PUBLER_BEACON_SCHEDULE:
+                target_times = PUBLER_BEACON_SCHEDULE[current_weekday]
+                for target_time in target_times:
+                    # Create the target datetime for today
+                    target_dt = datetime.datetime.combine(
+                        est_now.date(), target_time, tzinfo=NEW_YORK_TZ
+                    )
+                    # Check if current time is within a 15-minute window after the slot start
+                    if (
+                        target_dt
+                        <= est_now
+                        <= (target_dt + datetime.timedelta(minutes=15))
+                    ):
+                        should_trigger_beacon = True
+                        break
+
+            # Clone the scheduled list and append 'beacon' dynamically if inside an active slot
+            active_agents_list = list(scheduled_agents_list)
+            if should_trigger_beacon:
+                active_agents_list.append("beacon")
+
+            if not active_agents_list:
                 await asyncio.sleep(60)
                 continue
 
-            # 1. Find what has completed successfully today
+            # 3. Find what has completed successfully today
             async with app.state.db_pool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute("""
@@ -859,12 +902,50 @@ async def perpetual_awareness_loop():
                     completed_rows = await cur.fetchall()
                     completed_today_set = {r["executed_agent"] for r in completed_rows}
 
-            # Filter out already completed tasks
-            pending_agents_for_today = [
-                agent
-                for agent in scheduled_agents_list
-                if agent not in completed_today_set
-            ]
+            # 4. Filter pending agents, bypassing daily completion check for beacon if scheduled
+            pending_agents_for_today = []
+            for agent in active_agents_list:
+                if agent == "beacon":
+                    if should_trigger_beacon:
+                        # Find out the maximum runs allowed today
+                        # Tuesday (1) = 2, Wednesday (2) = 3, Thursday (3) = 2
+                        daily_caps = {1: 2, 2: 3, 3: 2}
+                        max_runs_allowed = daily_caps.get(current_weekday, 0)
+
+                        async with await app.state.db_pool.connection() as conn:
+                            async with conn.cursor() as cur:
+                                # Count how many times beacon successfully executed TODAY (NY Time)
+                                await cur.execute("""
+                                    SELECT COUNT(*) FROM agent_system_logs 
+                                    WHERE agent_name = 'beacon' 
+                                    AND log_level = 'INFO'
+                                    AND timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
+                                """)
+                                daily_run_count = (await cur.fetchone())[0]
+
+                                # Safety check: Also ensure it hasn't run in the last 20 minutes
+                                await cur.execute("""
+                                    SELECT COUNT(*) FROM agent_system_logs 
+                                    WHERE agent_name = 'beacon' 
+                                    AND timestamp >= NOW() - INTERVAL '20 minutes';
+                                """)
+                                recent_runs = (await cur.fetchone())[0]
+
+                        # Only queue beacon if we are under the daily cap and cleared the 20-min guard
+                        if daily_run_count < max_runs_allowed:
+                            if recent_runs == 0:
+                                pending_agents_for_today.append(agent)
+                            else:
+                                print(
+                                    "⏳ Beacon slot is active, but cooling down from a recent run."
+                                )
+                        else:
+                            print(
+                                f"🛑 Beacon is done for today. Daily cap of {max_runs_allowed} reached."
+                            )
+
+                elif agent not in completed_today_set:
+                    pending_agents_for_today.append(agent)
 
             if pending_agents_for_today:
                 # Load the live infrastructure circuit breaker status matrix
@@ -960,7 +1041,7 @@ async def perpetual_awareness_loop():
                             vendor_isolation_matrix,
                         )
 
-                    # Only cool down if a task actually ran
+                    # Only cool down if a task actually ran (45 mins)
                     await asyncio.sleep(45 * 60)
                     continue
                 else:
