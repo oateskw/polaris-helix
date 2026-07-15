@@ -2147,6 +2147,7 @@ async def update_lead_status_and_attribute(
 
 @app.post("/api/v1/logs")
 async def ingest_log(payload: LogIngestSchema):
+    row = None
     try:
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -2161,6 +2162,11 @@ async def ingest_log(payload: LogIngestSchema):
                 )
                 row = await cur.fetchone()
             await conn.commit()
+
+        # Ensure we actually got a database ID before passing it along
+        if not row:
+            raise Exception("Failed to retrieve returning log ID from database.")
+
         asyncio.create_task(
             analyze_and_orchestrate_log(
                 log_id=row[0],  # 👈 Pass the DB log ID
@@ -2172,6 +2178,8 @@ async def ingest_log(payload: LogIngestSchema):
         )
         return {"status": "success", "logged_id": row[0]}
     except Exception as exc:
+        # This will now securely print the real database or validation error to your Render logs!
+        print(f"❌ [Helix Ingest Engine] Error: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
 
