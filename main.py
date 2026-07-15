@@ -748,6 +748,18 @@ async def sync_phantombuster_credits(db_pool) -> None:
 
             credits = round(remaining_ms / 60000.0, 2)
 
+            # Get the previous state from the database first
+            was_circuit_broken = False
+            async with db_pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT is_circuit_broken FROM helix_infrastructure_oracle_ledger WHERE vendor_name = %s;",
+                        (VENDOR_PHANTOMBUSTERS,),
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        was_circuit_broken = row[0]
+
             is_circuit_broken = credits <= 0
             await upsert_vendor_credit_state(
                 db_pool,
@@ -757,14 +769,15 @@ async def sync_phantombuster_credits(db_pool) -> None:
                 credit_unit="MINUTES",
             )
 
-            if not is_circuit_broken:
+            # ONLY alert if there was an actual state change!
+            if was_circuit_broken and not is_circuit_broken:
                 send_telegram_broadcast(
-                    "🔄 *INFRASTRUCTURE CIRCUIT HEALED*: PhantomBusters has been automatically re-activated.",
+                    f"🔄 *INFRASTRUCTURE CIRCUIT HEALED*: PhantomBusters has recovered from a previous depletion block. Balance is now healthy at `{credits} MINUTES`.",
                     "success",
                 )
-            else:
+            elif is_circuit_broken and not was_circuit_broken:
                 send_telegram_broadcast(
-                    "🚨 [CIRCUIT BREAKER] PhantomBusters credits are depleted. Isolation engaged.",
+                    f"🚨 [CIRCUIT BREAKER] PhantomBusters credits have depleted (`{credits} MINUTES`). Downstream scraping queues are now ISOLATED.",
                     "critical",
                 )
     except Exception as e:
@@ -1484,6 +1497,7 @@ async def async_http_post_proxy(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize the database pool and core parameters
     app.state.db_pool = AsyncConnectionPool(
         conninfo=get_validated_database_url(),
         open=False,
@@ -1494,11 +1508,10 @@ async def lifespan(app: FastAPI):
     app.state.ai_client = Anthropic(api_key=anthropic_key) if anthropic_key else None
     app.state.phantombuster_remediation = {}
     app.state.vendor_matrix_degraded = False
-
-    # 🌟 NEW ADDITION: Daily prompt optimizer lock state
     app.state.last_optimization_date = None
 
     try:
+        # Establish pool and initialize table schemas if not present
         await app.state.db_pool.open(wait=True)
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -1507,21 +1520,69 @@ async def lifespan(app: FastAPI):
                 await cur.execute(HELIX_INFRASTRUCTURE_ORACLE_LEDGER_SQL)
             await conn.commit()
 
+        # Seed vendor state rows and run the initial credit checks
         await seed_oracle_ledger_rows(app.state.db_pool)
         await sync_external_vendor_credits(app.state.db_pool)
+
+        # =====================================================================
+        # 📊 TELEGRAM START-UP TELEMETRY (DYNAMIC CHECKLIST)
+        # =====================================================================
+        est_now = get_new_york_now()
+        current_weekday = est_now.weekday()
+        scheduled_agents = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
+
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                # Retrieve agents that have logged a success entry today (NY Time)
+                await cur.execute("""
+                    SELECT DISTINCT LOWER(agent_name) as executed_agent
+                    FROM agent_system_logs 
+                    WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
+                """)
+                completed_rows = await cur.fetchall()
+                completed_today = {r["executed_agent"] for r in completed_rows}
+
+        # Build dynamic checklist visualizer
+        status_lines = []
+        for agent in scheduled_agents:
+            status_icon = "✅" if agent in completed_today else "⏳"
+            status_label = "Completed" if agent in completed_today else "Pending"
+            status_lines.append(f"* {status_icon} `{agent}` ({status_label})")
+
+        # Handle the decoupled Beacon schedule edge-case visibility
+        if "beacon" in completed_today:
+            status_lines.append("* ✅ `beacon` (Completed)")
+        elif current_weekday in [1, 2, 3]:  # Tuesday, Wednesday, Thursday
+            status_lines.append("* ⏳ `beacon` (Pending - Time-Slot Bound)")
+
+        queue_checklist = (
+            "\n".join(status_lines)
+            if status_lines
+            else "* No agents scheduled for today."
+        )
+
+        boot_msg = (
+            f"🚀 *Helix Orchestrator Booted Successfully*\n\n"
+            f"📅 *Today's Queue Checklist (NY Time):*\n"
+            f"{queue_checklist}\n\n"
+            f"ℹ️ _Unrun queue items will be deployed sequentially in 45-minute intervals._"
+        )
+
+        # Spin up concurrent daemon loops
         app.state.credit_sync_task = asyncio.create_task(
             credit_sync_scheduler_loop(app.state.db_pool)
         )
         app.state.awareness_task = asyncio.create_task(perpetual_awareness_loop())
-        send_telegram_broadcast(
-            "Helix application cloud lifespan engine initialized successfully.",
-            "success",
-        )
+
+        # Dispatch the descriptive payload to your Telegram channel
+        send_telegram_broadcast(boot_msg, "success")
+
     except Exception as exc:
         traceback.print_exc()
         raise exc
     yield
 
+    # Clean teardown upon container exit/restart
     app.state.awareness_task.cancel()
     if hasattr(app.state, "credit_sync_task"):
         app.state.credit_sync_task.cancel()
