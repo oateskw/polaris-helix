@@ -338,6 +338,7 @@ class LogIngestSchema(BaseModel):
         "pulsar",
         "radar",
         "nova",
+        "chiron",
     ]
     log_level: str = "INFO"
     message: str
@@ -451,6 +452,72 @@ def parse_credit_value(raw_value: Any) -> float | None:
         if match:
             return float(match.group(0))
     return None
+
+
+async def dispatch_chiron_heal_request(
+    db_pool,
+    log_id: int,
+    agent_name: str,
+    error_msg: str,
+    traceback_str: str,
+    metadata: dict,
+) -> None:
+    """Inserts a session tracking row and fires an API request to polaris-chiron"""
+    chiron_url = os.getenv(
+        "CHIRON_API_URL", "https://polaris-chiron.onrender.com"
+    ).rstrip("/")
+    # 👈 Renamed from CHIRON_API_KEY to HELIX_AUTH_TOKEN
+    helix_token = os.getenv("HELIX_AUTH_TOKEN", "")
+
+    if not helix_token:
+        print(
+            "⚠️ HELIX_AUTH_TOKEN is not configured on Helix. Skipping auto-healing trigger."
+        )
+        return
+
+    try:
+        # 1. Log the initiation state in our Neon DB
+        async with db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO chiron_healing_sessions 
+                        (triggering_log_id, target_agent, error_message, full_traceback, status)
+                    VALUES (%s, %s, %s, %s, 'triggered')
+                    ON CONFLICT DO NOTHING;
+                    """,
+                    (log_id, agent_name, error_msg, traceback_str),
+                )
+            await conn.commit()
+
+        # 2. Package and fire the trigger payload to Chiron
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                f"{chiron_url}/api/v1/chiron/heal",
+                headers={
+                    "X-Chiron-Key": helix_token,  # Keep the protocol header, but pass our standardized token
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "log_id": log_id,
+                    "target_agent": agent_name,
+                    "error_message": error_msg[:500],
+                    "full_traceback": traceback_str,
+                    "metadata": metadata,
+                },
+            )
+
+            if response.status_code == 200:
+                print(
+                    f"🚀 [Helix] Successfully dispatched Chiron self-healing session for {agent_name}."
+                )
+            else:
+                print(
+                    f"⚠️ [Helix] Chiron rejected healing payload with status {response.status_code}: {response.text}"
+                )
+
+    except Exception as exc:
+        print(f"💥 [Helix] Failed to dispatch self-healing request to Chiron: {exc}")
 
 
 async def seed_oracle_ledger_rows(db_pool) -> None:
@@ -1191,7 +1258,7 @@ async def process_roi_attribution_boost(email: str, status: str, db_pool):
 async def trigger_downstream_mesh_with_payload(
     strategy: dict, agent_list: list, isolation_matrix: dict
 ):
-    master_token = os.getenv("INBOUND_API_KEY", "")
+    master_token = os.getenv("HELIX_AUTH_TOKEN", "")
 
     # 1. NEXUS OMNI-STRATEGIST (MUST SUCCEED FIRST)
     if "nexus" in agent_list:
@@ -1682,7 +1749,7 @@ async def analyze_and_orchestrate_log(
                         )
 
                         if agent_name in ["beacon", "nova"]:
-                            master_token = os.getenv("INBOUND_API_KEY", "")
+                            master_token = os.getenv("HELIX_AUTH_TOKEN", "")
                             nexus_base_url = os.getenv(
                                 "NEXUS_NERVOUS_IMPULSE_URL",
                                 "https://polaris-nexus.onrender.com",
@@ -1875,7 +1942,7 @@ async def analyze_and_orchestrate_log(
                         strategy = await cur.fetchone()
 
                         if strategy and agent_name in ["nexus", "nova"]:
-                            master_token = os.getenv("INBOUND_API_KEY", "")
+                            master_token = os.getenv("HELIX_AUTH_TOKEN", "")
                             if agent_name == "nexus":
                                 url = os.getenv(
                                     "NEXUS_NERVOUS_IMPULSE_URL",
@@ -1971,7 +2038,7 @@ async def inbound_blueprints(
     background_tasks: BackgroundTasks,
     x_inbound_key: str | None = Header(default=None),
 ):
-    expected_key = os.getenv("INBOUND_API_KEY")
+    expected_key = os.getenv("HELIX_AUTH_TOKEN")
     if expected_key and not (
         x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
     ):
@@ -2021,7 +2088,7 @@ async def update_lead_status_and_attribute(
     email: str = Query(...),
     x_vanguard_key: str | None = Header(default=None),
 ):
-    expected_key = os.getenv("VANGUARD_API_KEY") or os.getenv("INBOUND_API_KEY")
+    expected_key = os.getenv("VANGUARD_API_KEY") or os.getenv("HELIX_AUTH_TOKEN")
     if expected_key and not (
         x_vanguard_key and hmac.compare_digest(x_vanguard_key, expected_key)
     ):
@@ -2081,7 +2148,7 @@ async def ingest_log(payload: LogIngestSchema):
 async def get_latest_agent_log(
     agent: str, x_inbound_key: str | None = Header(default=None)
 ):
-    expected_key = os.getenv("INBOUND_API_KEY")
+    expected_key = os.getenv("HELIX_AUTH_TOKEN")
     if expected_key and not (
         x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
     ):
@@ -2162,7 +2229,7 @@ async def execute_orchestrated_master_cycle(
 async def get_current_scheduler_target(
     x_inbound_key: str | None = Header(default=None),
 ):
-    expected_key = os.getenv("INBOUND_API_KEY")
+    expected_key = os.getenv("HELIX_AUTH_TOKEN")
     if expected_key and not (
         x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
     ):
@@ -2197,7 +2264,7 @@ async def rotate_scheduler_target(
     payload: SchedulerTargetUpdateModel,
     x_inbound_key: str | None = Header(default=None),
 ):
-    expected_key = os.getenv("INBOUND_API_KEY")
+    expected_key = os.getenv("HELIX_AUTH_TOKEN")
     if expected_key and not (
         x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
     ):
@@ -2256,7 +2323,7 @@ async def rotate_scheduler_target(
 
 @app.get("/api/v1/oracle/vendor-health")
 async def get_vendor_health(x_inbound_key: str | None = Header(default=None)):
-    expected_key = os.getenv("INBOUND_API_KEY")
+    expected_key = os.getenv("HELIX_AUTH_TOKEN")
     if expected_key and not (
         x_inbound_key and hmac.compare_digest(x_inbound_key, expected_key)
     ):

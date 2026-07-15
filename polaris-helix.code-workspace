@@ -1,22 +1,32 @@
 {
 	"folders": [
 		{
-			"path": "."
+			"name": "polaris-aura",
+			"path": "../polaris-aura"
 		},
 		{
+			"name": "polaris-beacon",
 			"path": "../polaris-beacon"
 		},
 		{
+			"name": "polaris-chiron",
+			"path": "../polaris-chiron"
+		},
+		{
+			"name": "polaris-helix",
+			"path": "."
+		},
+		{
+			"name": "polaris-vanguard",
 			"path": "../polaris-vanguard"
 		},
 		{
+			"name": "polaris-vector",
 			"path": "../polaris-vector"
 		},
 		{
+			"name": "polaris_website",
 			"path": "../polaris_website"
-		},
-		{
-			"path": "../polaris-aura"
 		}
 	]
 }
