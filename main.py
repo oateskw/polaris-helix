@@ -228,7 +228,16 @@ def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
         "verbose": "📡 [TELEMETRY]",
     }
     prefix = prefixes.get(notification_type, "📡")
-    formatted_message = f"{prefix}\n{message}"
+    # 🌟 Automatically append traceback details ONLY for critical notifications
+    extra_details = ""
+    if notification_type == "critical":
+        tb_str = traceback.format_exc()
+        # Ensure we actually have an active exception trace to print
+        if tb_str and "NoneType: None" not in tb_str:
+            # Cap at 1500 characters to prevent hitting Telegram message length limits
+            extra_details = f"\n\n**🔍 Traceback:**\n```python\n{tb_str[-1500:]}\n```"
+
+    formatted_message = f"{prefix}\n{message}{extra_details}"
 
     async def _send() -> None:
         try:
@@ -912,7 +921,7 @@ async def perpetual_awareness_loop():
                         daily_caps = {1: 2, 2: 3, 3: 2}
                         max_runs_allowed = daily_caps.get(current_weekday, 0)
 
-                        async with await app.state.db_pool.connection() as conn:
+                        async with app.state.db_pool.connection() as conn:
                             async with conn.cursor() as cur:
                                 # Count how many times beacon successfully executed TODAY (NY Time)
                                 await cur.execute("""
