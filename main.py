@@ -872,27 +872,9 @@ async def perpetual_awareness_loop():
             current_weekday = est_now.weekday()
             current_date_str = est_now.strftime("%Y-%m-%d")
 
-            # 🌟 FIXED DAILY PROMPT OPTIMIZATION TRIGGER
-            # Runs during the 11:00 PM (23:00) hour, safely locked to once per day[cite: 7]
-            if est_now.hour == 23:
-                if (
-                    getattr(app.state, "last_optimization_date", None)
-                    != current_date_str
-                ):
-                    app.state.last_optimization_date = current_date_str
-
-                    send_telegram_broadcast(
-                        "🧠 *DAILY SYSTEM OPTIMIZATION ENGINE STARTING*\n"
-                        "Analyzing today's logs and prepping smart prompts for tonight's midnight runs.",
-                        "orchestration",
-                    )
-                    # Run background optimizer task[cite: 7]
-                    await run_daily_prompt_optimization(app.state.db_pool)
-
-            # 1. Grab standard daily scheduled agents for today
-            scheduled_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
-
-            # 2. Check if we need to dynamically append 'beacon' based on Publer timeslots
+            # =====================================================================
+            # 🌟 1. TRIGGER BEACON OUT-OF-BAND (INDEPENDENT OF SEQUENTIAL QUEUE)
+            # =====================================================================
             should_trigger_beacon = False
             if current_weekday in PUBLER_BEACON_SCHEDULE:
                 target_times = PUBLER_BEACON_SCHEDULE[current_weekday]
@@ -910,16 +892,89 @@ async def perpetual_awareness_loop():
                         should_trigger_beacon = True
                         break
 
-            # Clone the scheduled list and append 'beacon' dynamically if inside an active slot
-            active_agents_list = list(scheduled_agents_list)
             if should_trigger_beacon:
-                active_agents_list.append("beacon")
+                # Find out the maximum runs allowed today
+                # Tuesday (1) = 2, Wednesday (2) = 3, Thursday (3) = 2
+                daily_caps = {1: 2, 2: 3, 3: 2}
+                max_runs_allowed = daily_caps.get(current_weekday, 0)
 
-            if not active_agents_list:
+                async with app.state.db_pool.connection() as conn:
+                    async with conn.cursor() as cur:
+                        # Count how many times beacon successfully executed TODAY (NY Time)
+                        await cur.execute("""
+                            SELECT COUNT(*) FROM agent_system_logs 
+                            WHERE agent_name = 'beacon' 
+                            AND log_level = 'INFO'
+                            AND timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
+                        """)
+                        daily_run_count = (await cur.fetchone())[0]
+
+                        # Safety check: Also ensure it hasn't run in the last 20 minutes
+                        await cur.execute("""
+                            SELECT COUNT(*) FROM agent_system_logs 
+                            WHERE agent_name = 'beacon' 
+                            AND timestamp >= NOW() - INTERVAL '20 minutes';
+                        """)
+                        recent_runs = (await cur.fetchone())[0]
+
+                # Only trigger beacon if we are under the daily cap and cleared the 20-min guard
+                if daily_run_count < max_runs_allowed and recent_runs == 0:
+                    async with app.state.db_pool.connection() as conn:
+                        async with conn.cursor(row_factory=dict_row) as cur:
+                            # Pull the active strategy
+                            await cur.execute("""
+                                SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                FROM helix_brain_scheduler 
+                                WHERE is_active = TRUE 
+                                ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
+                            """)
+                            active_strategy = await cur.fetchone()
+
+                    if active_strategy:
+                        send_telegram_broadcast(
+                            f"📡 [TIME-CRITICAL TRIGGER] Deploying `beacon` out-of-band for strategy: *{active_strategy['industry_name']}*",
+                            "orchestration",
+                        )
+                        # Load live isolation status and trigger immediately
+                        vendor_isolation_matrix = await load_vendor_isolation_matrix(
+                            app.state.db_pool
+                        )
+                        await trigger_downstream_mesh_with_payload(
+                            active_strategy,
+                            ["beacon"],
+                            vendor_isolation_matrix,
+                        )
+
+            # =====================================================================
+            # 🧠 2. DAILY PROMPT OPTIMIZATION TRIGGER
+            # =====================================================================
+            # Runs during the 11:00 PM (23:00) hour, safely locked to once per day
+            if est_now.hour == 23:
+                if (
+                    getattr(app.state, "last_optimization_date", None)
+                    != current_date_str
+                ):
+                    app.state.last_optimization_date = current_date_str
+
+                    send_telegram_broadcast(
+                        "🧠 *DAILY SYSTEM OPTIMIZATION ENGINE STARTING*\n"
+                        "Analyzing today's logs and prepping smart prompts for tonight's midnight runs.",
+                        "orchestration",
+                    )
+                    # Run background optimizer task
+                    await run_daily_prompt_optimization(app.state.db_pool)
+
+            # =====================================================================
+            # 🔄 3. STANDARD SEQUENTIAL DRIP (BEACON RUNS EXCLUDED FROM COOLDOWN)
+            # =====================================================================
+            # 1. Grab standard daily scheduled agents for today (doesn't contain beacon)
+            scheduled_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
+
+            if not scheduled_agents_list:
                 await asyncio.sleep(60)
                 continue
 
-            # 3. Find what has completed successfully today
+            # 2. Find what has completed successfully today
             async with app.state.db_pool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute("""
@@ -930,50 +985,12 @@ async def perpetual_awareness_loop():
                     completed_rows = await cur.fetchall()
                     completed_today_set = {r["executed_agent"] for r in completed_rows}
 
-            # 4. Filter pending agents, bypassing daily completion check for beacon if scheduled
-            pending_agents_for_today = []
-            for agent in active_agents_list:
-                if agent == "beacon":
-                    if should_trigger_beacon:
-                        # Find out the maximum runs allowed today
-                        # Tuesday (1) = 2, Wednesday (2) = 3, Thursday (3) = 2
-                        daily_caps = {1: 2, 2: 3, 3: 2}
-                        max_runs_allowed = daily_caps.get(current_weekday, 0)
-
-                        async with app.state.db_pool.connection() as conn:
-                            async with conn.cursor() as cur:
-                                # Count how many times beacon successfully executed TODAY (NY Time)
-                                await cur.execute("""
-                                    SELECT COUNT(*) FROM agent_system_logs 
-                                    WHERE agent_name = 'beacon' 
-                                    AND log_level = 'INFO'
-                                    AND timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
-                                """)
-                                daily_run_count = (await cur.fetchone())[0]
-
-                                # Safety check: Also ensure it hasn't run in the last 20 minutes
-                                await cur.execute("""
-                                    SELECT COUNT(*) FROM agent_system_logs 
-                                    WHERE agent_name = 'beacon' 
-                                    AND timestamp >= NOW() - INTERVAL '20 minutes';
-                                """)
-                                recent_runs = (await cur.fetchone())[0]
-
-                        # Only queue beacon if we are under the daily cap and cleared the 20-min guard
-                        if daily_run_count < max_runs_allowed:
-                            if recent_runs == 0:
-                                pending_agents_for_today.append(agent)
-                            else:
-                                print(
-                                    "⏳ Beacon slot is active, but cooling down from a recent run."
-                                )
-                        else:
-                            print(
-                                f"🛑 Beacon is done for today. Daily cap of {max_runs_allowed} reached."
-                            )
-
-                elif agent not in completed_today_set:
-                    pending_agents_for_today.append(agent)
+            # 3. Filter pending agents
+            pending_agents_for_today = [
+                agent
+                for agent in scheduled_agents_list
+                if agent not in completed_today_set
+            ]
 
             if pending_agents_for_today:
                 # Load the live infrastructure circuit breaker status matrix
@@ -981,7 +998,7 @@ async def perpetual_awareness_loop():
                     app.state.db_pool
                 )
 
-                # 🧠 SMART EVALUATION: Scan the pending queue and find the first UNBLOCKED agent
+                # Scan the pending queue and find the first UNBLOCKED agent
                 next_agent_up = None
                 for candidate_agent in pending_agents_for_today:
                     is_isolated = False
@@ -1069,7 +1086,7 @@ async def perpetual_awareness_loop():
                             vendor_isolation_matrix,
                         )
 
-                    # Only cool down if a task actually ran (45 mins)
+                    # Only sleep/cooldown standard loop if a sequential task actually ran
                     await asyncio.sleep(45 * 60)
                     continue
                 else:
@@ -1085,6 +1102,7 @@ async def perpetual_awareness_loop():
         except Exception as loop_crash:
             send_telegram_broadcast(f"Loop exception: `{loop_crash}`", "critical")
 
+        # Heartbeat tick interval
         await asyncio.sleep(60)
 
 
