@@ -518,6 +518,9 @@ async def dispatch_chiron_heal_request(
 
     except Exception as exc:
         print(f"💥 [Helix] Failed to dispatch self-healing request to Chiron: {exc}")
+        import traceback
+
+        traceback.print_exc()
 
 
 async def seed_oracle_ledger_rows(db_pool) -> None:
@@ -1934,8 +1937,18 @@ async def analyze_and_orchestrate_log(
                         await conn.commit()
                         return
 
-                    # 🩹 NEW: Trigger Chiron for any ERROR log that has a traceback!
-                    traceback_str = meta.get("traceback")
+                    # 🩹 Robust extraction check
+                    traceback_str = None
+                    if isinstance(meta, dict):
+                        traceback_str = meta.get("traceback") or meta.get(
+                            "traceback_str"
+                        )
+
+                    if not traceback_str:
+                        # Fallback: check if the raw message contains traceback indicators
+                        if "traceback" in norm_msg:
+                            traceback_str = message
+
                     if traceback_str:
                         asyncio.create_task(
                             dispatch_chiron_heal_request(
