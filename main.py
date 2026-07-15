@@ -10,6 +10,7 @@ import requests
 import datetime
 import psycopg
 import httpx
+import uvicorn
 from anthropic import Anthropic
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal, Optional, List
@@ -23,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
-import uvicorn
+from helix_optimizer import run_daily_prompt_optimization
 
 load_dotenv()
 
@@ -869,6 +870,24 @@ async def perpetual_awareness_loop():
         try:
             est_now = get_new_york_now()
             current_weekday = est_now.weekday()
+            current_date_str = est_now.strftime("%Y-%m-%d")
+
+            # 🌟 FIXED DAILY PROMPT OPTIMIZATION TRIGGER
+            # Runs during the 11:00 PM (23:00) hour, safely locked to once per day[cite: 7]
+            if est_now.hour == 23:
+                if (
+                    getattr(app.state, "last_optimization_date", None)
+                    != current_date_str
+                ):
+                    app.state.last_optimization_date = current_date_str
+
+                    send_telegram_broadcast(
+                        "🧠 *DAILY SYSTEM OPTIMIZATION ENGINE STARTING*\n"
+                        "Analyzing today's logs and prepping smart prompts for tonight's midnight runs.",
+                        "orchestration",
+                    )
+                    # Run background optimizer task[cite: 7]
+                    await run_daily_prompt_optimization(app.state.db_pool)
 
             # 1. Grab standard daily scheduled agents for today
             scheduled_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
@@ -1457,6 +1476,9 @@ async def lifespan(app: FastAPI):
     app.state.ai_client = Anthropic(api_key=anthropic_key) if anthropic_key else None
     app.state.phantombuster_remediation = {}
     app.state.vendor_matrix_degraded = False
+
+    # 🌟 NEW ADDITION: Daily prompt optimizer lock state
+    app.state.last_optimization_date = None
 
     try:
         await app.state.db_pool.open(wait=True)
