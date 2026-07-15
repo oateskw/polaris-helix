@@ -1724,7 +1724,7 @@ app = FastAPI(title="Helix Strategic Orchestration Core API", lifespan=lifespan)
 
 
 async def analyze_and_orchestrate_log(
-    agent_name: str, log_level: str, message: str, metadata: dict | None
+    log_id: int, agent_name: str, log_level: str, message: str, metadata: dict | None
 ) -> None:
     norm_msg = message.lower()
     normalized_log_level = str(log_level or "INFO").upper()
@@ -1934,6 +1934,20 @@ async def analyze_and_orchestrate_log(
                         await conn.commit()
                         return
 
+                    # 🩹 NEW: Trigger Chiron for any ERROR log that has a traceback!
+                    traceback_str = meta.get("traceback")
+                    if traceback_str:
+                        asyncio.create_task(
+                            dispatch_chiron_heal_request(
+                                db_pool=app.state.db_pool,
+                                log_id=log_id,
+                                agent_name=agent_name,
+                                error_msg=message,
+                                traceback_str=traceback_str,
+                                metadata=meta,
+                            )
+                        )
+
                     if industry:
                         await cur.execute(
                             "SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region FROM helix_brain_scheduler WHERE industry_name = %s LIMIT 1;",
@@ -2136,7 +2150,11 @@ async def ingest_log(payload: LogIngestSchema):
             await conn.commit()
         asyncio.create_task(
             analyze_and_orchestrate_log(
-                payload.agent_name, payload.log_level, payload.message, payload.metadata
+                log_id=row[0],  # 👈 Pass the DB log ID
+                agent_name=payload.agent_name,
+                log_level=payload.log_level,
+                message=payload.message,
+                metadata=payload.metadata,
             )
         )
         return {"status": "success", "logged_id": row[0]}
