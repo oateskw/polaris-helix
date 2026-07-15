@@ -965,6 +965,9 @@ async def credit_sync_scheduler_loop(db_pool) -> None:
 async def perpetual_awareness_loop():
     print("🚀 [PERPETUAL BRAIN ENGINE] Staggered drip pipeline loop active...")
 
+    # Track standard drip interval without blocking the loop
+    last_standard_drip_at = None  # Initialize tracker
+
     while True:
         try:
             est_now = get_new_york_now()
@@ -1066,142 +1069,151 @@ async def perpetual_awareness_loop():
             # =====================================================================
             # 🔄 3. STANDARD SEQUENTIAL DRIP (BEACON RUNS EXCLUDED FROM COOLDOWN)
             # =====================================================================
-            # 1. Grab standard daily scheduled agents for today (doesn't contain beacon)
-            scheduled_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
+            # Only attempt standard sequential drips if at least 45 minutes have passed
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            if last_standard_drip_at is None or (
+                now_utc - last_standard_drip_at
+            ) >= datetime.timedelta(minutes=45):
 
-            if not scheduled_agents_list:
-                await asyncio.sleep(60)
-                continue
+                # 1. Grab standard daily scheduled agents for today (doesn't contain beacon)
+                scheduled_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
 
-            # 2. Find what has completed successfully today
-            async with app.state.db_pool.connection() as conn:
-                async with conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute("""
-                        SELECT DISTINCT LOWER( agent_name ) as executed_agent
-                        FROM agent_system_logs 
-                        WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
-                    """)
-                    completed_rows = await cur.fetchall()
-                    completed_today_set = {r["executed_agent"] for r in completed_rows}
-
-            # 3. Filter pending agents
-            pending_agents_for_today = [
-                agent
-                for agent in scheduled_agents_list
-                if agent not in completed_today_set
-            ]
-
-            if pending_agents_for_today:
-                # Load the live infrastructure circuit breaker status matrix
-                vendor_isolation_matrix = await load_vendor_isolation_matrix(
-                    app.state.db_pool
-                )
-
-                # Scan the pending queue and find the first UNBLOCKED agent
-                next_agent_up = None
-                for candidate_agent in pending_agents_for_today:
-                    is_isolated = False
-
-                    if candidate_agent == "vanguard" and vendor_isolation_matrix.get(
-                        VENDOR_MYEMAILVERIFIER, False
-                    ):
-                        is_isolated = True
-                    elif candidate_agent == "radar" and vendor_isolation_matrix.get(
-                        VENDOR_PHANTOMBUSTERS, False
-                    ):
-                        is_isolated = True
-                    elif candidate_agent == "nova" and vendor_isolation_matrix.get(
-                        VENDOR_MOLTSET, False
-                    ):
-                        is_isolated = True
-                    elif candidate_agent == "nexus" and vendor_isolation_matrix.get(
-                        VENDOR_ANTHROPIC, False
-                    ):
-                        is_isolated = True
-
-                    if is_isolated:
-                        print(
-                            f"⚠️ [QUEUE BYPASS] Skipping isolated agent '{candidate_agent}' to prevent queue blocking."
-                        )
-                        await write_helix_command_center_log(
-                            app.state.db_pool,
-                            "WARNING",
-                            message=f"Bypassed agent '{candidate_agent}' in queue due to vendor circuit breaker isolation.",
-                            action_taken="QUEUE_BYPASS",
-                            extra_metadata={"blocked_agent": candidate_agent},
-                        )
-                        continue
-                    else:
-                        next_agent_up = candidate_agent
-                        break
-
-                if next_agent_up:
+                if scheduled_agents_list:
+                    # 2. Find what has completed successfully today
                     async with app.state.db_pool.connection() as conn:
                         async with conn.cursor(row_factory=dict_row) as cur:
-                            if next_agent_up in ["radar", "pulsar"]:
-                                await cur.execute("""
-                                    SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
-                                    FROM helix_brain_scheduler 
-                                    WHERE is_active = TRUE 
-                                    ORDER BY last_targeted_at DESC NULLS LAST LIMIT 1;
-                                """)
+                            await cur.execute("""
+                                SELECT DISTINCT LOWER( agent_name ) as executed_agent
+                                FROM agent_system_logs 
+                                WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
+                            """)
+                            completed_rows = await cur.fetchall()
+                            completed_today_set = {
+                                r["executed_agent"] for r in completed_rows
+                            }
+
+                    # 3. Filter pending agents
+                    pending_agents_for_today = [
+                        agent
+                        for agent in scheduled_agents_list
+                        if agent not in completed_today_set
+                    ]
+
+                    if pending_agents_for_today:
+                        # Load the live infrastructure circuit breaker status matrix
+                        vendor_isolation_matrix = await load_vendor_isolation_matrix(
+                            app.state.db_pool
+                        )
+
+                        # Scan the pending queue and find the first UNBLOCKED agent
+                        next_agent_up = None
+                        for candidate_agent in pending_agents_for_today:
+                            is_isolated = False
+
+                            if (
+                                candidate_agent == "vanguard"
+                                and vendor_isolation_matrix.get(
+                                    VENDOR_MYEMAILVERIFIER, False
+                                )
+                            ):
+                                is_isolated = True
+                            elif (
+                                candidate_agent == "radar"
+                                and vendor_isolation_matrix.get(
+                                    VENDOR_PHANTOMBUSTERS, False
+                                )
+                            ):
+                                is_isolated = True
+                            elif (
+                                candidate_agent == "nova"
+                                and vendor_isolation_matrix.get(VENDOR_MOLTSET, False)
+                            ):
+                                is_isolated = True
+                            elif (
+                                candidate_agent == "nexus"
+                                and vendor_isolation_matrix.get(VENDOR_ANTHROPIC, False)
+                            ):
+                                is_isolated = True
+
+                            if is_isolated:
+                                print(
+                                    f"⚠️ [QUEUE BYPASS] Skipping isolated agent '{candidate_agent}'."
+                                )
+                                await write_helix_command_center_log(
+                                    app.state.db_pool,
+                                    "WARNING",
+                                    message=f"Bypassed agent '{candidate_agent}' in queue due to vendor circuit breaker isolation.",
+                                    action_taken="QUEUE_BYPASS",
+                                    extra_metadata={"blocked_agent": candidate_agent},
+                                )
+                                continue
                             else:
-                                await cur.execute("""
-                                    SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
-                                    FROM helix_brain_scheduler 
-                                    WHERE is_active = TRUE 
-                                    AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
-                                    ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
-                                """)
-                            active_strategy = await cur.fetchone()
+                                next_agent_up = candidate_agent
+                                break
+
+                        if next_agent_up:
+                            async with app.state.db_pool.connection() as conn:
+                                async with conn.cursor(row_factory=dict_row) as cur:
+                                    if next_agent_up in ["radar", "pulsar"]:
+                                        await cur.execute("""
+                                            SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                            FROM helix_brain_scheduler 
+                                            WHERE is_active = TRUE 
+                                            ORDER BY last_targeted_at DESC NULLS LAST LIMIT 1;
+                                        """)
+                                    else:
+                                        await cur.execute("""
+                                            SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                            FROM helix_brain_scheduler 
+                                            WHERE is_active = TRUE 
+                                            AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
+                                            ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
+                                        """)
+                                    active_strategy = await cur.fetchone()
+
+                                    if active_strategy:
+                                        await cur.execute(
+                                            "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
+                                            (active_strategy["industry_id"],),
+                                        )
+                                await conn.commit()
 
                             if active_strategy:
-                                await cur.execute(
-                                    "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
-                                    (active_strategy["industry_id"],),
+                                send_telegram_broadcast(
+                                    f"⏳ [STAGGERED DRIP] Deploying `{next_agent_up}` for strategy: *{active_strategy['industry_name']}*",
+                                    "orchestration",
                                 )
-                        await conn.commit()
+                                await write_helix_command_center_log(
+                                    app.state.db_pool,
+                                    "INFO",
+                                    message=f"Deploying worker agent '{next_agent_up}' to manage targeting loops.",
+                                    action_taken=f"LAUNCH_{next_agent_up.upper()}",
+                                    target_niche=active_strategy["industry_name"],
+                                    extra_metadata={
+                                        "strategy_id": active_strategy["industry_id"]
+                                    },
+                                )
 
-                    if active_strategy:
-                        send_telegram_broadcast(
-                            f"⏳ [STAGGERED DRIP] Deploying `{next_agent_up}` for strategy: *{active_strategy['industry_name']}*",
-                            "orchestration",
-                        )
-                        # Write structured command-center telemetry record
-                        await write_helix_command_center_log(
-                            app.state.db_pool,
-                            "INFO",
-                            message=f"Deploying worker agent '{next_agent_up}' to manage targeting loops.",
-                            action_taken=f"LAUNCH_{next_agent_up.upper()}",
-                            target_niche=active_strategy["industry_name"],
-                            extra_metadata={
-                                "strategy_id": active_strategy["industry_id"]
-                            },
-                        )
+                                await trigger_downstream_mesh_with_payload(
+                                    active_strategy,
+                                    [next_agent_up],
+                                    vendor_isolation_matrix,
+                                )
 
-                        await trigger_downstream_mesh_with_payload(
-                            active_strategy,
-                            [next_agent_up],
-                            vendor_isolation_matrix,
-                        )
-
-                    # Only sleep/cooldown standard loop if a sequential task actually ran
-                    await asyncio.sleep(45 * 60)
-                    continue
-                else:
-                    await write_helix_command_center_log(
-                        app.state.db_pool,
-                        "INFO",
-                        message="All pending queue items are currently blocked by circuit isolation.",
-                        action_taken="ORCHESTRATOR_STALL_WAIT",
-                    )
-                    await asyncio.sleep(5 * 60)
-                    continue
+                                # 🌟 UPDATE DRIP TIMESTAMP (instead of sleeping here!)
+                                last_standard_drip_at = now_utc
+                        else:
+                            await write_helix_command_center_log(
+                                app.state.db_pool,
+                                "INFO",
+                                message="All pending queue items are currently blocked by circuit isolation.",
+                                action_taken="ORCHESTRATOR_STALL_WAIT",
+                            )
 
         except Exception as loop_crash:
             send_telegram_broadcast(f"Loop exception: `{loop_crash}`", "critical")
 
-        # Heartbeat tick interval
+        # Heartbeat tick interval (Keeps checking Beacon schedule every 60 seconds!)
         await asyncio.sleep(60)
 
 
