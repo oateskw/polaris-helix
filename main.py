@@ -1561,7 +1561,9 @@ async def analyze_and_orchestrate_log(
                         records_found = int(meta.get("records_found", 0))
                         status_flag = str(meta.get("status", "")).upper()
 
-                        if status_flag == "COMPLETED" and records_found < 500:
+                        if status_flag == "COMPLETED" and records_found < int(
+                            os.getenv("MOLTSET_HARVEST_LIMIT", 50)
+                        ):
                             send_telegram_broadcast(
                                 f"📉 *PARTIAL NOVA DETECTED*\nLast run only secured `{records_found}` unique clean leads.\nAdvancing queue...",
                                 "orchestration",
