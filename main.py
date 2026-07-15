@@ -1542,18 +1542,59 @@ async def lifespan(app: FastAPI):
                 completed_rows = await cur.fetchall()
                 completed_today = {r["executed_agent"] for r in completed_rows}
 
-        # Build dynamic checklist visualizer
+                # Grab exact timestamps of successful beacon runs today to match against slots
+                await cur.execute("""
+                    SELECT timestamp AT TIME ZONE 'America/New_York' as local_time
+                    FROM agent_system_logs
+                    WHERE agent_name = 'beacon'
+                    AND log_level = 'INFO'
+                    AND timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
+                """)
+                beacon_run_rows = await cur.fetchall()
+                beacon_run_times = [row["local_time"].time() for row in beacon_run_rows]
+
+        # Build dynamic checklist visualizer for standard agents
         status_lines = []
         for agent in scheduled_agents:
             status_icon = "✅" if agent in completed_today else "⏳"
             status_label = "Completed" if agent in completed_today else "Pending"
             status_lines.append(f"* {status_icon} `{agent}` ({status_label})")
 
-        # Handle the decoupled Beacon schedule edge-case visibility
-        if "beacon" in completed_today:
-            status_lines.append("* ✅ `beacon` (Completed)")
-        elif current_weekday in [1, 2, 3]:  # Tuesday, Wednesday, Thursday
-            status_lines.append("* ⏳ `beacon` (Pending - Time-Slot Bound)")
+        # Handle the decoupled Beacon schedule with time-slot tracking
+        if current_weekday in PUBLER_BEACON_SCHEDULE:
+            target_times = PUBLER_BEACON_SCHEDULE[current_weekday]
+            beacon_slots_status = []
+
+            for target_time in target_times:
+                formatted_time = (
+                    target_time.strftime("%I%p").lstrip("0").lower()
+                )  # e.g., "7am", "2pm"
+
+                # Check if a log exists within a 15-minute window after this slot's time
+                slot_executed = False
+                for run_time in beacon_run_times:
+                    # Allow a 15-minute execution window logic matching
+                    dt_slot = datetime.datetime.combine(est_now.date(), target_time)
+                    dt_run = datetime.datetime.combine(est_now.date(), run_time)
+                    if dt_slot <= dt_run <= (dt_slot + datetime.timedelta(minutes=15)):
+                        slot_executed = True
+                        break
+
+                if slot_executed:
+                    beacon_slots_status.append(f"{formatted_time} ✅")
+                elif (
+                    est_now.time()
+                    > (
+                        datetime.datetime.combine(est_now.date(), target_time)
+                        + datetime.timedelta(minutes=15)
+                    ).time()
+                ):
+                    beacon_slots_status.append(f"{formatted_time} ❌ (missed)")
+                else:
+                    beacon_slots_status.append(f"{formatted_time} ⏳")
+
+            slots_joined = ", ".join(beacon_slots_status)
+            status_lines.append(f"* 📡 `beacon` (Slots: {slots_joined})")
 
         queue_checklist = (
             "\n".join(status_lines)
