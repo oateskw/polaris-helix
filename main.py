@@ -834,6 +834,20 @@ async def sync_myemailverifier_credits(db_pool) -> None:
                 )
                 return
 
+            # =====================================================================
+            # 🌟 [FIX] STATE-TRACKING & DESCRIPTIVE TELEGRAM TRANSITION ALERTS
+            # =====================================================================
+            was_circuit_broken = False
+            async with db_pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT is_circuit_broken FROM helix_infrastructure_oracle_ledger WHERE vendor_name = %s;",
+                        (VENDOR_MYEMAILVERIFIER,),
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        was_circuit_broken = row[0]
+
             is_circuit_broken = credits <= 0
             await upsert_vendor_credit_state(
                 db_pool,
@@ -843,16 +857,18 @@ async def sync_myemailverifier_credits(db_pool) -> None:
                 credit_unit="CREDITS",
             )
 
-            if not is_circuit_broken:
+            # ONLY alert when there is a genuine state change!
+            if was_circuit_broken and not is_circuit_broken:
                 send_telegram_broadcast(
-                    "🔄 *INFRASTRUCTURE CIRCUIT HEALED*: MyEmailVerifier has been automatically re-activated.",
+                    f"🔄 *INFRASTRUCTURE CIRCUIT HEALED*: MyEmailVerifier has recovered from a previous depletion block. Balance is now healthy at `{credits} CREDITS`.",
                     "success",
                 )
-            else:
+            elif is_circuit_broken and not was_circuit_broken:
                 send_telegram_broadcast(
-                    "🚨 [CIRCUIT BREAKER] MyEmailVerifier credits are depleted. Isolation engaged.",
+                    f"🚨 [CIRCUIT BREAKER] MyEmailVerifier credits have depleted (`{credits} CREDITS`). Outbound verification queues are now ISOLATED.",
                     "critical",
                 )
+
     except Exception as e:
         await mark_vendor_fail_closed(
             db_pool,
