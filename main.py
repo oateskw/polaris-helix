@@ -1099,6 +1099,21 @@ async def perpetual_awareness_loop():
                         if agent not in completed_today_set
                     ]
 
+                    # ⏳ RETRY BYPASS: If Nova ran today but a campaign is waiting on an hourly self-healing retry, 
+                    # force 'nova' back into the pending queue so the loop can pick it up!
+                    if "nova" not in pending_agents_for_today:
+                        async with app.state.db_pool.connection() as conn:
+                            async with conn.cursor() as retry_cur:
+                                await retry_cur.execute("""
+                                    SELECT COUNT(*) FROM helix_brain_scheduler 
+                                    WHERE is_active = TRUE 
+                                    AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL);
+                                """)
+                                retry_eligible_count = (await retry_cur.fetchone())[0]
+                                
+                                if retry_eligible_count > 0:
+                                    pending_agents_for_today.append("nova")
+
                     if pending_agents_for_today:
                         # Load the live infrastructure circuit breaker status matrix
                         vendor_isolation_matrix = await load_vendor_isolation_matrix(
