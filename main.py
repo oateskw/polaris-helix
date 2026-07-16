@@ -1792,15 +1792,58 @@ async def analyze_and_orchestrate_log(
                             )
 
                     # =====================================================================
-                    # 🧠 CASCADING NOVA FEEDBACK LOOP (OPTIMIZED CURSOR REUSE)
+                    # 🧠 CASCADING NOVA FEEDBACK LOOP WITH SELF-HEALING CIRCUIT BREAKER
                     # =====================================================================
-                    if (
-                        agent_name == "nova"
-                        and "successfully processed batch" in norm_msg
+                    if agent_name == "nova" and (
+                        "finished batch run" in norm_msg
+                        or "successfully processed batch" in norm_msg
                     ):
                         records_found = int(meta.get("records_found", 0))
                         status_flag = str(meta.get("status", "")).upper()
+                        strategy_payload = meta.get("strategy_payload")
 
+                        # 🔁 CIRCUIT BREAKER: Handle MoltSet Beta dropouts / empty data states safely
+                        if status_flag == "PROVIDER_DOWN_RETRY":
+                            send_telegram_broadcast(
+                                f"⚠️ *MOLTSET BETA DROPOUT DETECTED*\n"
+                                f"Nova failed to pull raw data for strategy: `{industry or 'Unknown Niche'}`.\n"
+                                f"Encountered upstream empty states. Entering self-healing hold.\n"
+                                f"🛑 *Queue progression paused.* Retrying this exact strategy in 60 minutes.",
+                                "orchestration",
+                            )
+                            # ⏳ ROLLBACK COOLDOWN: Reset targeting timestamp so it retries in exactly 1 hour
+                            async with conn.cursor() as reset_cur:
+                                await reset_cur.execute(
+                                    """
+                                    UPDATE helix_brain_scheduler 
+                                    SET last_targeted_at = NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL + INTERVAL '1 hour'
+                                    WHERE industry_name = %s;
+                                    """,
+                                    (industry,),
+                                )
+                            await conn.commit()
+                            return  # 🧠 EXIT: Do NOT advance the queue. Safely stall.
+
+                        # 🛑 CIRCUIT BREAKER: Handle complete list exhaustion
+                        if status_flag == "EXHAUSTED" or (
+                            status_flag == "COMPLETED" and records_found == 0
+                        ):
+                            send_telegram_broadcast(
+                                f"🛑 *CAMPAIGN EXHAUSTION GUARD TRIPPED*\n"
+                                f"Nova secured `0` unique clean leads for strategy: `{industry or 'Unknown Niche'}`.\n"
+                                f"Deactivating campaign row in scheduler database to save infrastructure API credits.",
+                                "critical",
+                            )
+                            async with conn.cursor() as disable_cur:
+                                await disable_cur.execute(
+                                    "UPDATE helix_brain_scheduler SET is_active = FALSE WHERE industry_name = %s;",
+                                    (industry,),
+                                )
+                            # 🌟 FIX: Commit changes BEFORE exiting the function!
+                            await conn.commit()
+                            return  # 🧠 EXIT: Terminate execution thread cleanly
+
+                        # 🟢 Standard Queue Progression & Cascading (Runs if status is COMPLETED and records > 0)
                         if status_flag == "COMPLETED" and records_found < int(
                             os.getenv("MOLTSET_HARVEST_LIMIT", 50)
                         ):
@@ -1813,7 +1856,6 @@ async def analyze_and_orchestrate_log(
                                 await load_vendor_isolation_matrix(app.state.db_pool)
                             )
 
-                            # 🧠 FIXED: Reuse 'conn' instead of requesting a new pool asset
                             async with conn.cursor(row_factory=dict_row) as cascade_cur:
                                 await cascade_cur.execute("""
                                     SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
@@ -1830,7 +1872,6 @@ async def analyze_and_orchestrate_log(
                                         "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
                                         (next_strategy["industry_id"],),
                                     )
-                                    # Let the outer conn.commit() clear everything together cleanly
 
                                     asyncio.create_task(
                                         trigger_downstream_mesh_with_payload(
