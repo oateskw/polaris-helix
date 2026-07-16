@@ -1099,7 +1099,7 @@ async def perpetual_awareness_loop():
                         if agent not in completed_today_set
                     ]
 
-                    # ⏳ RETRY BYPASS: If Nova ran today but a campaign is waiting on an hourly self-healing retry, 
+                    # ⏳ RETRY BYPASS: If Nova ran today but a campaign is waiting on an hourly self-healing retry,
                     # force 'nova' back into the pending queue so the loop can pick it up!
                     if "nova" not in pending_agents_for_today:
                         async with app.state.db_pool.connection() as conn:
@@ -1110,7 +1110,7 @@ async def perpetual_awareness_loop():
                                     AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL);
                                 """)
                                 retry_eligible_count = (await retry_cur.fetchone())[0]
-                                
+
                                 if retry_eligible_count > 0:
                                     pending_agents_for_today.append("nova")
 
@@ -1817,36 +1817,40 @@ async def analyze_and_orchestrate_log(
                         status_flag = str(meta.get("status", "")).upper()
                         strategy_payload = meta.get("strategy_payload")
 
-                        # 🔁 CIRCUIT BREAKER: Handle MoltSet Beta dropouts / empty data states safely
+                        # 🔁 CIRCUIT BREAKER 1: Provider Dropouts
                         if status_flag == "PROVIDER_DOWN_RETRY":
                             send_telegram_broadcast(
-                                f"⚠️ *MOLTSET BETA DROPOUT DETECTED*\n"
-                                f"Nova failed to pull raw data for strategy: `{industry or 'Unknown Niche'}`.\n"
-                                f"Encountered upstream empty states. Entering self-healing hold.\n"
-                                f"🛑 *Queue progression paused.* Retrying this exact strategy in 60 minutes.",
+                                f"⚠️ *MOLTSET BETA DROPOUT DETECTED*\nNova failed to pull raw data for strategy: `{industry or 'Unknown Niche'}`. Entering self-healing hold. Retrying in 60 minutes.",
                                 "orchestration",
                             )
-                            # ⏳ ROLLBACK COOLDOWN: Reset targeting timestamp so it retries in exactly 1 hour
                             async with conn.cursor() as reset_cur:
                                 await reset_cur.execute(
-                                    """
-                                    UPDATE helix_brain_scheduler 
-                                    SET last_targeted_at = NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL + INTERVAL '1 hour'
-                                    WHERE industry_name = %s;
-                                    """,
+                                    "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL + INTERVAL '1 hour' WHERE industry_name = %s;",
                                     (industry,),
                                 )
                             await conn.commit()
-                            return  # 🧠 EXIT: Do NOT advance the queue. Safely stall.
+                            return
 
-                        # 🛑 CIRCUIT BREAKER: Handle complete list exhaustion
-                        if status_flag == "EXHAUSTED" or (
+                        # 🛑 CIRCUIT BREAKER 2: Hard API Quota Depletion
+                        elif status_flag == "RATE_LIMITED":
+                            send_telegram_broadcast(
+                                f"🚨 *MOLTSET API QUOTA EXHAUSTED*\nNova hit hard rate limit walls for strategy: `{industry or 'Unknown Niche'}`. Sequential queue frozen until midnight reset.",
+                                "critical",
+                            )
+                            async with conn.cursor() as reset_cur:
+                                await reset_cur.execute(
+                                    "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL WHERE industry_name = %s;",
+                                    (industry,),
+                                )
+                            await conn.commit()
+                            return
+
+                        # 🛑 CIRCUIT BREAKER 3: True Campaign Exhaustion
+                        elif status_flag == "EXHAUSTED" or (
                             status_flag == "COMPLETED" and records_found == 0
                         ):
                             send_telegram_broadcast(
-                                f"🛑 *CAMPAIGN EXHAUSTION GUARD TRIPPED*\n"
-                                f"Nova secured `0` unique clean leads for strategy: `{industry or 'Unknown Niche'}`.\n"
-                                f"Deactivating campaign row in scheduler database to save infrastructure API credits.",
+                                f"🛑 *CAMPAIGN EXHAUSTION GUARD TRIPPED*\nNova secured `0` unique clean leads for strategy: `{industry or 'Unknown Niche'}`. Deactivating campaign row.",
                                 "critical",
                             )
                             async with conn.cursor() as disable_cur:
@@ -1854,16 +1858,13 @@ async def analyze_and_orchestrate_log(
                                     "UPDATE helix_brain_scheduler SET is_active = FALSE WHERE industry_name = %s;",
                                     (industry,),
                                 )
-                            # 🌟 FIX: Commit changes BEFORE exiting the function!
                             await conn.commit()
-                            return  # 🧠 EXIT: Terminate execution thread cleanly
+                            return
 
-                        # 🟢 Standard Queue Progression & Cascading (Runs if status is COMPLETED and records > 0)
-                        if status_flag == "COMPLETED" and records_found < int(
-                            os.getenv("MOLTSET_HARVEST_LIMIT", 50)
-                        ):
+                        # 🟢 PROGRESSION: Successful Data Ingestion Cascade (Handles both partial and maximum yields)
+                        elif status_flag == "COMPLETED" and records_found > 0:
                             send_telegram_broadcast(
-                                f"📉 *PARTIAL NOVA DETECTED*\nLast run only secured `{records_found}` unique clean leads.\nAdvancing queue...",
+                                f"📉 *NOVA BATCH SUCCESSFUL*\nSecured `{records_found}` unique clean leads for strategy: `{industry}`. Advancing queue cascade...",
                                 "orchestration",
                             )
 
