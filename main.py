@@ -995,32 +995,21 @@ async def perpetual_awareness_loop():
                         break
 
             if should_trigger_beacon:
-                # Find out the maximum runs allowed today
-                # Tuesday (1) = 2, Wednesday (2) = 3, Thursday (3) = 2
-                daily_caps = {1: 2, 2: 3, 3: 2}
-                max_runs_allowed = daily_caps.get(current_weekday, 0)
-
                 async with app.state.db_pool.connection() as conn:
                     async with conn.cursor() as cur:
-                        # Count how many times beacon successfully executed TODAY (NY Time)
+                        # Safety check: Only ensure it hasn't run in the last 45 minutes
+                        # (This completely replaces the fragile daily_run_count check!)
                         await cur.execute("""
                             SELECT COUNT(*) FROM agent_system_logs 
                             WHERE agent_name = 'beacon' 
                             AND log_level = 'INFO'
-                            AND timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
-                        """)
-                        daily_run_count = (await cur.fetchone())[0]
-
-                        # Safety check: Also ensure it hasn't run in the last 20 minutes
-                        await cur.execute("""
-                            SELECT COUNT(*) FROM agent_system_logs 
-                            WHERE agent_name = 'beacon' 
-                            AND timestamp >= NOW() - INTERVAL '20 minutes';
+                            AND timestamp >= NOW() - INTERVAL '45 minutes';
                         """)
                         recent_runs = (await cur.fetchone())[0]
 
-                # Only trigger beacon if we are under the daily cap and cleared the 20-min guard
-                if daily_run_count < max_runs_allowed and recent_runs == 0:
+                # Drop the daily_run_count check entirely.
+                # If we are in a valid slot window and it hasn't run in the last 45 mins, run it!
+                if recent_runs == 0:
                     async with app.state.db_pool.connection() as conn:
                         async with conn.cursor(row_factory=dict_row) as cur:
                             # Pull the active strategy
