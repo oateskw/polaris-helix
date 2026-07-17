@@ -12,7 +12,15 @@ from config.settings import MOLTSET_ALLOWED_CATEGORIES
 from database.connection import create_async_db_pool
 from helix_optimizer import reactive_optimizer_loop, run_daily_prompt_optimization
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request, Header, BackgroundTasks
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    Header,
+    BackgroundTasks,
+)
 from pydantic import BaseModel
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -141,6 +149,17 @@ class SchedulerTargetUpdateModel(BaseModel):
 
 
 # --- API ENDPOINTS ---
+@app.get("/", status_code=200)
+@app.head("/", status_code=200)
+async def root_heartbeat(response: Response):
+    """
+    Catches automatic platform uptime pings (GET/HEAD)
+    to keep logs clean and confirm the container is alive.
+    """
+    # Using a minimal payload or empty body keeps responses fast and lightweight
+    return {"status": "healthy", "service": "polaris-helix"}
+
+
 @app.get("/api/v1/health")
 async def health_check():
     return {"status": "healthy", "timestamp": get_new_york_now().isoformat()}
