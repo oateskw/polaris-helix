@@ -73,58 +73,70 @@ async def telegram_webhook_handler(request: Request):
                 LIMIT 10;
             """
 
+            send_telegram_broadcast(
+                "🔍 <i>Diagnostics: Opening connection to NeonDB pool...</i>",
+                "orchestration",
+            )
+
             async with db_pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(query)
                     records = await cur.fetchall()
 
+            send_telegram_broadcast(
+                f"🔍 <i>Diagnostics: Query complete. Found {len(records)} records. Entering streaming loop...</i>",
+                "orchestration",
+            )
+
             if not records:
                 send_telegram_broadcast(
-                    "📆 <b>Today's Logs:</b> No agent system logs recorded yet today.",
+                    "📆 System Alert: No agent system logs found for today.",
                     "orchestration",
                 )
                 return {"status": "processed"}
 
-            # 1. Received your verification ping successfully!
+            # Process each row with an isolated diagnostic shield
+            for idx, rec in enumerate(records):
+                try:
+                    timestamp, agent_name, log_level, message, metadata = rec
+                    time_str = (
+                        timestamp.strftime("%H:%M:%S") if timestamp else "00:00:00"
+                    )
+
+                    # 1. Test string conversion and escaping
+                    safe_agent = html.escape(str(agent_name or "Unknown"))
+                    safe_level = html.escape(str(log_level or "INFO"))
+                    safe_message = html.escape(str(message or ""))
+
+                    single_log_entry = f"🔹 <b>[{time_str}] {safe_agent}</b> (<code>{safe_level}</code>)\n• {safe_message}\n"
+
+                    if metadata:
+                        import json
+
+                        meta_str = json.dumps(metadata)
+                        safe_meta = html.escape(meta_str)
+                        single_log_entry += f"• <i>Meta:</i> <code>{safe_meta}</code>\n"
+
+                    # 2. Attempt the transmission
+                    send_telegram_broadcast(single_log_entry, "orchestration")
+
+                except Exception as row_err:
+                    # If an individual row breaks parsing or serialization, this catches it instantly
+                    send_telegram_broadcast(
+                        f"⚠️ <b>Row {idx} Processing Failure:</b>\n"
+                        f"• Error: <code>{html.escape(str(row_err))}</code>\n"
+                        f"• Raw Agent: <code>{html.escape(str(rec[1]))}</code>",
+                        "orchestration",
+                    )
+
             send_telegram_broadcast(
-                f"⚡ <b>Database Hit:</b> Found {len(records)} recent log entries for today. Compiling feed...",
-                "orchestration",
+                "🏁 <i>Diagnostics: Log loop iteration complete.</i>", "orchestration"
             )
 
-            # 2. Build the feed with absolute HTML sanitization
-            history_text = "📆 <b>Today's Agent Logs (Latest 10):</b>\n\n"
-            for rec in records:
-                timestamp, agent_name, log_level, message, metadata = rec
-                time_str = timestamp.strftime("%H:%M:%S")
-
-                if log_level.upper() in ["ERROR", "CRITICAL"]:
-                    icon = "❌"
-                elif log_level.upper() == "WARNING":
-                    icon = "⚠️"
-                else:
-                    icon = "🔹"
-
-                # Cleanly escape any raw logs containing text like: "Error in <module> & others"
-                safe_agent = html.escape(str(agent_name))
-                safe_level = html.escape(str(log_level))
-                safe_message = html.escape(str(message))
-
-                history_text += f"{icon} <b>[{time_str}] {safe_agent}</b> (<code>{safe_level}</code>)\n"
-                history_text += f"• {safe_message}\n"
-
-                if metadata and isinstance(metadata, dict):
-                    meta_details = ", ".join([f"{k}: {v}" for k, v in metadata.items()])
-                    safe_meta = html.escape(meta_details)
-                    history_text += f"• <i>Meta:</i> <code>{safe_meta}</code>\n"
-
-                history_text += "\n"
-
-            # 3. Fire the sanitized payload
-            send_telegram_broadcast(history_text, "orchestration")
-
         except Exception as err:
+            # Catches global failures (pool timeouts, syntax errors, etc.)
             send_telegram_broadcast(
-                f"❌ <b>History Engine Failure:</b> <code>{str(err)}</code>",
+                f"❌ <b>Global History Engine Failure:</b> <code>{html.escape(str(err))}</code>",
                 "orchestration",
             )
 
