@@ -81,39 +81,42 @@ async def telegram_webhook_handler(request: Request):
 
             if not records:
                 send_telegram_broadcast(
-                    "📆 <b>System Alert:</b> No logs found for today.", "orchestration"
+                    "📆 <b>System Alert:</b> No operational events recorded today.",
+                    "orchestration",
                 )
                 return {"status": "processed"}
 
-            # Optional: Keep a single, clean header if you like
-            send_telegram_broadcast(
-                "📋 <b>System Log Feed (Latest 10):</b>", "orchestration"
-            )
+            summary_lines = ["📋 <b>Polaris-Helix Activity Summary:</b>\n"]
 
             for rec in records:
-                timestamp, agent_name, log_level, message, metadata = rec
-                time_str = timestamp.strftime("%H:%M:%S")
+                timestamp, agent_name, log_level, message = rec
+                time_str = timestamp.strftime("%I:%M %p")  # e.g., "02:50 AM"
 
-                icon = (
-                    "❌"
-                    if log_level.upper() in ["ERROR", "CRITICAL"]
-                    else "⚠️" if log_level.upper() == "WARNING" else "🔹"
+                # Determine simple status text based on log level or message context
+                msg_lower = message.lower()
+                if log_level.upper() in ["ERROR", "CRITICAL"]:
+                    status = "failed ❌"
+                elif "ratelimited" in msg_lower:
+                    status = "rate-limited ⚠️"
+                elif (
+                    "finalized" in msg_lower
+                    or "successful" in msg_lower
+                    or "flush" in msg_lower
+                ):
+                    status = "successful_run ✅"
+                else:
+                    status = "processed status 🔹"
+
+                # Clean up names to match your styling preference
+                display_name = str(agent_name).capitalize()
+
+                summary_lines.append(
+                    f"• <b>{display_name}</b> ran at <code>{time_str}</code> ({status})"
                 )
 
-                safe_agent = html.escape(str(agent_name or "Unknown"))
-                safe_level = html.escape(str(log_level or "INFO"))
-                safe_message = html.escape(str(message or ""))
-
-                single_log_entry = f"{icon} <b>[{time_str}] {safe_agent}</b> (<code>{safe_level}</code>)\n• {safe_message}\n"
-
-                if metadata:
-                    import json
-
-                    meta_str = json.dumps(metadata)
-                    safe_meta = html.escape(meta_str)
-                    single_log_entry += f"• <i>Meta:</i> <code>{safe_meta}</code>\n"
-
-                send_telegram_broadcast(single_log_entry, "orchestration")
+            # Combine all lines into a single message
+            final_summary = "\n".join(summary_lines)
+            send_telegram_broadcast(final_summary, "orchestration")
 
         except Exception as err:
             send_telegram_broadcast(
