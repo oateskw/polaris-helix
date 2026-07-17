@@ -37,12 +37,18 @@ async def telegram_webhook_handler(request: Request):
     # 2. Command Processing Matrix
     if text == "/optimize":
         send_telegram_broadcast(
-            "⏳ *Manual Telegram Trigger:* Initializing Claude 4.5 Sonnet optimization override...",
+            "⏳ *Manual Telegram Trigger:* Initializing Claude prompt optimization override...",
             "orchestration",
         )
         try:
+            # Import your underlying optimization service dynamically
+            from helix_optimizer import run_daily_prompt_optimization
+
             db_pool = request.app.state.db_pool
+
+            # Force the prompt tuning loop to bypass the standard anomaly thresholds
             await run_daily_prompt_optimization(db_pool, force=True)
+
             send_telegram_broadcast(
                 "✅ *Success:* Calibration sweep completed cleanly via Telegram command.",
                 "orchestration",
@@ -54,18 +60,47 @@ async def telegram_webhook_handler(request: Request):
             )
 
     elif text == "/status":
-        send_telegram_broadcast(
-            f"📊 *Polaris-Helix Health Status:*\n"
-            f"• *Environment:* Production (Render)\n"
-            f"• *Database Pool:* Connected & Stable\n"
-            f"• *Optimizer Loop:* Autonomous Background Daemon Active 🟢",
-            "orchestration",
-        )
+        try:
+            app_state = request.app.state
+            db_pool = getattr(app_state, "db_pool", None)
+
+            # 1. Dynamically verify NeonDB Pool status
+            db_status = (
+                "Stable 🟢" if db_pool and not db_pool.closed else "Disconnected ❌"
+            )
+
+            # 2. Verify if the autonomous background tasks are still alive or crashed
+            optimizer_task = getattr(app_state, "optimizer_task", None)
+            if optimizer_task and not optimizer_task.done():
+                optimizer_status = "Autonomous Background Daemon Active 🟢"
+            elif optimizer_task and optimizer_task.done():
+                # Check if it exited with an unhandled exception
+                exc = optimizer_task.exception()
+                optimizer_status = (
+                    f"Crashed ❌ (`{str(exc)[:30]}`)" if exc else "Stopped ⚠️"
+                )
+            else:
+                optimizer_status = "Not Initialized ⚠️"
+
+            # 3. Compile and broadcast
+            status_message = (
+                f"📊 *Polaris-Helix Health Status:*\n"
+                f"• *Environment:* Production (Render)\n"
+                f"• *Database Pool:* {db_status}\n"
+                f"• *Optimizer Loop:* {optimizer_status}"
+            )
+            send_telegram_broadcast(status_message, "orchestration")
+
+        except Exception as err:
+            send_telegram_broadcast(
+                f"❌ *Status Diagnostics Failure:* `{str(err)}`", "orchestration"
+            )
 
     elif text == "/history":
         try:
             db_pool = request.app.state.db_pool
 
+            # Query the absolute latest log entry for each agent today, ordered chronologically
             query = """
                 WITH ranked_logs AS (
                     SELECT 
@@ -75,7 +110,8 @@ async def telegram_webhook_handler(request: Request):
                         message,
                         ROW_NUMBER() OVER (PARTITION BY agent_name ORDER BY timestamp DESC) as rn
                     FROM agent_system_logs
-                    WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date)
+                    WHERE timestamp >= CURRENT_DATE
+                )
                 SELECT timestamp, agent_name, log_level, message
                 FROM ranked_logs
                 WHERE rn = 1
@@ -89,14 +125,12 @@ async def telegram_webhook_handler(request: Request):
 
             if not records:
                 send_telegram_broadcast(
-                    "📆 <b>System Alert:</b> No active agent runs recorded today.",
+                    "📆 *System Alert:* No active agent runs recorded today.",
                     "orchestration",
                 )
                 return {"status": "processed"}
 
-            summary_lines = [
-                "📋 <b>Polaris-Helix Agent Timelines (Latest State):</b>\n"
-            ]
+            summary_lines = ["📋 *Polaris-Helix Agent Timelines (Latest State):*\n"]
 
             for rec in records:
                 timestamp, agent_name, log_level, message = rec
@@ -118,8 +152,9 @@ async def telegram_webhook_handler(request: Request):
 
                 display_name = str(agent_name).capitalize()
 
+                # Formatted with Markdown instead of HTML
                 summary_lines.append(
-                    f"• <b>{display_name}</b> active at <code>{time_str}</code> ({status})"
+                    f"• *{display_name}* active at `{time_str}` ({status})"
                 )
 
             final_summary = "\n".join(summary_lines)
@@ -127,8 +162,7 @@ async def telegram_webhook_handler(request: Request):
 
         except Exception as err:
             send_telegram_broadcast(
-                f"❌ <b>Summary Engine Failure:</b> <code>{html.escape(str(err))}</code>",
-                "orchestration",
+                f"❌ *Summary Engine Failure:* `{str(err)}`", "orchestration"
             )
 
     elif text.startswith("/execute"):
@@ -137,33 +171,30 @@ async def telegram_webhook_handler(request: Request):
             parts = text.split(maxsplit=1)
             target_agent = parts[1].lower().strip() if len(parts) > 1 else None
 
-            # 🆕 Dynamically extract allowed agent names directly from your main.py schema
+            # Dynamically extract allowed agent names directly from your main.py schema
             from main import LogIngestSchema
             from typing import get_args
 
-            # Extract the arguments from the Literal definition inside the schema
             agent_field_type = LogIngestSchema.__annotations__["agent_name"]
-            valid_agents = get_args(
-                agent_field_type
-            )  # Yields ('vanguard', 'beacon', 'echo', ...)
+            valid_agents = get_args(agent_field_type)
 
             # Validate if a single agent was specified
             if target_agent and target_agent not in valid_agents:
                 send_telegram_broadcast(
-                    f"⚠️ <b>Invalid Agent:</b> <code>{html.escape(target_agent)}</code> is not part of the ecosystem.",
+                    f"⚠️ *Invalid Agent:* `{target_agent}` is not part of the ecosystem.",
                     "orchestration",
                 )
                 return {"status": "processed"}
 
-            # 1. Feedback
+            # 1. Feedback via Markdown
             if target_agent:
                 send_telegram_broadcast(
-                    f"🔌 <b>Targeted Override:</b> Isolating mesh to execute <b>{target_agent.capitalize()}</b> only...",
+                    f"🔌 *Targeted Override:* Isolating mesh to execute *{target_agent.capitalize()}* only...",
                     "orchestration",
                 )
             else:
                 send_telegram_broadcast(
-                    "🔌 <b>Master Override:</b> Initiating synchronized ecosystem cycle...",
+                    "🔌 *Master Override:* Initiating synchronized ecosystem cycle...",
                     "orchestration",
                 )
 
@@ -191,7 +222,7 @@ async def telegram_webhook_handler(request: Request):
 
             if not strategy:
                 send_telegram_broadcast(
-                    "⚠️ <b>Execution Halted:</b> No active targets configured in the scheduler table.",
+                    "⚠️ *Execution Halted:* No active targets configured in the scheduler table.",
                     "orchestration",
                 )
                 return {"status": "processed"}
@@ -202,7 +233,7 @@ async def telegram_webhook_handler(request: Request):
 
             vendor_matrix = await load_vendor_isolation_matrix(db_pool)
 
-            # If target_agent is specified, wrap it in a list; otherwise, dispatch the default master stack
+            # Set specific agent payload or default master stack
             agents_to_run = (
                 [target_agent]
                 if target_agent
@@ -225,17 +256,21 @@ async def telegram_webhook_handler(request: Request):
 
             await bg_tasks()
 
+            # Clean up array representation for clean markdown printing
+            agents_string = ", ".join(agents_to_run)
+            target_region_str = strategy["target_region"] or "Global"
+
             send_telegram_broadcast(
-                f"🚀 <b>Mesh Sequence Deployed!</b>\n"
-                f"• Target Niche: <code>{html.escape(strategy['industry_name'])}</code>\n"
-                f"• Dispatched Payload: <code>{agents_to_run}</code>",
+                f"🚀 *Mesh Sequence Deployed!*\n"
+                f"• Target Niche: `{strategy['industry_name']}`\n"
+                f"• Target Region: `{target_region_str}`\n"
+                f"• Dispatched Payload: `[{agents_string}]`",
                 "orchestration",
             )
 
         except Exception as err:
             send_telegram_broadcast(
-                f"❌ <b>Execution Trigger Failed:</b> <code>{html.escape(str(err))}</code>",
-                "orchestration",
+                f"❌ *Execution Trigger Failed:* `{str(err)}`", "orchestration"
             )
 
     return {"status": "processed"}
