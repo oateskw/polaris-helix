@@ -179,7 +179,7 @@ async def trigger_downstream_mesh_with_payload(
             nova_payload = {
                 "target_region": strategy["target_region"],
                 "daily_quota_limit": 500,
-                "target_company_limit": 5,
+                "target_company_limit": 35,
                 "industries": [
                     {
                         "industry_id": strategy["industry_id"],
