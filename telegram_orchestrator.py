@@ -1,4 +1,5 @@
 import os
+import asyncio
 import html
 from fastapi import APIRouter, Request, HTTPException
 from helix_optimizer import run_daily_prompt_optimization
@@ -78,10 +79,24 @@ async def telegram_webhook_handler(request: Request):
                 "orchestration",
             )
 
-            async with db_pool.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(query)
-                    records = await cur.fetchall()
+            try:
+                async with asyncio.timeout(5.0):
+                    async with db_pool.connection() as conn:
+                        async with conn.cursor() as cur:
+                            await cur.execute(query)
+                            records = await cur.fetchall()
+            except TimeoutError:
+                send_telegram_broadcast(
+                    "❌ <b>Database Timeout:</b> Connection to NeonDB pool timed out after 5 seconds.",
+                    "orchestration",
+                )
+                return {"status": "processed"}
+            except Exception as db_err:
+                send_telegram_broadcast(
+                    f"❌ <b>Database Driver Error:</b> <code>{html.escape(str(db_err))}</code>",
+                    "orchestration",
+                )
+                return {"status": "processed"}
 
             send_telegram_broadcast(
                 f"🔍 <i>Diagnostics: Query complete. Found {len(records)} records. Entering streaming loop...</i>",
