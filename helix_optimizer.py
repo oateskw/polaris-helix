@@ -5,24 +5,44 @@ import re
 from anthropic import AsyncAnthropic
 
 
-async def run_daily_prompt_optimization(db_pool):
+async def check_anomaly_threshold(db_pool, threshold=5) -> bool:
     """
-    Pre-flight job to fetch the latest agent prompts, analyze error/warning logs,
-    and dynamically update prompt-specific keys using Claude 3.5.[cite: 6]
+    Checks if the error/warning log count over the last 3 hours crosses our threshold.
+    """
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                SELECT COUNT(*) FROM agent_system_logs 
+                WHERE timestamp >= NOW() - INTERVAL '3 hours'
+                AND log_level IN ('WARNING', 'ERROR');
+            """)
+            row = await cur.fetchone()
+            count = row[0] if row else 0
+            return count >= threshold
+
+
+async def run_daily_prompt_optimization(db_pool, force=False):
+    """
+    Intelligent prompt-tuning engine driven by Claude 3.5.
     """
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
     if not anthropic_key:
-        print(
-            "⚠️ [OPTIMIZER] ANTHROPIC_API_KEY missing. Skipping dynamic optimization."
-        )
+        print("⚠️ [OPTIMIZER] ANTHROPIC_API_KEY missing. Skipping.")
         return
+
+    # Smart Check: If not forced, only optimize if we actually have issues to fix
+    if not force:
+        has_anomalies = await check_anomaly_threshold(db_pool)
+        if not has_anomalies:
+            print(
+                "⏭️ [OPTIMIZER] System logs are clean. Skipping optimization to save tokens."
+            )
+            return
 
     ai_client = AsyncAnthropic(api_key=anthropic_key)
 
-    # 1. Fetch current prompts from the database[cite: 6]
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
-            # Safely verify the table exists with the unique multi-key constraint[cite: 6]
             await cur.execute("""
                 CREATE TABLE IF NOT EXISTS helix_agent_prompts (
                     id SERIAL PRIMARY KEY,
@@ -35,19 +55,14 @@ async def run_daily_prompt_optimization(db_pool):
             """)
             await conn.commit()
 
-            # Fix: Retrieve the prompt_key so we don't overwrite dictionaries![cite: 6]
             await cur.execute(
                 "SELECT agent_name, prompt_key, system_prompt FROM helix_agent_prompts;"
             )
             raw_prompts = await cur.fetchall()
 
             if not raw_prompts:
-                print(
-                    "⚠️ [OPTIMIZER] No prompts found in 'helix_agent_prompts'. Nothing to optimize."
-                )
                 return
 
-            # 2. Fetch warnings or errors from the logs table to guide optimization[cite: 6]
             await cur.execute("""
                 SELECT agent_name, log_level, message, metadata 
                 FROM agent_system_logs 
@@ -56,41 +71,27 @@ async def run_daily_prompt_optimization(db_pool):
             """)
             logs = await cur.fetchall()
 
-    # Format logs for Claude to ingest as context[cite: 6]
-    log_context = ""
-    for log in logs:
-        log_context += f"[{log[0]} - {log[1]}]: {log[2]} (Meta: {json.dumps(log[3])})\n"
+    log_context = "".join(
+        f"[{log[0]} - {log[1]}]: {log[2]} (Meta: {json.dumps(log[3])})\n"
+        for log in logs
+    )
 
-    # Fix: Loop over isolated keys instead of losing them[cite: 6]
     for agent_name, prompt_key, current_prompt in raw_prompts:
-        print(
-            f"🧠 [OPTIMIZER] Analyzing system rules for '{agent_name}' ({prompt_key})..."
-        )
-
         try:
             response = await ai_client.messages.create(
                 model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
                 max_tokens=2000,
-                temperature=0.1,  # Low temp for structured, logical modifications[cite: 6]
+                temperature=0.1,
                 system=(
                     "You are an expert AI Meta-Orchestrator. Your role is to carefully analyze "
                     "agent system prompts and improve them based on execution feedback. "
-                    "Look for any negative tone issues, formatting failures (like unwanted hyphens or em-dashes), "
-                    "or off-topic hallucinations mentioned in error/warning logs. Gently refine the prompt to patch those holes. "
-                    "Output ONLY the revised prompt wrapped in `<prompt>...</prompt>` tags. Do not "
-                    "include any other chat or introductory explanation."
+                    "Look for any negative tone issues, formatting failures, or off-topic hallucinations. "
+                    "Output ONLY the revised prompt wrapped in `<prompt>...</prompt>` tags."
                 ),
                 messages=[
                     {
                         "role": "user",
-                        "content": (
-                            f"Current Prompt for agent '{agent_name}' (Task/Key: {prompt_key}):\n"
-                            f'"""\n{current_prompt}\n"""\n\n'
-                            f"System Execution Logs from the past 24 hours:\n"
-                            f"\"\"\"\n{log_context if log_context else 'No execution errors reported.'}\n\"\"\"\n\n"
-                            f"Rewrite and improve the prompt to prevent failures, refine professional tone, "
-                            f"and solidify output safety. Deliver only the finalized prompt inside `<prompt>` tags."
-                        ),
+                        "content": f"Current Prompt:\n{current_prompt}\n\nLogs:\n{log_context or 'No execution errors.'}\n\nRewrite inside `<prompt>` tags.",
                     }
                 ],
             )
@@ -103,7 +104,6 @@ async def run_daily_prompt_optimization(db_pool):
                         new_prompt = match.group(1).strip()
 
             if new_prompt and new_prompt != current_prompt:
-                # Fix: Target the UPDATE using both agent_name AND prompt_key![cite: 6]
                 async with db_pool.connection() as conn:
                     async with conn.cursor() as cur:
                         await cur.execute(
@@ -118,12 +118,16 @@ async def run_daily_prompt_optimization(db_pool):
                 print(
                     f"✅ [OPTIMIZER] Successfully optimized '{agent_name}' ({prompt_key})."
                 )
-            else:
-                print(
-                    f"⏭️ [OPTIMIZER] No modification needed for '{agent_name}' ({prompt_key}). Prompt is optimal."
-                )
-
         except Exception as e:
-            print(
-                f"❌ [OPTIMIZER] Exception occurred while optimizing '{agent_name}' ({prompt_key}): {e}"
-            )
+            print(f"❌ [OPTIMIZER] Exception: {e}")
+
+
+async def reactive_optimizer_loop(db_pool):
+    """Continuous background loop monitoring system metrics natively."""
+    print("🧠 [INTELLIGENT OPTIMIZER] Event-driven loop initialized.")
+    while True:
+        try:
+            await run_daily_prompt_optimization(db_pool, force=False)
+        except Exception as e:
+            print(f"⚠️ [INTELLIGENT OPTIMIZER] Loop iteration error: {e}")
+        await asyncio.sleep(3600)  # Check every hour

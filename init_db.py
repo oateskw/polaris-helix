@@ -1,119 +1,64 @@
-"""
-init_db.py — One-shot provisioning script that creates the agent_system_logs
-table on our Neon Postgres cloud instance if it does not already exist.
-
-Run once before starting the API:
-    python init_db.py
-"""
-
 import os
 import sys
 import traceback
-
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 from dotenv import load_dotenv
 import psycopg
+
+from database.schemas import PROVISION_SQL, SEED_SQL
 
 load_dotenv()
 
 
 def get_validated_database_url() -> str:
-    """Return a validated, SSL-enforced DATABASE_URL or raise descriptively."""
+    """Validates and enforces strict SSL connection parameters for cloud Neon Postgres instances."""
     url = os.getenv("DATABASE_URL", "")
     if not url or not url.startswith("postgresql://"):
         raise ValueError(
             "Missing or invalid cloud DATABASE_URL. Please set your Neon Postgres "
             "connection string in your environment or .env file."
         )
-    if "?sslmode=require" not in url:
-        url = url + "?sslmode=require"
+
+    parsed = urlparse(url)
+    query_map = dict(parse_qsl(parsed.query, keep_blank_values=True))
+
+    if query_map.get("sslmode") != "require":
+        query_map["sslmode"] = "require"
+        url = urlunparse(parsed._replace(query=urlencode(query_map)))
+
     return url
 
 
-PROVISION_SQL = """
-CREATE TABLE IF NOT EXISTS agent_system_logs (
-    id          BIGSERIAL    PRIMARY KEY,
-    agent_name  TEXT         NOT NULL CHECK (agent_name IN ('vanguard', 'beacon')),
-    log_level   TEXT         NOT NULL DEFAULT 'INFO'
-                             CHECK (log_level IN ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')),
-    message     TEXT         NOT NULL,
-    metadata    JSONB,
-    timestamp   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_asl_agent_name  ON agent_system_logs (agent_name);
-CREATE INDEX IF NOT EXISTS idx_asl_timestamp   ON agent_system_logs (timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_asl_log_level   ON agent_system_logs (log_level);
-
-CREATE TABLE IF NOT EXISTS inbound_blueprints (
-    id                     BIGSERIAL    PRIMARY KEY,
-    headcount              INTEGER      NOT NULL,
-    weekly_hours_wasted    INTEGER      NOT NULL,
-    annual_wasted_hours    INTEGER      NOT NULL,
-    annual_financial_bleed DOUBLE PRECISION NOT NULL,
-    friction_points        JSONB        NOT NULL,
-    name                   TEXT         NOT NULL,
-    company_name           TEXT         NOT NULL,
-    email                  TEXT         NOT NULL,
-    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_email ON inbound_blueprints (email);
-CREATE INDEX IF NOT EXISTS idx_inbound_blueprints_created_at ON inbound_blueprints (created_at DESC);
-
-CREATE TABLE IF NOT EXISTS helix_brain_scheduler (
-    industry_id SERIAL PRIMARY KEY,
-    industry_name VARCHAR(100) UNIQUE NOT NULL,
-    bottleneck_profile TEXT NOT NULL,
-    pain_tokens TEXT[] NOT NULL,
-    target_region VARCHAR(100) DEFAULT 'Texas',
-    is_active BOOLEAN DEFAULT TRUE,
-    last_targeted_at TIMESTAMP DEFAULT NULL,
-    priority_score INT DEFAULT 1
-);
-
-CREATE INDEX IF NOT EXISTS idx_hbs_last_targeted ON helix_brain_scheduler (last_targeted_at);
-
-CREATE TABLE IF NOT EXISTS helix_infrastructure_oracle_ledger (
-    vendor_name VARCHAR(50) PRIMARY KEY,
-    credits_remaining NUMERIC(10, 2) NOT NULL DEFAULT 100.00,
-    credit_unit VARCHAR(20) NOT NULL DEFAULT 'USD',
-    is_circuit_broken BOOLEAN DEFAULT FALSE,
-    last_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-INSERT INTO helix_infrastructure_oracle_ledger
-    (vendor_name, credits_remaining, credit_unit, is_circuit_broken)
-VALUES
-    ('MyEmailVerifier', 100.00, 'Tokens', FALSE),
-    ('PhantomBusters', 1200.00, 'Minutes', FALSE),
-    ('MoltSet', 200.00, 'Tokens', FALSE)
-ON CONFLICT (vendor_name) DO NOTHING;
-"""
-
-
-def main() -> None:
+def run_provisioning():
     try:
         database_url = get_validated_database_url()
     except ValueError as exc:
-        print(f"\n[init_db] CONFIG ERROR: {exc}\n")
+        print(f"\n❌ [init_db] CONFIGURATION ERROR: {exc}\n")
         sys.exit(1)
 
-    print("[init_db] Connecting to Neon Postgres (SSL required)…")
+    print("📡 Connecting to Neon Cloud Postgres instance (SSL Enforced)...")
     try:
         with psycopg.connect(database_url) as conn:
             with conn.cursor() as cur:
+                print("🛠️  Provisioning relational layout matrices...")
                 cur.execute(PROVISION_SQL)
+
+                print(
+                    "🌱 Seeding critical operational infrastructure ledger defaults..."
+                )
+                cur.execute(SEED_SQL)
+
             conn.commit()
-        print("[init_db] Schema provisioned on Neon: table + indexes are ready.")
+        print("✅ [init_db] Success! Schema provisioned and seed rows verified.")
+
     except (psycopg.OperationalError, OSError) as exc:
         print(
-            "\n[init_db] CLOUD CONNECTION FAILED — possible causes: wrong credentials, "
-            "DNS resolution failure, or network timeout. Full trace:\n"
+            "\n💥 [init_db] CLOUD CONNECTION FAILED\n"
+            "Verify network boundaries, Render/Neon secrets, or connection strings.\n"
         )
         traceback.print_exc()
-        print(f"\n[init_db] Error detail: {exc}\n")
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    run_provisioning()
