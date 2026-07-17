@@ -61,7 +61,7 @@ async def perpetual_awareness_loop(app_instance):
             current_date_str = est_now.strftime("%Y-%m-%d")
 
             # =====================================================================
-            # 🌟 1. TRIGGER BEACON & DEPENDENT NEXUS OUT-OF-BAND
+            # 🌟 1. TRIGGER BEACON & DEPENDENT NEXUS OUT-OF-BAND (STRICT VANGUARD GATE)
             # =====================================================================
             should_trigger_beacon = False
             if current_weekday in PUBLER_BEACON_SCHEDULE:
@@ -79,17 +79,25 @@ async def perpetual_awareness_loop(app_instance):
                         break
 
             if should_trigger_beacon:
+                # 🛡️ 1a. Pull precise execution histories for today from the central ledger
                 async with db_pool.connection() as conn:
                     async with conn.cursor() as cur:
+                        # Count how many times each agent completed a run successfully today
                         await cur.execute("""
-                            SELECT COUNT(*) FROM agent_system_logs 
-                            WHERE agent_name = 'beacon' 
-                            AND log_level = 'INFO'
-                            AND timestamp >= NOW() - INTERVAL '45 minutes';
+                            SELECT 
+                                COUNT(CASE WHEN agent_name = 'nexus' AND message LIKE '%%SUCCESS%%' THEN 1 END) as nexus_runs,
+                                COUNT(CASE WHEN agent_name = 'beacon' AND (message LIKE '%%completed%%' OR execution_status = 'SUCCESS') THEN 1 END) as beacon_runs,
+                                COUNT(CASE WHEN agent_name = 'beacon' AND timestamp >= NOW() - INTERVAL '45 minutes' THEN 1 END) as recent_safety_lock
+                            FROM agent_system_logs 
+                            WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
                         """)
-                        recent_runs = (await cur.fetchone())[0]
+                        row = await cur.fetchone()
+                        nexus_runs = row[0] if row else 0
+                        beacon_runs = row[1] if row else 0
+                        recent_safety_lock = row[2] if row else 0
 
-                if recent_runs == 0:
+                # Prevent loop re-entry double-firing within the 15-minute time window
+                if recent_safety_lock == 0:
                     async with db_pool.connection() as conn:
                         async with conn.cursor(row_factory=dict_row) as cur:
                             await cur.execute("""
@@ -101,23 +109,50 @@ async def perpetual_awareness_loop(app_instance):
                             active_strategy = await cur.fetchone()
 
                     if active_strategy:
-                        send_telegram_broadcast(
-                            f"📡 [PROACTIVE SEQUENCE] Deploying dependencies out-of-band for strategy: *{active_strategy['industry_name']}*.\n"
-                            f"Running `nexus` structural mapping first, then invoking `beacon`.",
-                            "orchestration",
-                        )
                         vendor_isolation_matrix = await load_vendor_isolation_matrix(
                             db_pool
                         )
 
-                        # Fix the gap proactively right here
-                        await trigger_downstream_mesh_with_payload(
-                            db_pool,
-                            app_instance.state,
-                            active_strategy,
-                            ["nexus", "beacon"],
-                            vendor_isolation_matrix,
-                        )
+                        # CASE A: First run of the day, or Beacon is attempting a multiple run sequence
+                        # where Nexus hasn't paved the next step yet (nexus_runs <= beacon_runs).
+                        if nexus_runs == 0 or (
+                            beacon_runs >= 1 and nexus_runs <= beacon_runs
+                        ):
+                            send_telegram_broadcast(
+                                f"🛡️ [NEXUS VANGUARD GATE] Intercepting Out-of-Band Beacon sequence.\n"
+                                f"Firing Nexus (Run #{nexus_runs + 1}) first to pave the path for strategy: *{active_strategy['industry_name']}*.",
+                                "orchestration",
+                            )
+
+                            # Fire ONLY Nexus first and explicitly await its network execution hand-off
+                            await trigger_downstream_mesh_with_payload(
+                                db_pool,
+                                app_instance.state,
+                                active_strategy,
+                                ["nexus"],
+                                vendor_isolation_matrix,
+                            )
+
+                            # 🌟 ADD THESE TWO LINES TO FIX THE BUG:
+                            await asyncio.sleep(60)
+                            continue
+
+                        # CASE B: Nexus has successfully run and cleared a path, leaving it 1 step ahead of Beacon.
+                        else:
+                            send_telegram_broadcast(
+                                f"🟢 [NEXUS VANGUARD GATE] Nexus verification confirmed one step ahead (Nexus: {nexus_runs}, Beacon: {beacon_runs}).\n"
+                                f"Deploying `beacon` content generation engine for strategy: *{active_strategy['industry_name']}*.",
+                                "orchestration",
+                            )
+
+                            # Fire Beacon safely knowing the exact database records and directives are fresh
+                            await trigger_downstream_mesh_with_payload(
+                                db_pool,
+                                app_instance.state,
+                                active_strategy,
+                                ["beacon"],
+                                vendor_isolation_matrix,
+                            )
 
             # =====================================================================
             # 🧠 2. DAILY PROMPT OPTIMIZATION TRIGGER
