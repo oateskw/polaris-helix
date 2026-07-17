@@ -1340,7 +1340,7 @@ async def trigger_downstream_mesh_with_payload(
                 "Nexus execution impulse successfully deployed down-mesh.", "verbose"
             )
 
-    # 2. NOVA
+    # 2. NOVA (Production Ignite Mesh Alignment)
     if "nova" in agent_list:
         if isolation_matrix.get(VENDOR_MOLTSET, False):
             send_telegram_broadcast(
@@ -1361,24 +1361,33 @@ async def trigger_downstream_mesh_with_payload(
                 target_niche=strategy["industry_name"],
             )
 
-            asyncio.create_task(
-                async_http_post_proxy(
-                    f"{url}/api/v1/nova/execute",
-                    {
-                        "X-Nova-Auth-Token": master_token,
-                        "Content-Type": "application/json",
-                    },
+            # 🚀 Construct the exact payload expected by NovaTriggerSchema
+            nova_payload = {
+                "target_region": strategy["target_region"],
+                "daily_quota_limit": 500,
+                "target_company_limit": 5,  # Defaults to 5 (or dynamically assign)
+                "industries": [
                     {
                         "industry_id": strategy["industry_id"],
                         "industry_name": strategy["industry_name"],
                         "moltset_category": strategy["moltset_category"],
-                        "target_region": strategy["target_region"],
                         "bottleneck_profile": strategy["bottleneck_profile"],
+                    }
+                ],
+            }
+
+            asyncio.create_task(
+                async_http_post_proxy(
+                    f"{url}/api/v1/nova/ignite",
+                    {
+                        "Authorization": f"Bearer {master_token}",  # FastAPI HTTPBearer compatibility
+                        "Content-Type": "application/json",
                     },
+                    nova_payload,
                 )
             )
             send_telegram_broadcast(
-                "Nova proxy sync call successfully routed to mesh edge node.",
+                "Nova orchestration bundle successfully ignited on mesh edge node.",
                 "verbose",
             )
 
