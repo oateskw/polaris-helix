@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from anthropic import Anthropic
+from telegram_orchestrator import router as telegram_router
 
 # Submodule Imports
 from services.telemetry import (
@@ -37,6 +38,7 @@ from core.engine import perpetual_awareness_loop, load_vendor_isolation_matrix
 load_dotenv()
 
 app = FastAPI(title="Helix Strategic Orchestration Core API")
+app.include_router(telegram_router)
 
 
 # Modify the lifespan context manager
