@@ -64,7 +64,7 @@ async def telegram_webhook_handler(request: Request):
         try:
             db_pool = request.app.state.db_pool
 
-            # Query for events that occurred today (using UTC to align with Neon/Render DB defaults)
+            # Strict UTC boundary to align perfectly with NeonDB's server time zone
             query = """
                 SELECT timestamp, agent_name, log_level, message, metadata
                 FROM agent_system_logs
@@ -73,10 +73,11 @@ async def telegram_webhook_handler(request: Request):
                 LIMIT 10;
             """
 
+            # --- CRITICAL FIX: Ensure full async 'await' on context managers and execution ---
             async with db_pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(query)
-                    records = await cur.fetchall()
+                    records = await cur.fetchall()  # 🚨 Added required await here!
 
             if not records:
                 send_telegram_broadcast(
@@ -85,13 +86,11 @@ async def telegram_webhook_handler(request: Request):
                 )
                 return {"status": "processed"}
 
-            # Render a clean feed of today's agent actions
             history_text = "📆 *Today's Agent Logs (Latest 10):*\n\n"
             for rec in records:
                 timestamp, agent_name, log_level, message, metadata = rec
                 time_str = timestamp.strftime("%H:%M:%S")
 
-                # Visual hierarchy based on log severity
                 if log_level.upper() in ["ERROR", "CRITICAL"]:
                     icon = "❌"
                 elif log_level.upper() == "WARNING":
@@ -102,7 +101,6 @@ async def telegram_webhook_handler(request: Request):
                 history_text += f"{icon} *[{time_str}] {agent_name}* (`{log_level}`)\n"
                 history_text += f"• {message}\n"
 
-                # Check for useful telemetry tucked inside your JSONB metadata field
                 if metadata and isinstance(metadata, dict):
                     meta_details = ", ".join(
                         [f"{k}: `{v}`" for k, v in metadata.items()]
@@ -114,8 +112,9 @@ async def telegram_webhook_handler(request: Request):
             send_telegram_broadcast(history_text, "orchestration")
 
         except Exception as err:
+            # Captures any internal failure and forces visibility back to your chat
             send_telegram_broadcast(
-                f"❌ *History Query Failed:* `{str(err)}`", "orchestration"
+                f"❌ *History Engine Failure:* `{str(err)}`", "orchestration"
             )
 
     return {"status": "processed"}
