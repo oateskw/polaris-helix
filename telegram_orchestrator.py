@@ -64,12 +64,13 @@ async def telegram_webhook_handler(request: Request):
         try:
             db_pool = request.app.state.db_pool
 
-            # Fetch actions executed today (UTC time zone aligned with NeonDB/Render)
+            # Query for events that occurred today (using UTC to align with Neon/Render DB defaults)
             query = """
-                SELECT created_at, action_type, status, details 
-                FROM optimization_logs 
-                WHERE created_at >= CURRENT_DATE 
-                ORDER BY created_at DESC;
+                SELECT timestamp, agent_name, log_level, message, metadata
+                FROM agent_system_logs
+                WHERE timestamp >= CURRENT_DATE
+                ORDER BY timestamp DESC
+                LIMIT 10;
             """
 
             async with db_pool.connection() as conn:
@@ -79,18 +80,36 @@ async def telegram_webhook_handler(request: Request):
 
             if not records:
                 send_telegram_broadcast(
-                    "📆 *Today's Execution Log:* No automated or manual runs recorded yet today.",
+                    "📆 *Today's Logs:* No agent system logs recorded yet today.",
                     "orchestration",
                 )
                 return {"status": "processed"}
 
-            # Format the output beautifully for Telegram
-            history_text = "📆 *Today's Execution History:*\n\n"
+            # Render a clean feed of today's agent actions
+            history_text = "📆 *Today's Agent Logs (Latest 10):*\n\n"
             for rec in records:
-                # Format timestamps to look clean (e.g., 14:32:10)
-                timestamp = rec[0].strftime("%H:%M:%S")
-                icon = "✅" if rec[2].lower() == "success" else "❌"
-                history_text += f"{icon} *[{timestamp}] {rec[1]}*\n• Status: `{rec[2]}`\n• Detail: {rec[3]}\n\n"
+                timestamp, agent_name, log_level, message, metadata = rec
+                time_str = timestamp.strftime("%H:%M:%S")
+
+                # Visual hierarchy based on log severity
+                if log_level.upper() in ["ERROR", "CRITICAL"]:
+                    icon = "❌"
+                elif log_level.upper() == "WARNING":
+                    icon = "⚠️"
+                else:
+                    icon = "🔹"
+
+                history_text += f"{icon} *[{time_str}] {agent_name}* (`{log_level}`)\n"
+                history_text += f"• {message}\n"
+
+                # Check for useful telemetry tucked inside your JSONB metadata field
+                if metadata and isinstance(metadata, dict):
+                    meta_details = ", ".join(
+                        [f"{k}: `{v}`" for k, v in metadata.items()]
+                    )
+                    history_text += f"• _Meta:_ {meta_details}\n"
+
+                history_text += "\n"
 
             send_telegram_broadcast(history_text, "orchestration")
 
