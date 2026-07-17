@@ -67,11 +67,19 @@ async def telegram_webhook_handler(request: Request):
             db_pool = request.app.state.db_pool
 
             query = """
-                SELECT timestamp, agent_name, log_level, message, metadata
-                FROM agent_system_logs
-                WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date
-                ORDER BY timestamp DESC
-                LIMIT 10;
+                WITH ranked_logs AS (
+                    SELECT 
+                        timestamp, 
+                        agent_name, 
+                        log_level, 
+                        message,
+                        ROW_NUMBER() OVER (PARTITION BY agent_name ORDER BY timestamp DESC) as rn
+                    FROM agent_system_logs
+                    WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date)
+                SELECT timestamp, agent_name, log_level, message
+                FROM ranked_logs
+                WHERE rn = 1
+                ORDER BY timestamp ASC;
             """
 
             async with db_pool.connection() as conn:
@@ -81,18 +89,19 @@ async def telegram_webhook_handler(request: Request):
 
             if not records:
                 send_telegram_broadcast(
-                    "📆 <b>System Alert:</b> No operational events recorded today.",
+                    "📆 <b>System Alert:</b> No active agent runs recorded today.",
                     "orchestration",
                 )
                 return {"status": "processed"}
 
-            summary_lines = ["📋 <b>Polaris-Helix Activity Summary:</b>\n"]
+            summary_lines = [
+                "📋 <b>Polaris-Helix Agent Timelines (Latest State):</b>\n"
+            ]
 
             for rec in records:
                 timestamp, agent_name, log_level, message = rec
-                time_str = timestamp.strftime("%I:%M %p")  # e.g., "02:50 AM"
+                time_str = timestamp.strftime("%I:%M %p")
 
-                # Determine simple status text based on log level or message context
                 msg_lower = message.lower()
                 if log_level.upper() in ["ERROR", "CRITICAL"]:
                     status = "failed ❌"
@@ -103,24 +112,22 @@ async def telegram_webhook_handler(request: Request):
                     or "successful" in msg_lower
                     or "flush" in msg_lower
                 ):
-                    status = "successful_run ✅"
+                    status = "completed run ✅"
                 else:
-                    status = "processed status 🔹"
+                    status = "active 🔹"
 
-                # Clean up names to match your styling preference
                 display_name = str(agent_name).capitalize()
 
                 summary_lines.append(
-                    f"• <b>{display_name}</b> ran at <code>{time_str}</code> ({status})"
+                    f"• <b>{display_name}</b> active at <code>{time_str}</code> ({status})"
                 )
 
-            # Combine all lines into a single message
             final_summary = "\n".join(summary_lines)
             send_telegram_broadcast(final_summary, "orchestration")
 
         except Exception as err:
             send_telegram_broadcast(
-                f"❌ <b>History Engine Failure:</b> <code>{html.escape(str(err))}</code>",
+                f"❌ <b>Summary Engine Failure:</b> <code>{html.escape(str(err))}</code>",
                 "orchestration",
             )
 
