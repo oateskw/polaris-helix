@@ -2061,14 +2061,34 @@ async def analyze_and_orchestrate_log(
                                 url = os.getenv(
                                     "NOVA_API_URL", "https://polaris-nova.onrender.com"
                                 ).rstrip("/")
+
+                                # 🚀 Structuring rescue escalation tasks to match the target schema
+                                rescue_payload = {
+                                    "target_region": strategy["target_region"],
+                                    "daily_quota_limit": 150,
+                                    "target_company_limit": 5,
+                                    "industries": [
+                                        {
+                                            "industry_id": strategy["industry_id"],
+                                            "industry_name": strategy["industry_name"],
+                                            "moltset_category": strategy[
+                                                "moltset_category"
+                                            ],
+                                            "bottleneck_profile": strategy[
+                                                "bottleneck_profile"
+                                            ],
+                                        }
+                                    ],
+                                }
+
                                 asyncio.create_task(
                                     async_http_post_proxy(
-                                        f"{url}/api/v1/nova/execute",
+                                        f"{url}/api/v1/nova/ignite",
                                         {
-                                            "x_nova_auth_token": master_token,
+                                            "Authorization": f"Bearer {master_token}",
                                             "Content-Type": "application/json",
                                         },
-                                        {**strategy, "rescue_mode": True},
+                                        rescue_payload,
                                     )
                                 )
 
