@@ -1,4 +1,5 @@
 import os
+import html
 from fastapi import APIRouter, Request, HTTPException
 from helix_optimizer import run_daily_prompt_optimization
 from services.telemetry import send_telegram_broadcast
@@ -84,13 +85,13 @@ async def telegram_webhook_handler(request: Request):
                 )
                 return {"status": "processed"}
 
-            # 🆕 Added immediate verification ping right after passing the check:
+            # 1. Received your verification ping successfully!
             send_telegram_broadcast(
                 f"⚡ <b>Database Hit:</b> Found {len(records)} recent log entries for today. Compiling feed...",
                 "orchestration",
             )
 
-            # Switch fully to HTML tags to prevent markdown parsing crashes on raw strings
+            # 2. Build the feed with absolute HTML sanitization
             history_text = "📆 <b>Today's Agent Logs (Latest 10):</b>\n\n"
             for rec in records:
                 timestamp, agent_name, log_level, message, metadata = rec
@@ -103,20 +104,22 @@ async def telegram_webhook_handler(request: Request):
                 else:
                     icon = "🔹"
 
-                history_text += f"{icon} <b>[{time_str}] {agent_name}</b> (<code>{log_level}</code>)\n"
-                # Strip out any potential HTML brackets in raw messages to be safe
-                safe_message = str(message).replace("<", "&lt;").replace(">", "&gt;")
+                # Cleanly escape any raw logs containing text like: "Error in <module> & others"
+                safe_agent = html.escape(str(agent_name))
+                safe_level = html.escape(str(log_level))
+                safe_message = html.escape(str(message))
+
+                history_text += f"{icon} <b>[{time_str}] {safe_agent}</b> (<code>{safe_level}</code>)\n"
                 history_text += f"• {safe_message}\n"
 
                 if metadata and isinstance(metadata, dict):
                     meta_details = ", ".join([f"{k}: {v}" for k, v in metadata.items()])
-                    safe_meta = meta_details.replace("<", "&lt;").replace(">", "&gt;")
+                    safe_meta = html.escape(meta_details)
                     history_text += f"• <i>Meta:</i> <code>{safe_meta}</code>\n"
 
                 history_text += "\n"
 
-            # If your send_telegram_broadcast default format is Markdown,
-            # make sure it passes parse_mode="HTML" to the underlying telegram requests call.
+            # 3. Fire the sanitized payload
             send_telegram_broadcast(history_text, "orchestration")
 
         except Exception as err:
