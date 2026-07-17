@@ -64,29 +64,34 @@ async def telegram_webhook_handler(request: Request):
         try:
             db_pool = request.app.state.db_pool
 
-            # Strict UTC boundary to align perfectly with NeonDB's server time zone
             query = """
                 SELECT timestamp, agent_name, log_level, message, metadata
                 FROM agent_system_logs
-                WHERE timestamp >= CURRENT_DATE
+                WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date
                 ORDER BY timestamp DESC
                 LIMIT 10;
             """
 
-            # --- CRITICAL FIX: Ensure full async 'await' on context managers and execution ---
             async with db_pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(query)
-                    records = await cur.fetchall()  # 🚨 Added required await here!
+                    records = await cur.fetchall()
 
             if not records:
                 send_telegram_broadcast(
-                    "📆 *Today's Logs:* No agent system logs recorded yet today.",
+                    "📆 <b>Today's Logs:</b> No agent system logs recorded yet today.",
                     "orchestration",
                 )
                 return {"status": "processed"}
 
-            history_text = "📆 *Today's Agent Logs (Latest 10):*\n\n"
+            # 🆕 Added immediate verification ping right after passing the check:
+            send_telegram_broadcast(
+                f"⚡ <b>Database Hit:</b> Found {len(records)} recent log entries for today. Compiling feed...",
+                "orchestration",
+            )
+
+            # Switch fully to HTML tags to prevent markdown parsing crashes on raw strings
+            history_text = "📆 <b>Today's Agent Logs (Latest 10):</b>\n\n"
             for rec in records:
                 timestamp, agent_name, log_level, message, metadata = rec
                 time_str = timestamp.strftime("%H:%M:%S")
@@ -98,23 +103,26 @@ async def telegram_webhook_handler(request: Request):
                 else:
                     icon = "🔹"
 
-                history_text += f"{icon} *[{time_str}] {agent_name}* (`{log_level}`)\n"
-                history_text += f"• {message}\n"
+                history_text += f"{icon} <b>[{time_str}] {agent_name}</b> (<code>{log_level}</code>)\n"
+                # Strip out any potential HTML brackets in raw messages to be safe
+                safe_message = str(message).replace("<", "&lt;").replace(">", "&gt;")
+                history_text += f"• {safe_message}\n"
 
                 if metadata and isinstance(metadata, dict):
-                    meta_details = ", ".join(
-                        [f"{k}: `{v}`" for k, v in metadata.items()]
-                    )
-                    history_text += f"• _Meta:_ {meta_details}\n"
+                    meta_details = ", ".join([f"{k}: {v}" for k, v in metadata.items()])
+                    safe_meta = meta_details.replace("<", "&lt;").replace(">", "&gt;")
+                    history_text += f"• <i>Meta:</i> <code>{safe_meta}</code>\n"
 
                 history_text += "\n"
 
+            # If your send_telegram_broadcast default format is Markdown,
+            # make sure it passes parse_mode="HTML" to the underlying telegram requests call.
             send_telegram_broadcast(history_text, "orchestration")
 
         except Exception as err:
-            # Captures any internal failure and forces visibility back to your chat
             send_telegram_broadcast(
-                f"❌ *History Engine Failure:* `{str(err)}`", "orchestration"
+                f"❌ <b>History Engine Failure:</b> <code>{str(err)}</code>",
+                "orchestration",
             )
 
     return {"status": "processed"}
