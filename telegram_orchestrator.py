@@ -104,18 +104,18 @@ async def telegram_webhook_handler(request: Request):
             query = """
                 WITH ranked_logs AS (
                     SELECT 
-                        timestamp, 
-                        agent_name, 
-                        log_level, 
+                        agent_name,
+                        log_level,
                         message,
-                        ROW_NUMBER() OVER (PARTITION BY agent_name ORDER BY timestamp DESC) as rn
+                        # 🌟 FORCE POSTGRES TO CONVERT UTC TO EASTERN TIME ON THE FLY
+                        created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' AS local_time,
+                        ROW_NUMBER() OVER(PARTITION BY agent_name ORDER BY created_at DESC) as rn
                     FROM agent_system_logs
-                    WHERE timestamp >= CURRENT_DATE
                 )
-                SELECT timestamp, agent_name, log_level, message
+                SELECT agent_name, log_level, message, local_time
                 FROM ranked_logs
                 WHERE rn = 1
-                ORDER BY timestamp ASC;
+                ORDER BY local_time ASC;
             """
 
             async with db_pool.connection() as conn:
