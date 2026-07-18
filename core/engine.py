@@ -20,8 +20,8 @@ DAILY_EXECUTION_ROUTERS = {
     2: ["nexus", "nova", "vanguard", "radar", "pulsar"],
     3: ["nexus", "nova", "vanguard", "radar", "pulsar"],
     4: ["nexus", "nova", "vanguard", "radar", "pulsar"],
-    5: ["nexus", "nova", "radar", "pulsar"],
-    6: ["nexus", "nova", "radar", "pulsar"],
+    5: ["nexus", "radar"],
+    6: ["nexus", "radar"],
 }
 
 PUBLER_BEACON_SCHEDULE = {
