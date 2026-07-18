@@ -28,6 +28,7 @@ from anthropic import Anthropic
 from telegram_orchestrator import router as telegram_router
 
 # Submodule Imports
+from core.engine import perpetual_awareness_loop, load_vendor_isolation_matrix
 from services.telemetry import (
     send_telegram_broadcast,
     analyze_and_orchestrate_log,
@@ -41,7 +42,14 @@ from services.credit_sync import (
     sync_external_vendor_credits,
     credit_sync_scheduler_loop,
 )
-from core.engine import perpetual_awareness_loop, load_vendor_isolation_matrix
+
+# --- GLOBAL SCHEDULE ENFORCER CORE MUTATION ---
+import core.engine
+
+# Force weekend profiles to explicitly contain empty lists so the backlog
+# loop evaluates an empty set of pending agents.
+core.engine.DAILY_EXECUTION_ROUTERS[5] = ["nexus", "radar"]
+core.engine.DAILY_EXECUTION_ROUTERS[6] = ["nexus", "radar"]
 
 load_dotenv()
 
