@@ -3,8 +3,14 @@ import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Request, HTTPException
+from psycopg.rows import dict_row
 from helix_optimizer import run_daily_prompt_optimization
-from services.telemetry import send_telegram_broadcast
+from services.telemetry import (
+    send_telegram_broadcast,
+    ExecutiveNotificationEvent,
+    emit_executive_notification,
+    send_executive_summary_from_logs,
+)
 
 router = APIRouter(prefix="/api/v1/telegram", tags=["telegram-control"])
 
@@ -38,9 +44,15 @@ async def telegram_webhook_handler(request: Request):
 
     # 2. Command Processing Matrix
     if text == "/optimize":
-        send_telegram_broadcast(
-            "⏳ *Manual Telegram Trigger:* Initializing Claude prompt optimization override...",
-            "orchestration",
+        emit_executive_notification(
+            ExecutiveNotificationEvent(
+                source_agent="helix",
+                event_type="manual_command_ack",
+                severity="info",
+                headline="Optimization Command Received",
+                outcome="Manual prompt optimization override started.",
+                next_action="Await completion confirmation.",
+            )
         )
         try:
             # Import your underlying optimization service dynamically
@@ -51,14 +63,27 @@ async def telegram_webhook_handler(request: Request):
             # Force the prompt tuning loop to bypass the standard anomaly thresholds
             await run_daily_prompt_optimization(db_pool, force=True)
 
-            send_telegram_broadcast(
-                "✅ *Success:* Calibration sweep completed cleanly via Telegram command.",
-                "orchestration",
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="manual_command_ack",
+                    severity="success",
+                    headline="Optimization Command Completed",
+                    outcome="Prompt calibration sweep completed successfully.",
+                    next_action="Continue tracking agent quality signals.",
+                )
             )
         except Exception as err:
-            send_telegram_broadcast(
-                f"❌ *Failure:* Telegram forced optimization crashed: `{str(err)}`",
-                "orchestration",
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="critical_failure",
+                    severity="critical",
+                    headline="Optimization Command Failed",
+                    outcome="Manual optimization crashed during execution.",
+                    impact=str(err),
+                    next_action="Inspect Helix optimizer logs and retry.",
+                )
             )
 
     elif text == "/status":
@@ -85,86 +110,49 @@ async def telegram_webhook_handler(request: Request):
                 optimizer_status = "Not Initialized ⚠️"
 
             # 3. Compile and broadcast
-            status_message = (
-                f"📊 *Polaris-Helix Health Status:*\n"
-                f"• *Environment:* Production (Render)\n"
-                f"• *Database Pool:* {db_status}\n"
-                f"• *Optimizer Loop:* {optimizer_status}"
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="manual_command_ack",
+                    severity="info",
+                    headline="Helix Status Snapshot",
+                    outcome=f"Database: {db_status}; Optimizer: {optimizer_status}",
+                    next_action="No action needed unless health is degraded.",
+                )
             )
-            send_telegram_broadcast(status_message, "orchestration")
 
         except Exception as err:
-            send_telegram_broadcast(
-                f"❌ *Status Diagnostics Failure:* `{str(err)}`", "orchestration"
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="critical_failure",
+                    severity="critical",
+                    headline="Status Command Failed",
+                    outcome="Could not compile Helix diagnostics.",
+                    impact=str(err),
+                    next_action="Inspect API and DB health.",
+                )
             )
 
     elif text == "/history":
         try:
             db_pool = request.app.state.db_pool
-
-            # Query the absolute latest log entry for each agent today, ordered chronologically
-            query = """
-                WITH ranked_logs AS (
-                    SELECT 
-                        agent_name,
-                        log_level,
-                        message,
-                        # 🌟 FORCE POSTGRES TO CONVERT UTC TO EASTERN TIME ON THE FLY
-                        created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' AS local_time,
-                        ROW_NUMBER() OVER(PARTITION BY agent_name ORDER BY created_at DESC) as rn
-                    FROM agent_system_logs
-                )
-                SELECT agent_name, log_level, message, local_time
-                FROM ranked_logs
-                WHERE rn = 1
-                ORDER BY local_time ASC;
-            """
-
-            async with db_pool.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(query)
-                    records = await cur.fetchall()
-
-            if not records:
-                send_telegram_broadcast(
-                    "📆 *System Alert:* No active agent runs recorded today.",
-                    "orchestration",
-                )
-                return {"status": "processed"}
-
-            summary_lines = ["📋 *Polaris-Helix Agent Timelines (Latest State):*\n"]
-
-            for rec in records:
-                timestamp, agent_name, log_level, message = rec
-                time_str = timestamp.strftime("%I:%M %p")
-
-                msg_lower = message.lower()
-                if log_level.upper() in ["ERROR", "CRITICAL"]:
-                    status = "failed ❌"
-                elif "ratelimited" in msg_lower:
-                    status = "rate-limited ⚠️"
-                elif (
-                    "finalized" in msg_lower
-                    or "successful" in msg_lower
-                    or "flush" in msg_lower
-                ):
-                    status = "completed run ✅"
-                else:
-                    status = "active 🔹"
-
-                display_name = str(agent_name).capitalize()
-
-                # Formatted with Markdown instead of HTML
-                summary_lines.append(
-                    f"• *{display_name}* active at `{time_str}` ({status})"
-                )
-
-            final_summary = "\n".join(summary_lines)
-            send_telegram_broadcast(final_summary, "orchestration")
+            ai_client = request.app.state.ai_client
+            await send_executive_summary_from_logs(
+                db_pool, lookback_minutes=180, ai_client=ai_client
+            )
 
         except Exception as err:
-            send_telegram_broadcast(
-                f"❌ *Summary Engine Failure:* `{str(err)}`", "orchestration"
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="critical_failure",
+                    severity="critical",
+                    headline="History Command Failed",
+                    outcome="Could not generate executive history summary.",
+                    impact=str(err),
+                    next_action="Inspect log query path and DB health.",
+                )
             )
 
     elif text.startswith("/execute"):
@@ -182,22 +170,40 @@ async def telegram_webhook_handler(request: Request):
 
             # Validate if a single agent was specified
             if target_agent and target_agent not in valid_agents:
-                send_telegram_broadcast(
-                    f"⚠️ *Invalid Agent:* `{target_agent}` is not part of the ecosystem.",
-                    "orchestration",
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="helix",
+                        event_type="manual_command_ack",
+                        severity="warning",
+                        headline="Execution Command Rejected",
+                        outcome=f"Unknown agent '{target_agent}' was requested.",
+                        next_action="Use a valid agent identifier.",
+                    )
                 )
                 return {"status": "processed"}
 
             # 1. Feedback via Markdown
             if target_agent:
-                send_telegram_broadcast(
-                    f"🔌 *Targeted Override:* Isolating mesh to execute *{target_agent.capitalize()}* only...",
-                    "orchestration",
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="helix",
+                        event_type="manual_command_ack",
+                        severity="info",
+                        headline="Targeted Execution Requested",
+                        outcome=f"Single-agent run initiated for {target_agent}.",
+                        next_action="Await completion milestone.",
+                    )
                 )
             else:
-                send_telegram_broadcast(
-                    "🔌 *Master Override:* Initiating synchronized ecosystem cycle...",
-                    "orchestration",
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="helix",
+                        event_type="manual_command_ack",
+                        severity="info",
+                        headline="Full Mesh Execution Requested",
+                        outcome="Synchronized multi-agent cycle initiated.",
+                        next_action="Monitor milestone updates for completion.",
+                    )
                 )
 
             # 2. Extract active strategy from DB
@@ -223,9 +229,15 @@ async def telegram_webhook_handler(request: Request):
                 await conn.commit()
 
             if not strategy:
-                send_telegram_broadcast(
-                    "⚠️ *Execution Halted:* No active targets configured in the scheduler table.",
-                    "orchestration",
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="helix",
+                        event_type="manual_command_ack",
+                        severity="warning",
+                        headline="Execution Halted",
+                        outcome="No active scheduler targets found.",
+                        next_action="Activate at least one scheduler strategy.",
+                    )
                 )
                 return {"status": "processed"}
 
@@ -262,17 +274,29 @@ async def telegram_webhook_handler(request: Request):
             agents_string = ", ".join(agents_to_run)
             target_region_str = strategy["target_region"] or "Global"
 
-            send_telegram_broadcast(
-                f"🚀 *Mesh Sequence Deployed!*\n"
-                f"• Target Niche: `{strategy['industry_name']}`\n"
-                f"• Target Region: `{target_region_str}`\n"
-                f"• Dispatched Payload: `[{agents_string}]`",
-                "orchestration",
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="pipeline_milestone",
+                    severity="success",
+                    headline="Mesh Sequence Deployed",
+                    outcome=f"Agents [{agents_string}] dispatched for {strategy['industry_name']}.",
+                    impact=f"Region: {target_region_str}",
+                    next_action="Track agent completions in Helix logs.",
+                )
             )
 
         except Exception as err:
-            send_telegram_broadcast(
-                f"❌ *Execution Trigger Failed:* `{str(err)}`", "orchestration"
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="critical_failure",
+                    severity="critical",
+                    headline="Execution Command Failed",
+                    outcome="Manual mesh trigger failed before completion.",
+                    impact=str(err),
+                    next_action="Inspect scheduler and mesh dispatch dependencies.",
+                )
             )
 
     return {"status": "processed"}

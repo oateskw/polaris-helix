@@ -2,17 +2,51 @@ import os
 import json
 import asyncio
 import traceback
+import hashlib
 import httpx
 import requests
 import datetime
+from dataclasses import dataclass
 from typing import Any, Optional
 from psycopg.types.json import Jsonb
 from psycopg.rows import dict_row
+from collections import deque
+import time
 
 from config.settings import NEW_YORK_TZ, CHIRON_API_URL, ANTHROPIC_MODEL
 
 # Reimport to prevent circular loops
 from services.mesh_client import trigger_downstream_mesh_with_payload
+
+# Rate limiting windows
+_GLOBAL_NOTIFICATION_HISTORY = deque()
+_MAX_NOTIFICATIONS_PER_MINUTE = (
+    6  # Caps output strictly to roughly 1 alert per 10 seconds
+)
+
+
+@dataclass
+class ExecutiveNotificationEvent:
+    source_agent: str
+    event_type: str
+    severity: str
+    headline: str
+    outcome: str
+    impact: str | None = None
+    next_action: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+_NOTIFICATION_FINGERPRINT_LAST_SENT: dict[str, datetime.datetime] = {}
+_NOTIFICATION_DEDUPE_WINDOW_SECONDS = int(
+    os.getenv("HELIX_NOTIFICATION_DEDUPE_SECONDS", "300")
+)
+_IMMEDIATE_ALERT_EVENT_TYPES = {
+    "critical_failure",
+    "vendor_circuit_breaker",
+    "pipeline_milestone",
+    "manual_command_ack",
+}
 
 
 def get_new_york_now() -> datetime.datetime:
@@ -53,12 +87,14 @@ def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
                     },
                 )
         except Exception as e:
-            print(f"⚠️ Telegram broadcast failed: {e}")
+            print(f"⚠️ Telegram broadcast async failed: {e}")
 
+    # FIX 1: Explicitly run or schedule the async routine
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_send())
     except RuntimeError:
+        # Fallback for non-async calling threads
         try:
             requests.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
@@ -70,7 +106,210 @@ def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
                 timeout=5,
             )
         except Exception as e:
-            print(f"⚠️ Telegram broadcast failed: {e}")
+            print(f"⚠️ Telegram broadcast sync fallback failed: {e}")
+
+
+def _event_severity_to_channel(severity: str) -> str:
+    normalized = (severity or "info").lower()
+    if normalized in {"critical", "error"}:
+        return "critical"
+    if normalized in {"success", "ok"}:
+        return "success"
+    return "orchestration"
+
+
+def _event_severity_to_emoji(severity: str) -> str:
+    normalized = (severity or "info").lower()
+    if normalized in {"critical", "error"}:
+        return "🚨"
+    if normalized in {"warning", "warn"}:
+        return "⚠️"
+    if normalized in {"success", "ok"}:
+        return "✅"
+    return "🧠"
+
+
+def _event_fingerprint(event: ExecutiveNotificationEvent) -> str:
+    payload = {
+        "source_agent": event.source_agent,
+        "event_type": event.event_type,
+        "severity": event.severity,
+        "headline": event.headline,
+        "outcome": event.outcome,
+    }
+    digest_src = json.dumps(payload, sort_keys=True)
+    return hashlib.sha256(digest_src.encode("utf-8")).hexdigest()
+
+
+def _should_emit_event(fingerprint: str) -> bool:
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    current_timestamp = time.time()
+
+    # 1. Clean old entries outside the sliding 60-second execution window
+    while (
+        _GLOBAL_NOTIFICATION_HISTORY
+        and _GLOBAL_NOTIFICATION_HISTORY[0] < current_timestamp - 60
+    ):
+        _GLOBAL_NOTIFICATION_HISTORY.popleft()
+
+    # 2. Strict Rate Guard Capacity check
+    if len(_GLOBAL_NOTIFICATION_HISTORY) >= _MAX_NOTIFICATIONS_PER_MINUTE:
+        print(f"⚠️ [RATE LIMIT ENGAGED] Coalescing alert drop to prevent channel spam.")
+        return False
+
+    # 3. Text String Standard Fingerprint Deduplication check
+    last_sent = _NOTIFICATION_FINGERPRINT_LAST_SENT.get(fingerprint)
+    if last_sent is not None:
+        elapsed = (now_utc - last_sent).total_seconds()
+        if elapsed < _NOTIFICATION_DEDUPE_WINDOW_SECONDS:
+            return False
+
+    # Append confirmation tracking flags
+    _NOTIFICATION_FINGERPRINT_LAST_SENT[fingerprint] = now_utc
+    _GLOBAL_NOTIFICATION_HISTORY.append(current_timestamp)
+    return True
+
+
+# Example of the structured format used across the codebase (from services/telemetry.py):
+def _format_executive_summary_card(event: ExecutiveNotificationEvent) -> str:
+    severity_emoji = _event_severity_to_emoji(event.severity)
+    lines = [
+        f"{severity_emoji} *{event.headline}*",
+        f"• Agent: `{event.source_agent}`",
+        f"• Outcome: {event.outcome}",
+    ]
+    if event.impact:
+        lines.append(f"• Impact: {event.impact}")
+    if event.next_action:
+        lines.append(f"• Next: {event.next_action}")
+    return "\n".join(lines)
+
+
+def _is_immediate_alert(event: ExecutiveNotificationEvent) -> bool:
+    severity = (event.severity or "info").lower()
+    if severity in {"critical", "error"}:
+        return True
+    return event.event_type in _IMMEDIATE_ALERT_EVENT_TYPES
+
+
+def emit_executive_notification(event: ExecutiveNotificationEvent) -> None:
+    fingerprint = _event_fingerprint(event)
+    if not _should_emit_event(fingerprint):
+        return
+
+    notification_channel = _event_severity_to_channel(event.severity)
+    if not _is_immediate_alert(event):
+        # Event-driven executive summaries still route through orchestration channel
+        notification_channel = "orchestration"
+
+    send_telegram_broadcast(
+        _format_executive_summary_card(event),
+        notification_channel,
+    )
+
+
+async def send_executive_summary_from_logs(
+    db_pool,
+    lookback_minutes: int = 180,
+    ai_client=None,  # Pass the app.state.ai_client here
+) -> None:
+    """Builds an AI-powered executive summary directly from Helix log telemetry."""
+    try:
+        async with db_pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT agent_name, log_level, message, metadata, timestamp
+                    FROM agent_system_logs
+                    WHERE timestamp >= NOW() - (%s || ' minutes')::INTERVAL
+                    ORDER BY timestamp DESC;
+                    """,
+                    (lookback_minutes,),
+                )
+                rows = await cur.fetchall()
+
+        if not rows:
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="manual_command_ack",
+                    severity="info",
+                    headline="Helix Executive Summary",
+                    outcome="No agent activity detected in the selected window.",
+                    next_action="No immediate action required.",
+                )
+            )
+            return
+
+        # Prepare clear data for Claude to digest
+        compact_logs = [
+            {
+                "time": r["timestamp"].strftime("%H:%M:%S"),
+                "agent": r["agent_name"],
+                "level": r["log_level"],
+                "msg": r["message"],
+                "meta": r["metadata"],
+            }
+            for r in rows[:40]  # Analyze the 40 most recent log milestones
+        ]
+
+        # FIX 2: Check for AI Client availability, generate smart analysis
+        if ai_client:
+            prompt = (
+                f"You are the Helix Executive Analytics Engine. Analyze the following recent system logs "
+                f"from the last {lookback_minutes} minutes and provide an executive summary scorecard. "
+                f"Group findings by agent actions. Use markdown lists and specific emojis. Keep it brief, "
+                f"highly professional, scannable, and omit mundane technical details.\n\n"
+                f"LOGS:\n{json.dumps(compact_logs, indent=2)}"
+            )
+
+            response = ai_client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=1000,
+                temperature=0.3,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            ai_summary = response.content[0].text
+
+            # Send via our broadcast engine directly
+            send_telegram_broadcast(ai_summary, "orchestration")
+        else:
+            # Fallback to structural metrics block if AI client isn't available
+            summary_lines = []
+            for agent in set(r["agent_name"] for r in rows):
+                total = sum(1 for r in rows if r["agent_name"] == agent)
+                errors = sum(
+                    1
+                    for r in rows
+                    if r["agent_name"] == agent and r["log_level"] == "ERROR"
+                )
+                marker = "🚨" if errors > 0 else "✅"
+                summary_lines.append(
+                    f"{marker} `{agent}`: {total} events ({errors} errors)"
+                )
+
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="manual_command_ack",
+                    severity="info",
+                    headline="Helix Executive Metrics (Fallback)",
+                    outcome="; ".join(summary_lines),
+                    next_action="Review log database directly.",
+                )
+            )
+    except Exception as exc:
+        emit_executive_notification(
+            ExecutiveNotificationEvent(
+                source_agent="helix",
+                event_type="critical_failure",
+                severity="critical",
+                headline="AI Executive Summary Build Failed",
+                outcome="Helix could not process log data arrays into an executive summary.",
+                impact=str(exc),
+                next_action="Validate database connectivity and Anthropic API key status.",
+            )
+        )
 
 
 async def write_helix_command_center_log(
@@ -141,15 +380,29 @@ async def evaluate_lead_density_and_escalate(
                 await conn.commit()
 
         if updated_strategy:
-            send_telegram_broadcast(
-                f"📈 *ADAPTIVE INGESTION DETECTED*\nNiche: `{industry_name}` received `{influx_count}` new leads.\nBoosted priority to: `{updated_strategy['priority_score']}`.",
-                "orchestration",
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="pipeline_milestone",
+                    severity="info",
+                    headline="Lead Ingestion Spike",
+                    outcome=f"{industry_name} received {influx_count} leads.",
+                    impact=f"Priority boosted to {updated_strategy['priority_score']}.",
+                    next_action="Monitor follow-on mesh dispatch readiness.",
+                )
             )
 
             if influx_count >= 10:
-                send_telegram_broadcast(
-                    f"⚡ *HIGH DENSITY THRESHOLD BROKEN*\nIndustry `{industry_name}` crossed limits. Deploying proxy tasks!",
-                    "orchestration",
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="helix",
+                        event_type="pipeline_milestone",
+                        severity="success",
+                        headline="High Density Trigger",
+                        outcome=f"{industry_name} crossed high-volume threshold.",
+                        impact="Proxy task fanout initiated.",
+                        next_action="Track completion of dispatched agents.",
+                    )
                 )
                 from core.engine import load_vendor_isolation_matrix
 
@@ -202,9 +455,16 @@ async def process_roi_attribution_boost(email: str, status: str, db_pool):
                     await conn.commit()
 
                     if updated_row:
-                        send_telegram_broadcast(
-                            f"🏆 *CLOSED-LOOP ROI REWARD*\nLead: `{email}` milestone: *{status.upper()}*\nMapped: `{target_industry}`\nScaled Priority `+{reward_weight}`!",
-                            "success",
+                        emit_executive_notification(
+                            ExecutiveNotificationEvent(
+                                source_agent="helix",
+                                event_type="pipeline_milestone",
+                                severity="success",
+                                headline="ROI Attribution Boost Applied",
+                                outcome=f"Lead milestone '{status.upper()}' mapped to {target_industry}.",
+                                impact=f"Priority increased by +{reward_weight}.",
+                                next_action="Continue monitoring conversion progression.",
+                            )
                         )
     except Exception as e:
         print(f"⚠️ Attribution processing anomaly: {e}")
@@ -369,8 +629,15 @@ async def analyze_and_orchestrate_log(
                 if normalized_log_level == "INFO":
                     # success check
                     if "execution status: success" in norm_msg:
-                        send_telegram_broadcast(
-                            f"Agent `{agent_name}` reported success status.", "success"
+                        emit_executive_notification(
+                            ExecutiveNotificationEvent(
+                                source_agent=agent_name,
+                                event_type="pipeline_milestone",
+                                severity="success",
+                                headline="Agent Execution Success",
+                                outcome=f"{agent_name} reported successful execution.",
+                                next_action="Monitor downstream dependencies for completion.",
+                            )
                         )
                         if agent_name in ["beacon", "nova"]:
                             master_token = os.getenv("HELIX_AUTH_TOKEN", "")
@@ -403,9 +670,15 @@ async def analyze_and_orchestrate_log(
                         status_flag = str(meta.get("status", "")).upper()
 
                         if status_flag == "PROVIDER_DOWN_RETRY":
-                            send_telegram_broadcast(
-                                f"⚠️ *MOLTSET DROPOUT DETECTED*\nNova retry on `{industry}` active.",
-                                "orchestration",
+                            emit_executive_notification(
+                                ExecutiveNotificationEvent(
+                                    source_agent="nova",
+                                    event_type="pipeline_milestone",
+                                    severity="warning",
+                                    headline="Nova Provider Retry",
+                                    outcome=f"Provider drop detected for {industry}; retry path active.",
+                                    next_action="Watch for recovery or escalation.",
+                                )
                             )
                             await cur.execute(
                                 "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL + INTERVAL '1 hour' WHERE industry_name = %s;",
@@ -414,9 +687,15 @@ async def analyze_and_orchestrate_log(
                             await conn.commit()
                             return
                         elif status_flag == "RATE_LIMITED":
-                            send_telegram_broadcast(
-                                f"🚨 *MOLTSET LIMITS HIT*\nSequential queue frozen on `{industry}`.",
-                                "critical",
+                            emit_executive_notification(
+                                ExecutiveNotificationEvent(
+                                    source_agent="nova",
+                                    event_type="vendor_circuit_breaker",
+                                    severity="critical",
+                                    headline="Nova Rate Limited",
+                                    outcome=f"Sequential queue frozen for {industry}.",
+                                    next_action="Increase quota or delay rerun.",
+                                )
                             )
                             await cur.execute(
                                 "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL WHERE industry_name = %s;",
@@ -427,9 +706,15 @@ async def analyze_and_orchestrate_log(
                         elif status_flag == "EXHAUSTED" or (
                             status_flag == "COMPLETED" and records_found == 0
                         ):
-                            send_telegram_broadcast(
-                                f"🛑 *EXHAUSTION GUARD TRIPPED*\nDeactivating `{industry}` campaign row.",
-                                "critical",
+                            emit_executive_notification(
+                                ExecutiveNotificationEvent(
+                                    source_agent="nova",
+                                    event_type="critical_failure",
+                                    severity="critical",
+                                    headline="Campaign Exhaustion Guard Triggered",
+                                    outcome=f"{industry} campaign has been deactivated.",
+                                    next_action="Rotate strategy target before rerun.",
+                                )
                             )
                             await cur.execute(
                                 "UPDATE helix_brain_scheduler SET is_active = FALSE WHERE industry_name = %s;",
@@ -438,9 +723,15 @@ async def analyze_and_orchestrate_log(
                             await conn.commit()
                             return
                         elif status_flag == "COMPLETED" and records_found > 0:
-                            send_telegram_broadcast(
-                                f"📉 *NOVA BATCH SUCCESS*\nSecured `{records_found}` leads for `{industry}`.",
-                                "orchestration",
+                            emit_executive_notification(
+                                ExecutiveNotificationEvent(
+                                    source_agent="nova",
+                                    event_type="pipeline_milestone",
+                                    severity="success",
+                                    headline="Nova Batch Completed",
+                                    outcome=f"Secured {records_found} leads for {industry}.",
+                                    next_action="Continue sequential enrichment pipeline.",
+                                )
                             )
                             from core.engine import load_vendor_isolation_matrix
 
@@ -494,9 +785,15 @@ async def analyze_and_orchestrate_log(
                                 ),
                             ),
                         )
-                        send_telegram_broadcast(
-                            f"📬 *VANGUARD OUTBOUND SWEEP*\nFinished and verified `{leads_processed}` emails.",
-                            "success",
+                        emit_executive_notification(
+                            ExecutiveNotificationEvent(
+                                source_agent="vanguard",
+                                event_type="pipeline_milestone",
+                                severity="success",
+                                headline="Vanguard Sweep Completed",
+                                outcome=f"Verified outbound processing for {leads_processed} leads.",
+                                next_action="Track reply and meeting conversion signals.",
+                            )
                         )
 
                     # Vector

@@ -29,7 +29,11 @@ async def async_http_post_proxy(
 ) -> bool:
     """🚀 HIGH-PERFORMANCE PROXY PROBE WITH LIVE EXCEPTION VERIFICATION"""
     # Localized import to prevent circular dependency
-    from services.telemetry import send_telegram_broadcast
+    from services.telemetry import (
+        send_telegram_broadcast,
+        ExecutiveNotificationEvent,
+        emit_executive_notification,
+    )
 
     backoff = 2.0
     async with httpx.AsyncClient(http2=False, timeout=30.0) as client:
@@ -47,9 +51,16 @@ async def async_http_post_proxy(
                     except Exception:
                         error_details = response.text
 
-                    send_telegram_broadcast(
-                        f"❌ *SCHEMA MISMATCH (422)*\nTarget Node: `{url}` rejected payload validation.\nDetails: `{error_details}`",
-                        "critical",
+                    emit_executive_notification(
+                        ExecutiveNotificationEvent(
+                            source_agent="helix",
+                            event_type="critical_failure",
+                            severity="critical",
+                            headline="Downstream Schema Rejection",
+                            outcome="A downstream service rejected payload validation.",
+                            impact=f"Endpoint: {url}; details: {error_details}",
+                            next_action="Review payload contract between Helix and target service.",
+                        )
                     )
                     return False
 
@@ -62,9 +73,16 @@ async def async_http_post_proxy(
 
                 if 400 <= status_code < 500:
                     response_excerpt = (response.text or "")[:300]
-                    send_telegram_broadcast(
-                        f"⚠️ *DOWNSTREAM CLIENT REJECTION*\nTarget Node: `{url}` returned status `{status_code}`.\nExcerpt: `{response_excerpt}`",
-                        "critical",
+                    emit_executive_notification(
+                        ExecutiveNotificationEvent(
+                            source_agent="helix",
+                            event_type="critical_failure",
+                            severity="critical",
+                            headline="Downstream Client Rejection",
+                            outcome=f"Target service returned HTTP {status_code}.",
+                            impact=f"Endpoint: {url}; excerpt: {response_excerpt}",
+                            next_action="Validate credentials and request payload.",
+                        )
                     )
                     return False
 
@@ -77,14 +95,28 @@ async def async_http_post_proxy(
 
                 return False
             except Exception as e:
-                send_telegram_broadcast(
-                    f"⚠️ [PROXY EXCEPTION] Attempt {attempt} failed targeting `{url}`. Error Context: `{str(e)}`",
-                    "verbose",
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="helix",
+                        event_type="pipeline_milestone",
+                        severity="warning",
+                        headline="Proxy Retry Triggered",
+                        outcome=f"Attempt {attempt} failed for downstream request.",
+                        impact=f"Endpoint: {url}; error: {e}",
+                        next_action="Automatic retry in progress.",
+                    )
                 )
                 if attempt == max_retries:
-                    send_telegram_broadcast(
-                        f"💥 *MESH NODE UNREACHABLE*\nEndpoint: `{url}` failed all connection attempts.\nFinal Network Error: `{e}`",
-                        "critical",
+                    emit_executive_notification(
+                        ExecutiveNotificationEvent(
+                            source_agent="helix",
+                            event_type="critical_failure",
+                            severity="critical",
+                            headline="Mesh Node Unreachable",
+                            outcome="All retry attempts to downstream endpoint failed.",
+                            impact=f"Endpoint: {url}; error: {e}",
+                            next_action="Inspect target service uptime and network path.",
+                        )
                     )
                 else:
                     await asyncio.sleep(backoff**attempt)
@@ -97,6 +129,8 @@ async def trigger_downstream_mesh_with_payload(
     from services.telemetry import (
         send_telegram_broadcast,
         write_helix_command_center_log,
+        ExecutiveNotificationEvent,
+        emit_executive_notification,
     )
 
     # SCHEDULING LEAK GUARD: Validate agent_list is non-empty before proceeding
@@ -115,9 +149,15 @@ async def trigger_downstream_mesh_with_payload(
     # 1. NEXUS OMNI-STRATEGIST (Enforced Dependency Barrier)
     if "nexus" in agent_list:
         if isolation_matrix.get(VENDOR_ANTHROPIC, False):
-            send_telegram_broadcast(
-                "Skipping Nexus Omni-Strategist sync sequence. Anthropic wallet ledger is isolated.",
-                "critical",
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="nexus",
+                    event_type="vendor_circuit_breaker",
+                    severity="critical",
+                    headline="Nexus Dispatch Blocked",
+                    outcome="Anthropic circuit breaker is active.",
+                    next_action="Restore Anthropic credits before rerun.",
+                )
             )
         else:
             url = os.getenv(
@@ -151,9 +191,16 @@ async def trigger_downstream_mesh_with_payload(
             )
 
             if not nexus_success:
-                send_telegram_broadcast(
-                    f"🛑 *CRITICAL ORCHESTRATION HALT*\nNexus failed to initialize for strategy: `{strategy['industry_name']}`.\nSuppressing all downstream mesh tasks (Nova, Beacon, Vanguard) to prevent corruption.",
-                    "critical",
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="nexus",
+                        event_type="critical_failure",
+                        severity="critical",
+                        headline="Orchestration Halted",
+                        outcome=f"Nexus failed to initialize for {strategy['industry_name']}.",
+                        impact="Downstream Nova/Beacon/Vanguard dispatch was suppressed.",
+                        next_action="Inspect Nexus availability and payload integrity.",
+                    )
                 )
                 await write_helix_command_center_log(
                     db_pool,
@@ -164,16 +211,29 @@ async def trigger_downstream_mesh_with_payload(
                 )
                 return  # Hard execution block protecting Beacon
 
-            send_telegram_broadcast(
-                "Nexus execution impulse successfully deployed down-mesh.", "verbose"
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="nexus",
+                    event_type="pipeline_milestone",
+                    severity="success",
+                    headline="Nexus Dispatch Confirmed",
+                    outcome="Nexus orchestration impulse deployed successfully.",
+                    next_action="Await downstream milestone updates.",
+                )
             )
 
     # 2. NOVA (Lead Harvesting Production Loop)
     if "nova" in agent_list:
         if isolation_matrix.get(VENDOR_MOLTSET, False):
-            send_telegram_broadcast(
-                "Skipping Lead Nova execution loop. Moltset circuit breaker is TRIPPED.",
-                "critical",
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="nova",
+                    event_type="vendor_circuit_breaker",
+                    severity="critical",
+                    headline="Nova Dispatch Blocked",
+                    outcome="Moltset circuit breaker is active.",
+                    next_action="Restore Moltset credits before rerun.",
+                )
             )
             await write_helix_command_center_log(
                 db_pool,
@@ -217,9 +277,15 @@ async def trigger_downstream_mesh_with_payload(
                     nova_payload,
                 )
             )
-            send_telegram_broadcast(
-                "Nova orchestration bundle successfully ignited on mesh edge node.",
-                "verbose",
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="nova",
+                    event_type="pipeline_milestone",
+                    severity="success",
+                    headline="Nova Dispatch Started",
+                    outcome=f"Nova execution initiated for {strategy['industry_name']}.",
+                    next_action="Monitor lead-harvest completion signal.",
+                )
             )
 
     # 3. BEACON TASK DISPATCH

@@ -4,7 +4,12 @@ import os
 from zoneinfo import ZoneInfo
 from psycopg.rows import dict_row
 
-from services.telemetry import send_telegram_broadcast, write_helix_command_center_log
+from services.telemetry import (
+    send_telegram_broadcast,
+    write_helix_command_center_log,
+    ExecutiveNotificationEvent,
+    emit_executive_notification,
+)
 from services.mesh_client import trigger_downstream_mesh_with_payload
 from helix_optimizer import run_daily_prompt_optimization
 
@@ -118,10 +123,15 @@ async def perpetual_awareness_loop(app_instance):
                         if nexus_runs == 0 or (
                             beacon_runs >= 1 and nexus_runs <= beacon_runs
                         ):
-                            send_telegram_broadcast(
-                                f"🛡️ [NEXUS VANGUARD GATE] Intercepting Out-of-Band Beacon sequence.\n"
-                                f"Firing Nexus (Run #{nexus_runs + 1}) first to pave the path for strategy: *{active_strategy['industry_name']}*.",
-                                "orchestration",
+                            emit_executive_notification(
+                                ExecutiveNotificationEvent(
+                                    source_agent="helix",
+                                    event_type="pipeline_milestone",
+                                    severity="info",
+                                    headline="Nexus Gate Engaged",
+                                    outcome=f"Nexus prioritized before Beacon for {active_strategy['industry_name']}.",
+                                    next_action="Await Nexus completion before Beacon deployment.",
+                                )
                             )
 
                             # Fire ONLY Nexus first and explicitly await its network execution hand-off
@@ -139,10 +149,16 @@ async def perpetual_awareness_loop(app_instance):
 
                         # CASE B: Nexus has successfully run and cleared a path, leaving it 1 step ahead of Beacon.
                         else:
-                            send_telegram_broadcast(
-                                f"🟢 [NEXUS VANGUARD GATE] Nexus verification confirmed one step ahead (Nexus: {nexus_runs}, Beacon: {beacon_runs}).\n"
-                                f"Deploying `beacon` content generation engine for strategy: *{active_strategy['industry_name']}*.",
-                                "orchestration",
+                            emit_executive_notification(
+                                ExecutiveNotificationEvent(
+                                    source_agent="helix",
+                                    event_type="pipeline_milestone",
+                                    severity="success",
+                                    headline="Beacon Deployment Cleared",
+                                    outcome=f"Nexus gate passed; Beacon dispatched for {active_strategy['industry_name']}.",
+                                    impact=f"Nexus runs: {nexus_runs}, Beacon runs: {beacon_runs}",
+                                    next_action="Monitor Beacon output quality and completion logs.",
+                                )
                             )
 
                             # Fire Beacon safely knowing the exact database records and directives are fresh
@@ -163,9 +179,15 @@ async def perpetual_awareness_loop(app_instance):
                     != current_date_str
                 ):
                     app_instance.state.last_optimization_date = current_date_str
-                    send_telegram_broadcast(
-                        "🧠 *DAILY SYSTEM OPTIMIZATION ENGINE STARTING*\nAnalyzing execution logs...",
-                        "orchestration",
+                    emit_executive_notification(
+                        ExecutiveNotificationEvent(
+                            source_agent="helix",
+                            event_type="pipeline_milestone",
+                            severity="info",
+                            headline="Daily Optimization Started",
+                            outcome="Helix prompt optimization cycle is running against latest logs.",
+                            next_action="Review optimization completion summary after execution.",
+                        )
                     )
                     await run_daily_prompt_optimization(db_pool)
 
@@ -297,9 +319,16 @@ async def perpetual_awareness_loop(app_instance):
                                 await conn.commit()
 
                             if active_strategy:
-                                send_telegram_broadcast(
-                                    f"⏳ [STAGGERED DRIP] Deploying `{next_agent_up}` for strategy: *{active_strategy['industry_name']}*",
-                                    "orchestration",
+                                emit_executive_notification(
+                                    ExecutiveNotificationEvent(
+                                        source_agent="helix",
+                                        event_type="pipeline_milestone",
+                                        severity="info",
+                                        headline="Staggered Dispatch",
+                                        outcome=f"{next_agent_up} dispatched for {active_strategy['industry_name']}.",
+                                        impact=f"Region: {active_strategy.get('target_region') or 'Global'}",
+                                        next_action="Track downstream execution milestone in logs.",
+                                    )
                                 )
                                 await write_helix_command_center_log(
                                     db_pool,
@@ -327,6 +356,16 @@ async def perpetual_awareness_loop(app_instance):
                             )
 
         except Exception as loop_crash:
-            send_telegram_broadcast(f"Loop exception: `{loop_crash}`", "critical")
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="critical_failure",
+                    severity="critical",
+                    headline="Core Orchestrator Loop Exception",
+                    outcome="Perpetual awareness loop hit an unhandled exception.",
+                    impact=str(loop_crash),
+                    next_action="Inspect engine logs and dependent service health.",
+                )
+            )
 
         await asyncio.sleep(60)

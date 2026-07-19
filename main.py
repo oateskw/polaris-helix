@@ -31,6 +31,8 @@ from telegram_orchestrator import router as telegram_router
 from core.engine import perpetual_awareness_loop, load_vendor_isolation_matrix
 from services.telemetry import (
     send_telegram_broadcast,
+    ExecutiveNotificationEvent,
+    emit_executive_notification,
     analyze_and_orchestrate_log,
     evaluate_lead_density_and_escalate,
     process_roi_attribution_boost,
@@ -78,9 +80,15 @@ async def lifespan(app: FastAPI):
         reactive_optimizer_loop(app.state.db_pool)
     )
 
-    send_telegram_broadcast(
-        "🚀 *Helix Orchestrator Booted with Global Scheduling Leak Refactor Complete!*",
-        "success",
+    emit_executive_notification(
+        ExecutiveNotificationEvent(
+            source_agent="helix",
+            event_type="pipeline_milestone",
+            severity="success",
+            headline="Helix Orchestrator Online",
+            outcome="Core orchestrator, credit sync, and optimizer workers started.",
+            next_action="Monitoring active agent pipeline in real time.",
+        )
     )
     yield
 
@@ -90,11 +98,11 @@ async def lifespan(app: FastAPI):
         app.state.credit_sync_task,
         app.state.optimizer_task,
     ]
-    
+
     for task in tasks_to_cancel:
         if task and not task.done():
             task.cancel()
-    
+
     await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
     await app.state.db_pool.close()
 
@@ -103,6 +111,15 @@ app.router.lifespan_context = lifespan
 
 
 # --- API MODELS ---
+class LogMetadataSchema(BaseModel):
+    industry_name: Optional[str] = "General Operations"
+    target_region: Optional[str] = "Global"
+    records_found: Optional[int] = 0
+    status: Optional[str] = "COMPLETED"
+    traceback: Optional[str] = None
+    extra_context: Optional[dict] = None
+
+
 class LogIngestSchema(BaseModel):
     agent_name: Literal[
         "vanguard",
@@ -119,9 +136,9 @@ class LogIngestSchema(BaseModel):
         "nova",
         "chiron",
     ]
-    log_level: str = "INFO"
+    log_level: Literal["INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     message: str
-    metadata: Optional[dict] = None
+    metadata: Optional[LogMetadataSchema] = None
 
 
 class LeadIngestModel(BaseModel):
@@ -155,6 +172,47 @@ class BlueprintInboundModel(BaseModel):
 class SchedulerTargetUpdateModel(BaseModel):
     industry_name: str
     target_region: str
+
+
+def run_deterministic_moltset_mapping(ai_client: Anthropic, industry_name: str) -> str:
+    """Deterministically map an incoming industry name to allowed scheduler categories."""
+    normalized = (industry_name or "").strip().lower()
+    if not normalized:
+        return "Professional and Business Services"
+
+    for category in MOLTSET_ALLOWED_CATEGORIES:
+        if normalized == category.lower():
+            return category
+
+    keyword_map = {
+        "it": "Information Technology",
+        "software": "Information Technology",
+        "bank": "Finance and Banking",
+        "finance": "Finance and Banking",
+        "school": "Education",
+        "health": "Health and Pharmaceuticals",
+        "medical": "Health and Pharmaceuticals",
+        "manufact": "Manufacturing",
+        "retail": "Retail",
+        "food": "Food and Beverage",
+        "nonprofit": "Non-Profit and Social Services",
+        "transport": "Transportation and Logistics",
+        "construction": "Construction",
+        "travel": "Tourism and Hospitality",
+        "energy": "Energy",
+        "marketing": "Marketing & Advertising",
+        "telecom": "Telecommunications",
+        "real estate": "Real Estate",
+        "auto": "Automotive",
+        "media": "Media and Publishing",
+        "agri": "Agriculture",
+    }
+
+    for token, mapped in keyword_map.items():
+        if token in normalized:
+            return mapped
+
+    return "Professional and Business Services"
 
 
 # --- API ENDPOINTS ---
@@ -467,9 +525,15 @@ async def force_prompt_optimization(
         # Run optimization immediately, setting force=True to skip log counts
         await run_daily_prompt_optimization(app.state.db_pool, force=True)
 
-        send_telegram_broadcast(
-            "🧠 *Manual Optimization Override Complete:* All agent prompts evaluated and re-tuned.",
-            "orchestration",
+        emit_executive_notification(
+            ExecutiveNotificationEvent(
+                source_agent="helix",
+                event_type="manual_command_ack",
+                severity="success",
+                headline="Manual Optimization Completed",
+                outcome="Prompt optimization override finished successfully.",
+                next_action="Continue monitoring downstream agent quality signals.",
+            )
         )
         return {"status": "optimization_cycle_completed", "forced": True}
     except Exception as exc:
@@ -497,20 +561,33 @@ async def execute_orchestrated_master_cycle(
                 ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
             """)
             strategy = await cur.fetchone()
-            if strategy:
+            if strategy and "industry_id" in strategy:
                 await cur.execute(
                     "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
                     (strategy["industry_id"],),
                 )
         await conn.commit()
 
+    if strategy and ("industry_id" not in strategy or "industry_name" not in strategy):
+        return {
+            "status": "standdown",
+            "message": "Standdown enforced for unassigned day: no runnable scheduler target.",
+        }
+
     if not strategy:
         return {"status": "idle", "message": "No active targets configured."}
 
     vendor_isolation_matrix = await load_vendor_isolation_matrix(app.state.db_pool)
-    send_telegram_broadcast(
-        f"Manual cycle override for `{strategy['industry_name']}` triggered.",
-        "orchestration",
+    emit_executive_notification(
+        ExecutiveNotificationEvent(
+            source_agent="helix",
+            event_type="manual_command_ack",
+            severity="info",
+            headline="Manual Orchestration Cycle Triggered",
+            outcome=f"Pipeline initiated for {strategy['industry_name']}.",
+            impact=f"Region: {strategy.get('target_region') or 'Global'}",
+            next_action="Track next completion milestone in the Helix dashboard.",
+        )
     )
 
     background_tasks.add_task(

@@ -4,7 +4,11 @@ import random
 import asyncio
 import httpx
 from typing import Any
-from services.telemetry import send_telegram_broadcast
+from services.telemetry import (
+    send_telegram_broadcast,
+    ExecutiveNotificationEvent,
+    emit_executive_notification,
+)
 
 VENDOR_PHANTOMBUSTERS = "PhantomBusters"
 VENDOR_MYEMAILVERIFIER = "MyEmailVerifier"
@@ -67,9 +71,16 @@ async def mark_vendor_fail_closed(
         is_circuit_broken=True,
         credit_unit="MINUTES" if vendor_name == VENDOR_PHANTOMBUSTERS else "USD",
     )
-    send_telegram_broadcast(
-        f"🚨 [CIRCUIT BREAKER] {vendor_name} credit sync failed. Fail-closed isolation engaged. Reason: {failure_reason[:200]}",
-        "critical",
+    emit_executive_notification(
+        ExecutiveNotificationEvent(
+            source_agent=vendor_name.lower(),
+            event_type="vendor_circuit_breaker",
+            severity="critical",
+            headline="Vendor Circuit Breaker Engaged",
+            outcome=f"{vendor_name} was fail-closed due to sync failure.",
+            impact=f"Reason: {failure_reason[:200]}",
+            next_action="Restore vendor API/credits and rerun sync.",
+        )
     )
 
 
@@ -142,14 +153,27 @@ async def sync_phantombuster_credits(db_pool) -> None:
             )
 
             if was_circuit_broken and not is_circuit_broken:
-                send_telegram_broadcast(
-                    f"🔄 *INFRASTRUCTURE CIRCUIT HEALED*: PhantomBusters has recovered. Balance healthy at `{credits} MINUTES`.",
-                    "success",
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="phantombusters",
+                        event_type="vendor_circuit_breaker",
+                        severity="success",
+                        headline="PhantomBusters Circuit Recovered",
+                        outcome=f"Credits restored to {credits} minutes.",
+                        next_action="Radar scraping can resume normal operations.",
+                    )
                 )
             elif is_circuit_broken and not was_circuit_broken:
-                send_telegram_broadcast(
-                    f"🚨 [CIRCUIT BREAKER] PhantomBusters credits depleted (`{credits} MINUTES`). Downstream scraping queues isolated.",
-                    "critical",
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="phantombusters",
+                        event_type="vendor_circuit_breaker",
+                        severity="critical",
+                        headline="PhantomBusters Credits Depleted",
+                        outcome=f"Remaining balance reached {credits} minutes.",
+                        impact="Downstream scraping queues are isolated.",
+                        next_action="Replenish PhantomBusters capacity.",
+                    )
                 )
     except Exception as e:
         await mark_vendor_fail_closed(
@@ -214,14 +238,27 @@ async def sync_myemailverifier_credits(db_pool) -> None:
             )
 
             if was_circuit_broken and not is_circuit_broken:
-                send_telegram_broadcast(
-                    f"🔄 *INFRASTRUCTURE CIRCUIT HEALED*: MyEmailVerifier has recovered. Balance healthy at `{credits} CREDITS`.",
-                    "success",
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="myemailverifier",
+                        event_type="vendor_circuit_breaker",
+                        severity="success",
+                        headline="MyEmailVerifier Circuit Recovered",
+                        outcome=f"Credits restored to {credits}.",
+                        next_action="Outbound verification can resume.",
+                    )
                 )
             elif is_circuit_broken and not was_circuit_broken:
-                send_telegram_broadcast(
-                    f"🚨 [CIRCUIT BREAKER] MyEmailVerifier credits depleted (`{credits} CREDITS`). Outbound verification isolated.",
-                    "critical",
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="myemailverifier",
+                        event_type="vendor_circuit_breaker",
+                        severity="critical",
+                        headline="MyEmailVerifier Credits Depleted",
+                        outcome=f"Remaining balance reached {credits} credits.",
+                        impact="Outbound verification has been isolated.",
+                        next_action="Replenish MyEmailVerifier credits.",
+                    )
                 )
     except Exception as e:
         await mark_vendor_fail_closed(
@@ -234,17 +271,19 @@ async def sync_external_vendor_credits(db_pool):
     await sync_myemailverifier_credits(db_pool)
 
 
-async def credit_sync_scheduler_loop(db_pool, execution_constraints: dict | None = None) -> None:
+async def credit_sync_scheduler_loop(
+    db_pool, execution_constraints: dict | None = None
+) -> None:
     """Orchestrates periodic infrastructure sweeps to feed vendor matrix breakers."""
     from config.settings import should_helix_workers_operate
-    
+
     while True:
         try:
             # Check if execution is allowed before proceeding
             if not should_helix_workers_operate():
                 await asyncio.sleep(3600)  # Sleep 1 hour on unassigned days
                 continue
-            
+
             jitter_seconds = random.randint(
                 -CREDIT_SYNC_JITTER_SECONDS, CREDIT_SYNC_JITTER_SECONDS
             )
