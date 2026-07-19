@@ -48,11 +48,6 @@ from services.credit_sync import (
 # --- GLOBAL SCHEDULE ENFORCER CORE MUTATION ---
 import core.engine
 
-# Force weekend profiles to explicitly contain empty lists so the backlog
-# loop evaluates an empty set of pending agents.
-core.engine.DAILY_EXECUTION_ROUTERS[5] = []
-core.engine.DAILY_EXECUTION_ROUTERS[6] = []
-
 load_dotenv()
 
 app = FastAPI(title="Helix Strategic Orchestration Core API")
