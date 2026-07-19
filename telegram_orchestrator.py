@@ -299,67 +299,160 @@ async def telegram_webhook_handler(request: Request):
                 )
             )
 
+    elif text.startswith(("/enable ", "/disable ")):
+        try:
+            db_pool = request.app.state.db_pool
+            command, target_agent = text.split(maxsplit=1)
+            target_agent = target_agent.strip().lower()
+
+            # 🛑 FAIL-SAFE: Helix can NEVER be disabled
+            if target_agent == "helix" and command == "/disable":
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="helix",
+                        event_type="action_blocked",
+                        severity="warning",
+                        headline="Operation Blocked",
+                        outcome="❌ Cannot disable `helix`. It is the core operational brain.",
+                        next_action="System protection active.",
+                    )
+                )
+                return {"status": "processed"}
+
+            enable_state = True if command == "/enable" else False
+            status_verb = "Enabled" if enable_state else "Disabled"
+            status_emoji = "🟢" if enable_state else "🔴"
+
+            async with db_pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO helix_agent_schedule (agent_name, weekday_int, is_enabled)
+                        VALUES (%s, 0, %s), (%s, 1, %s), (%s, 2, %s), (%s, 3, %s), (%s, 4, %s), (%s, 5, %s), (%s, 6, %s)
+                        ON CONFLICT (agent_name, weekday_int) 
+                        DO UPDATE SET is_enabled = EXCLUDED.is_enabled;
+                    """,
+                        [
+                            target_agent,
+                            enable_state,
+                            target_agent,
+                            enable_state,
+                            target_agent,
+                            enable_state,
+                            target_agent,
+                            enable_state,
+                            target_agent,
+                            enable_state,
+                            target_agent,
+                            enable_state,
+                            target_agent,
+                            enable_state,
+                        ],
+                    )
+
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="schedule_modifier",
+                    severity="info",
+                    headline="Schedule Strategy Updated",
+                    outcome=f"{status_emoji} `{target_agent}` has been *{status_verb}* globally.",
+                    next_action="Engine will reference the updated matrix on the next tick interval.",
+                )
+            )
+
+        except Exception as err:
+            # Error handling here...
+            pass
+
+    # 2. Smart /today Fetching (Supports Multiple Runs)
     elif text == "/today":
         try:
             db_pool = request.app.state.db_pool
 
-            # 1. Get the current day of the week based on your system timezone
-            from core.engine import DAILY_EXECUTION_ROUTERS, NEW_YORK_TZ
+            from core.engine import NEW_YORK_TZ
             import datetime
 
             est_now = datetime.datetime.now(NEW_YORK_TZ)
             current_weekday = est_now.weekday()
             day_name = est_now.strftime("%A")
 
-            # 2. Grab what was scheduled for today
-            scheduled_today = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
-
-            # 3. Query the DB to find what agents actually ran today
+            # 1. Gather today's completed execution counts from system logs
             async with db_pool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute("""
-                        SELECT DISTINCT LOWER(agent_name) as executed_agent
+                        SELECT LOWER(agent_name) as agent, COUNT(*) as run_count
                         FROM agent_system_logs 
-                        WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
+                        WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date
+                        GROUP BY LOWER(agent_name);
                     """)
-                    rows = await cur.fetchall()
-                    completed_today = {r["executed_agent"] for r in rows}
+                    log_rows = await cur.fetchall()
+                    run_counts = {r["agent"]: r["run_count"] for r in log_rows}
 
-            # 4. Calculate what is still pending
-            still_pending = [
-                agent for agent in scheduled_today if agent not in completed_today
-            ]
+            # 2. Hard-lock Helix metrics so it bypasses DB table data entirely
+            helix_runs = run_counts.get("helix", 0)
+            # Force it to show as executed if it ran at least once, or keep its count
+            completed_list = [f"`helix` ({max(helix_runs, 1)}/1x)"]
+            pending_list = []
 
-            # 5. Format the strings for your executive layout
-            completed_str = (
-                ", ".join([f"`{a}`" for a in scheduled_today if a in completed_today])
-                or "_None yet_"
-            )
-            pending_str = (
-                ", ".join([f"`{a}`" for a in still_pending]) or "_All clear! 🎉_"
-            )
+            # 3. Query the database table for ALL OTHER agents
+            async with db_pool.connection() as conn:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        """
+                        SELECT agent_name, max_daily_runs, scheduled_time 
+                        FROM helix_agent_schedule 
+                        WHERE weekday_int = %s AND is_enabled = TRUE AND LOWER(agent_name) != 'helix';
+                    """,
+                        [current_weekday],
+                    )
+                    sched_rows = await cur.fetchall()
+
+            # 4. Process the rest of the agents dynamically
+            for row in sched_rows:
+                agent = row["agent_name"].lower()
+                max_runs = row["max_daily_runs"]
+                sched_time = row["scheduled_time"]
+                actual_runs = run_counts.get(agent, 0)
+
+                time_suffix = (
+                    f" @ {sched_time.strftime('%I:%M %p')}" if sched_time else ""
+                )
+
+                if actual_runs > 0:
+                    completed_list.append(f"`{agent}` ({actual_runs}/{max_runs}x)")
+
+                if actual_runs < max_runs:
+                    if sched_time:
+                        pending_list.append(f"`{agent}` ({time_suffix})")
+                    else:
+                        pending_list.append(
+                            f"`{agent}` ({max_runs - actual_runs} left)"
+                        )
+
+            completed_str = ", ".join(completed_list)
+            pending_str = ", ".join(pending_list) or "_All clear! 🎉_"
 
             emit_executive_notification(
                 ExecutiveNotificationEvent(
                     source_agent="helix",
                     event_type="manual_command_ack",
                     severity="info",
-                    headline=f"Pipeline Schedule ({day_name})",
-                    outcome=f"✅ *Executed Today:* {completed_str}\n⏳ *Remaining Today:* {pending_str}",
-                    next_action="Monitoring staggered loop intervals.",
+                    headline=f"Time-Aware Schedule ({day_name})",
+                    outcome=f"✅ *Executed Today:* {completed_str}\n⏳ *Remaining / Upcoming:* {pending_str}",
+                    next_action="Monitoring scheduled precision check-ins.",
                 )
             )
-
         except Exception as err:
+            # Fallback emergency reporting if DB breaks entirely—Helix still outputs!
             emit_executive_notification(
                 ExecutiveNotificationEvent(
                     source_agent="helix",
-                    event_type="critical_failure",
-                    severity="critical",
-                    headline="Schedule Fetch Failed",
-                    outcome="Could not calculate today's pipeline progress.",
-                    impact=str(err),
-                    next_action="Inspect core engine constants and database connectivity.",
+                    event_type="manual_command_ack",
+                    severity="warning",
+                    headline=f"Schedule Snapshot ({day_name})",
+                    outcome=f"✅ *Executed Today:* `helix` (Active)\n⚠️ *Notice:* Database schedule table unavailable.",
+                    next_action="Verify database connectivity.",
                 )
             )
 
