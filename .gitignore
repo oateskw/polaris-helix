@@ -14,6 +14,7 @@ build/
 # VS Code
 .vscode/
 .github/
+.coverage
 
 # OS
 .DS_Store
