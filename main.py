@@ -4,6 +4,7 @@ import hmac
 import datetime
 import asyncio
 import psycopg
+import json
 from typing import List, Optional, Literal
 from contextlib import asynccontextmanager, suppress
 
@@ -347,6 +348,23 @@ async def update_lead_status(
 @app.post("/api/v1/logs")
 async def ingest_log(payload: LogIngestSchema):
     try:
+        # Convert Pydantic metadata model to a clean, JSON-serializable dict
+        clean_metadata = None
+        if payload.metadata:
+            if hasattr(payload.metadata, "model_dump"):  # Pydantic v2
+                clean_metadata = payload.metadata.model_dump()
+            elif hasattr(payload.metadata, "dict"):  # Pydantic v1
+                clean_metadata = payload.metadata.dict()
+            elif isinstance(payload.metadata, dict):
+                clean_metadata = payload.metadata
+            else:
+                try:
+                    clean_metadata = json.loads(
+                        json.dumps(payload.metadata, default=str)
+                    )
+                except Exception:
+                    clean_metadata = {"raw_fallback": str(payload.metadata)}
+
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -355,7 +373,7 @@ async def ingest_log(payload: LogIngestSchema):
                         payload.agent_name,
                         payload.log_level,
                         payload.message,
-                        Jsonb(payload.metadata) if payload.metadata else None,
+                        Jsonb(clean_metadata) if clean_metadata else None,
                     ),
                 )
                 row = await cur.fetchone()
@@ -364,6 +382,7 @@ async def ingest_log(payload: LogIngestSchema):
         if not row:
             raise Exception("No ID returned from log insertion.")
 
+        # Fire off the background task with the completely sanitized, serializable metadata
         asyncio.create_task(
             analyze_and_orchestrate_log(
                 app.state.db_pool,
@@ -372,7 +391,7 @@ async def ingest_log(payload: LogIngestSchema):
                 payload.agent_name,
                 payload.log_level,
                 payload.message,
-                payload.metadata,
+                clean_metadata,  # <--- Clean dictionary prevents downstream 500s
             )
         )
         return {"status": "success", "logged_id": row[0]}
