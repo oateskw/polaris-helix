@@ -53,19 +53,20 @@ async def perpetual_awareness_loop(app_instance):
             current_time = est_now.time()
             current_date_str = est_now.strftime("%Y-%m-%d")
 
-            # =====================================================================
-            # 🌟 1. TRIGGER BEACON & DEPENDENT NEXUS OUT-OF-BAND (DB TIME-AWARE ENGINE)
-            # =====================================================================
-            # We fetch any enabled agent that has a precision scheduled_time set for today
+            # OPEN ONE CONNECTION CONTEXT FOR THE ENTIRE TICK'S READ OPERATIONS
             async with db_pool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cur:
+
+                    # =====================================================================
+                    # 🌟 1. TRIGGER BEACON & DEPENDENT NEXUS OUT-OF-BAND
+                    # =====================================================================
                     await cur.execute(
                         """
                         SELECT agent_name, scheduled_time 
                         FROM helix_agent_schedule 
                         WHERE weekday_int = %s AND is_enabled = TRUE 
                         AND scheduled_time IS NOT NULL AND LOWER(agent_name) != 'helix';
-                    """,
+                        """,
                         [current_weekday],
                     )
                     time_locked_agents = await cur.fetchall()

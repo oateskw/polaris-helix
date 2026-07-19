@@ -38,8 +38,8 @@ def create_async_db_pool() -> AsyncConnectionPool:
         open=False,  # We call await pool.open() in lifespan startup
         check=AsyncConnectionPool.check_connection,
         max_idle=270.0,
-        min_size=1,
-        max_size=10,
+        min_size=2,
+        max_size=20,
         timeout=30.0,
         max_lifetime=1800.0,
         num_workers=3,
