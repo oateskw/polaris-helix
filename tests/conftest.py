@@ -2,12 +2,14 @@ import os
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 TEST_AUTH_TOKEN = "helix_super_secure_test_token"
 TEST_VANGUARD_KEY = "test_vanguard_key"
+TEST_EXECUTION_DAYS = "1,3,5"  # Default test execution schedule
 
 
 class AsyncContextManagerMock:
@@ -89,6 +91,7 @@ def auth_env(monkeypatch):
     monkeypatch.setenv("HELIX_AUTH_TOKEN", TEST_AUTH_TOKEN)
     monkeypatch.setenv("VANGUARD_API_KEY", TEST_VANGUARD_KEY)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    monkeypatch.setenv("EXECUTION_DAYS", TEST_EXECUTION_DAYS)
 
 
 @pytest.fixture
@@ -133,3 +136,30 @@ async def app_client(app_module):
         base_url="http://test",
     ) as client:
         yield client
+
+
+@pytest.fixture
+def mock_scheduler_standdown():
+    """Mock for testing scheduler standdown behavior on unassigned days."""
+    mock = AsyncMock()
+    mock.should_execute_today = AsyncMock(return_value=False)
+    mock.standdown_workers = AsyncMock()
+    return mock
+
+
+@pytest.fixture
+def execution_day_override(monkeypatch):
+    """Factory fixture to override execution days for specific tests."""
+    def _set_days(days: str):
+        monkeypatch.setenv("EXECUTION_DAYS", days)
+    return _set_days
+
+
+@pytest.fixture
+def mock_perpetual_loop_control():
+    """Mock for controlling perpetual awareness loop execution in tests."""
+    mock = AsyncMock()
+    mock.is_execution_day = AsyncMock(return_value=True)
+    mock.halt_loop = AsyncMock()
+    mock.resume_loop = AsyncMock()
+    return mock

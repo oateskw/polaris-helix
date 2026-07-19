@@ -57,10 +57,17 @@ CREATE TABLE IF NOT EXISTS helix_brain_scheduler (
     is_active              BOOLEAN          DEFAULT TRUE,
     last_targeted_at       TIMESTAMP        DEFAULT NULL,
     priority_score         INT              DEFAULT 1,
-    minimum_cooldown_hours INT              DEFAULT 24
+    minimum_cooldown_hours INT              DEFAULT 24,
+    assigned_days          INT[]            DEFAULT ARRAY[]::INT[],
+    CONSTRAINT valid_assigned_days CHECK (
+        assigned_days <@ ARRAY[0,1,2,3,4,5,6] AND
+        array_length(assigned_days, 1) IS NULL OR array_length(assigned_days, 1) <= 7
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_hbs_last_targeted ON helix_brain_scheduler (last_targeted_at);
+CREATE INDEX IF NOT EXISTS idx_hbs_assigned_days ON helix_brain_scheduler USING GIN (assigned_days);
+CREATE INDEX IF NOT EXISTS idx_hbs_active_industries ON helix_brain_scheduler (is_active, industry_id) WHERE is_active = TRUE;
 
 CREATE TABLE IF NOT EXISTS helix_infrastructure_oracle_ledger (
     vendor_name       VARCHAR(50)    PRIMARY KEY,

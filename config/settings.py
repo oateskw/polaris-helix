@@ -1,10 +1,36 @@
 import os
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+from datetime import datetime, time
+from typing import Final
 
 load_dotenv()
 
-NEW_YORK_TZ = ZoneInfo("America/New_York")
+NEW_YORK_TZ: Final[ZoneInfo] = ZoneInfo("America/New_York")
+
+# Scheduling Constraints - Worker agents stand down on unassigned days
+HELIX_ACTIVE_DAYS: Final[frozenset[int]] = frozenset({0, 1, 2, 3, 4})  # Monday-Friday
+HELIX_STANDBY_DAYS: Final[frozenset[int]] = frozenset({5, 6})  # Saturday-Sunday
+HELIX_ACTIVE_HOURS_START: Final[time] = time(6, 0)  # 6:00 AM ET
+HELIX_ACTIVE_HOURS_END: Final[time] = time(22, 0)  # 10:00 PM ET
+
+
+def is_helix_active_day(dt: datetime | None = None) -> bool:
+    """Check if current day is an active operational day for Helix workers."""
+    check_time = dt if dt else datetime.now(NEW_YORK_TZ)
+    return check_time.weekday() in HELIX_ACTIVE_DAYS
+
+
+def is_helix_active_hours(dt: datetime | None = None) -> bool:
+    """Check if current time falls within active operational hours."""
+    check_time = dt if dt else datetime.now(NEW_YORK_TZ)
+    current_time = check_time.time()
+    return HELIX_ACTIVE_HOURS_START <= current_time <= HELIX_ACTIVE_HOURS_END
+
+
+def should_helix_workers_operate(dt: datetime | None = None) -> bool:
+    """Determine if worker agents should be active based on schedule constraints."""
+    return is_helix_active_day(dt) and is_helix_active_hours(dt)
 
 MOLTSET_ALLOWED_CATEGORIES = [
     "Information Technology",
@@ -65,5 +91,9 @@ PHANTOMBUSTER_KEYWORD_STAIRCASE = [25, 12, 8, 5]
 PHANTOMBUSTER_ZERO_RESULT_THRESHOLD = 2
 PHANTOMBUSTER_TUNING_COOLDOWN_MINUTES = 60
 
-CREDIT_SYNC_INTERVAL_SECONDS = 8 * 60 * 60
-CREDIT_SYNC_JITTER_SECONDS = 10 * 60
+CREDIT_SYNC_INTERVAL_SECONDS: Final[int] = 8 * 60 * 60
+CREDIT_SYNC_JITTER_SECONDS: Final[int] = 10 * 60
+
+# Worker Standdown Configuration
+WORKER_STANDDOWN_CHECK_INTERVAL_SECONDS: Final[int] = 5 * 60  # Check every 5 minutes
+WORKER_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: Final[int] = 30

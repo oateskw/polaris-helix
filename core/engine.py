@@ -178,6 +178,16 @@ async def perpetual_awareness_loop(app_instance):
             ) >= datetime.timedelta(minutes=45):
                 scheduled_agents_list = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
 
+                if not scheduled_agents_list:
+                    await write_helix_command_center_log(
+                        db_pool,
+                        "INFO",
+                        f"No agents scheduled for weekday {current_weekday}. Standing down.",
+                        "ORCHESTRATOR_STANDDOWN",
+                    )
+                    await asyncio.sleep(60)
+                    continue
+
                 if scheduled_agents_list:
                     async with db_pool.connection() as conn:
                         async with conn.cursor(row_factory=dict_row) as cur:
@@ -206,6 +216,17 @@ async def perpetual_awareness_loop(app_instance):
                                 """)
                                 if (await retry_cur.fetchone())[0] > 0:
                                     pending_agents_for_today.append("nova")
+
+                    if not pending_agents_for_today:
+                        await write_helix_command_center_log(
+                            db_pool,
+                            "INFO",
+                            f"All scheduled agents for weekday {current_weekday} have completed execution. Standing down.",
+                            "ORCHESTRATOR_COMPLETE",
+                        )
+                        last_standard_drip_at = now_utc
+                        await asyncio.sleep(60)
+                        continue
 
                     if pending_agents_for_today:
                         vendor_isolation_matrix = await load_vendor_isolation_matrix(

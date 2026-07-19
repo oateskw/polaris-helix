@@ -48,8 +48,8 @@ import core.engine
 
 # Force weekend profiles to explicitly contain empty lists so the backlog
 # loop evaluates an empty set of pending agents.
-core.engine.DAILY_EXECUTION_ROUTERS[5] = ["nexus", "radar"]
-core.engine.DAILY_EXECUTION_ROUTERS[6] = ["nexus", "radar"]
+core.engine.DAILY_EXECUTION_ROUTERS[5] = []
+core.engine.DAILY_EXECUTION_ROUTERS[6] = []
 
 load_dotenv()
 
@@ -69,32 +69,33 @@ async def lifespan(app: FastAPI):
     await app.state.db_pool.open(wait=True)
     await sync_external_vendor_credits(app.state.db_pool)
 
-    # Background Tasks
+    # Background Tasks - Ensure perpetual_awareness_loop respects DAILY_EXECUTION_ROUTERS
     app.state.awareness_task = asyncio.create_task(perpetual_awareness_loop(app))
     app.state.credit_sync_task = asyncio.create_task(
         credit_sync_scheduler_loop(app.state.db_pool)
     )
-    # New: Add the intelligent prompt tuning loop directly into the app state
     app.state.optimizer_task = asyncio.create_task(
         reactive_optimizer_loop(app.state.db_pool)
     )
 
     send_telegram_broadcast(
-        "🚀 *Helix Orchestrator Booted successfully with Autonomous Self-Healing Optimizer!*",
+        "🚀 *Helix Orchestrator Booted with Global Scheduling Leak Refactor Complete!*",
         "success",
     )
     yield
 
-    # Clean teardown
-    app.state.awareness_task.cancel()
-    app.state.credit_sync_task.cancel()
-    app.state.optimizer_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await app.state.awareness_task
-    with suppress(asyncio.CancelledError):
-        await app.state.credit_sync_task
-    with suppress(asyncio.CancelledError):
-        await app.state.optimizer_task
+    # Clean teardown with explicit cancellation order
+    tasks_to_cancel = [
+        app.state.awareness_task,
+        app.state.credit_sync_task,
+        app.state.optimizer_task,
+    ]
+    
+    for task in tasks_to_cancel:
+        if task and not task.done():
+            task.cancel()
+    
+    await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
     await app.state.db_pool.close()
 
 
