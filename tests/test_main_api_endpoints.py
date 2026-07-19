@@ -296,3 +296,29 @@ async def test_run_cycle_idle_and_active(
     assert active.json()["status"] == "orchestration_cycle_pushed"
     assert connection.commit_calls >= 1
     assert len(cursors[0].executed) >= 2
+
+
+async def test_run_cycle_unassigned_day_blocks_execution(
+    app_module, app_client, db_pool_factory, monkeypatch
+):
+    """Verify orchestrator refuses to run cycles on unassigned days"""
+    schedule_row = HybridMockRow(
+        {
+            "id": 1,
+            "day_of_week": "unassigned",
+            "assigned_agent": None,
+            "is_active": False,
+            "created_at": datetime.datetime(2026, 1, 1, 0, 0, 0),
+        }
+    )
+    pool, _, cursors = db_pool_factory(fetchone_sequence=[schedule_row, None])
+    app_module.app.state.db_pool = pool
+
+    response = await app_client.post(
+        "/api/v1/orchestrator/run-cycle",
+        headers={"X-Helix-Auth-Token": TEST_AUTH_TOKEN},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "standdown"
+    assert "unassigned day" in response.json()["message"].lower()

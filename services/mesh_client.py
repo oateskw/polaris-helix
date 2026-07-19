@@ -99,6 +99,17 @@ async def trigger_downstream_mesh_with_payload(
         write_helix_command_center_log,
     )
 
+    # SCHEDULING LEAK GUARD: Validate agent_list is non-empty before proceeding
+    if not agent_list:
+        await write_helix_command_center_log(
+            db_pool,
+            "INFO",
+            f"Mesh dispatch skipped for strategy '{strategy.get('industry_name', 'UNKNOWN')}': agent_list is empty (unassigned day).",
+            "SKIP_MESH_DISPATCH_EMPTY_AGENT_LIST",
+            strategy.get("industry_name", "UNKNOWN"),
+        )
+        return
+
     master_token = os.getenv("HELIX_AUTH_TOKEN", "")
 
     # 1. NEXUS OMNI-STRATEGIST (Enforced Dependency Barrier)
@@ -163,6 +174,13 @@ async def trigger_downstream_mesh_with_payload(
             send_telegram_broadcast(
                 "Skipping Lead Nova execution loop. Moltset circuit breaker is TRIPPED.",
                 "critical",
+            )
+            await write_helix_command_center_log(
+                db_pool,
+                "WARNING",
+                "Nova dispatch blocked by Moltset isolation matrix.",
+                "SKIP_NOVA_ISOLATION",
+                strategy["industry_name"],
             )
         else:
             url = os.getenv("NOVA_API_URL", "https://polaris-nova.onrender.com").rstrip(

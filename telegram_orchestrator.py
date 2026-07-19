@@ -1,6 +1,7 @@
 import os
 import asyncio
-import html
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Request, HTTPException
 from helix_optimizer import run_daily_prompt_optimization
 from services.telemetry import send_telegram_broadcast
@@ -9,6 +10,7 @@ router = APIRouter(prefix="/api/v1/telegram", tags=["telegram-control"])
 
 # Bind directly to your existing environment variable string
 TELEGRAM_ADMIN_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+EASTERN_TZ = ZoneInfo("America/New_York")
 
 
 @router.post("/webhook")

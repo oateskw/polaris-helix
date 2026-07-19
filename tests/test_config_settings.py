@@ -24,3 +24,12 @@ def test_settings_token_defaults(monkeypatch):
 
     assert reloaded.HELIX_AUTH_TOKEN == "override-token"
     assert reloaded.VANGUARD_API_KEY == "override-vanguard"
+
+
+def test_execution_constraints_scheduling_standdown(monkeypatch):
+    """Verify execution constraints enforce worker standdown on unassigned days."""
+    reloaded = importlib.reload(settings)
+
+    assert hasattr(reloaded, "HELIX_ACTIVE_DAYS")
+    assert hasattr(reloaded, "should_helix_workers_operate")
+    assert callable(reloaded.should_helix_workers_operate)

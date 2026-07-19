@@ -29,6 +29,8 @@ def create_async_db_pool() -> AsyncConnectionPool:
     """
     Configures and returns a high-performance AsyncConnectionPool for Helix.
     Using connection pooling prevents exhausting cloud limits on Render.
+    Enforces aggressive timeout and connection limits to prevent resource leaks
+    during worker standdown periods.
     """
     db_url = get_validated_database_url()
     return AsyncConnectionPool(
@@ -36,4 +38,9 @@ def create_async_db_pool() -> AsyncConnectionPool:
         open=False,  # We call await pool.open() in lifespan startup
         check=AsyncConnectionPool.check_connection,
         max_idle=270.0,
+        min_size=1,
+        max_size=10,
+        timeout=30.0,
+        max_lifetime=1800.0,
+        num_workers=3,
     )
