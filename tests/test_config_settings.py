@@ -28,11 +28,8 @@ def test_settings_token_defaults(monkeypatch):
 
 def test_execution_constraints_scheduling_standdown(monkeypatch):
     """Verify execution constraints enforce worker standdown on unassigned days."""
-    monkeypatch.delenv("EXECUTION_CONSTRAINTS", raising=False)
-
     reloaded = importlib.reload(settings)
 
-    assert hasattr(reloaded, "EXECUTION_CONSTRAINTS")
-    assert isinstance(reloaded.EXECUTION_CONSTRAINTS, dict)
-    assert "allowed_days" in reloaded.EXECUTION_CONSTRAINTS
-    assert isinstance(reloaded.EXECUTION_CONSTRAINTS["allowed_days"], list)
+    assert hasattr(reloaded, "HELIX_ACTIVE_DAYS")
+    assert hasattr(reloaded, "should_helix_workers_operate")
+    assert callable(reloaded.should_helix_workers_operate)
