@@ -299,4 +299,68 @@ async def telegram_webhook_handler(request: Request):
                 )
             )
 
+    elif text == "/today":
+        try:
+            db_pool = request.app.state.db_pool
+
+            # 1. Get the current day of the week based on your system timezone
+            from core.engine import DAILY_EXECUTION_ROUTERS, NEW_YORK_TZ
+            import datetime
+
+            est_now = datetime.datetime.now(NEW_YORK_TZ)
+            current_weekday = est_now.weekday()
+            day_name = est_now.strftime("%A")
+
+            # 2. Grab what was scheduled for today
+            scheduled_today = DAILY_EXECUTION_ROUTERS.get(current_weekday, [])
+
+            # 3. Query the DB to find what agents actually ran today
+            async with db_pool.connection() as conn:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute("""
+                        SELECT DISTINCT LOWER(agent_name) as executed_agent
+                        FROM agent_system_logs 
+                        WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
+                    """)
+                    rows = await cur.fetchall()
+                    completed_today = {r["executed_agent"] for r in rows}
+
+            # 4. Calculate what is still pending
+            still_pending = [
+                agent for agent in scheduled_today if agent not in completed_today
+            ]
+
+            # 5. Format the strings for your executive layout
+            completed_str = (
+                ", ".join([f"`{a}`" for a in scheduled_today if a in completed_today])
+                or "_None yet_"
+            )
+            pending_str = (
+                ", ".join([f"`{a}`" for a in still_pending]) or "_All clear! 🎉_"
+            )
+
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="manual_command_ack",
+                    severity="info",
+                    headline=f"Pipeline Schedule ({day_name})",
+                    outcome=f"✅ *Executed Today:* {completed_str}\n⏳ *Remaining Today:* {pending_str}",
+                    next_action="Monitoring staggered loop intervals.",
+                )
+            )
+
+        except Exception as err:
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="critical_failure",
+                    severity="critical",
+                    headline="Schedule Fetch Failed",
+                    outcome="Could not calculate today's pipeline progress.",
+                    impact=str(err),
+                    next_action="Inspect core engine constants and database connectivity.",
+                )
+            )
+
     return {"status": "processed"}
