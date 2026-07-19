@@ -236,12 +236,12 @@ async def sync_external_vendor_credits(db_pool):
 
 async def credit_sync_scheduler_loop(db_pool, execution_constraints: dict | None = None) -> None:
     """Orchestrates periodic infrastructure sweeps to feed vendor matrix breakers."""
-    from config.settings import is_execution_allowed_today
+    from config.settings import should_helix_workers_operate
     
     while True:
         try:
             # Check if execution is allowed before proceeding
-            if execution_constraints and not is_execution_allowed_today(execution_constraints):
+            if not should_helix_workers_operate():
                 await asyncio.sleep(3600)  # Sleep 1 hour on unassigned days
                 continue
             
