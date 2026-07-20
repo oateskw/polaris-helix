@@ -377,6 +377,17 @@ async def telegram_webhook_handler(request: Request):
             current_weekday = est_now.weekday()
             day_name = est_now.strftime("%A")
 
+            # Dedicated emoji mapping based on infrastructure layout
+            EMOJI_MATRIX = {
+                "helix": "⚙️",
+                "nova": "🚀",
+                "pulsar": "📡",
+                "radar": "🎯",
+                "vanguard": "🛡️",
+                "nexus": "🧠",
+                "beacon": "🚨",
+            }
+
             # 1. Gather today's completed execution counts from system logs
             async with db_pool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cur:
@@ -391,9 +402,10 @@ async def telegram_webhook_handler(request: Request):
 
             # 2. Hard-lock Helix metrics so it bypasses DB table data entirely
             helix_runs = run_counts.get("helix", 0)
-            # Force it to show as executed if it ran at least once, or keep its count
-            completed_list = [f"`helix` ({max(helix_runs, 1)}/1x)"]
-            pending_list = []
+            completed_lines = [
+                f"  {EMOJI_MATRIX.get('helix', '⚙️')} *helix:* {max(helix_runs, 1)} / 1x runs"
+            ]
+            pending_lines = []
 
             # 3. Query the database table for ALL OTHER agents
             async with db_pool.connection() as conn:
@@ -408,30 +420,37 @@ async def telegram_webhook_handler(request: Request):
                     )
                     sched_rows = await cur.fetchall()
 
-            # 4. Process the rest of the agents dynamically
+            # 4. Process the rest of the agents dynamically into separate lines
             for row in sched_rows:
                 agent = row["agent_name"].lower()
                 max_runs = row["max_daily_runs"]
                 sched_time = row["scheduled_time"]
                 actual_runs = run_counts.get(agent, 0)
+                emoji = EMOJI_MATRIX.get(agent, "🤖")
 
                 time_suffix = (
                     f" @ {sched_time.strftime('%I:%M %p')}" if sched_time else ""
                 )
 
                 if actual_runs > 0:
-                    completed_list.append(f"`{agent}` ({actual_runs}/{max_runs}x)")
+                    completed_lines.append(
+                        f"  {emoji} *{agent}:* {actual_runs} / {max_runs}x runs"
+                    )
 
                 if actual_runs < max_runs:
                     if sched_time:
-                        pending_list.append(f"`{agent}` ({time_suffix})")
+                        pending_lines.append(f"  ⏳ *{agent}* ({time_suffix})")
                     else:
-                        pending_list.append(
-                            f"`{agent}` ({max_runs - actual_runs} left)"
+                        pending_lines.append(
+                            f"  ⏳ *{agent}* ({max_runs - actual_runs} left)"
                         )
 
-            completed_str = ", ".join(completed_list)
-            pending_str = ", ".join(pending_list) or "_All clear! 🎉_"
+            completed_str = "\n" + "\n".join(completed_lines)
+            pending_str = (
+                ("\n" + "\n".join(pending_lines))
+                if pending_lines
+                else "\n  _All clear! 🎉_"
+            )
 
             emit_executive_notification(
                 ExecutiveNotificationEvent(
@@ -439,19 +458,19 @@ async def telegram_webhook_handler(request: Request):
                     event_type="manual_command_ack",
                     severity="info",
                     headline=f"Time-Aware Schedule ({day_name})",
-                    outcome=f"✅ *Executed Today:* {completed_str}\n⏳ *Remaining / Upcoming:* {pending_str}",
+                    outcome=f"✅ *Executed Today:*{completed_str}\n⏳ *Remaining / Upcoming:*{pending_str}",
                     next_action="Monitoring scheduled precision check-ins.",
                 )
             )
         except Exception as err:
-            # Fallback emergency reporting if DB breaks entirely—Helix still outputs!
+            # Fallback emergency reporting if DB breaks entirely
             emit_executive_notification(
                 ExecutiveNotificationEvent(
                     source_agent="helix",
                     event_type="manual_command_ack",
                     severity="warning",
                     headline=f"Schedule Snapshot ({day_name})",
-                    outcome=f"✅ *Executed Today:* `helix` (Active)\n⚠️ *Notice:* Database schedule table unavailable.",
+                    outcome="✅ *Executed Today:*\n  ⚙️ *helix:* Active\n⚠️ *Notice:* Database schedule table unavailable.",
                     next_action="Verify database connectivity.",
                 )
             )

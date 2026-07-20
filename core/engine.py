@@ -188,23 +188,44 @@ async def perpetual_awareness_loop(app_instance):
                         break
 
             if should_trigger_beacon:
-                # 🛡️ 1a. Pull precise execution histories for today from the central ledger
+                # 🛡️ 1a. Pull recent safety locks to prevent tight concurrent firing loops
                 async with db_pool.connection() as conn:
                     async with conn.cursor() as cur:
                         await cur.execute("""
-                            SELECT 
-                                COUNT(CASE WHEN agent_name = 'nexus' AND message LIKE '%%SUCCESS%%' THEN 1 END) as nexus_runs,
-                                COUNT(CASE WHEN agent_name = 'beacon' AND (message LIKE '%%completed%%' OR execution_status = 'SUCCESS') THEN 1 END) as beacon_runs,
-                                COUNT(CASE WHEN agent_name = 'beacon' AND timestamp >= NOW() - INTERVAL '45 minutes' THEN 1 END) as recent_safety_lock
+                            SELECT COUNT(*) 
                             FROM agent_system_logs 
-                            WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
+                            WHERE agent_name = 'beacon' 
+                              AND timestamp >= NOW() - INTERVAL '45 minutes';
                         """)
-                        row = await cur.fetchone()
-                        nexus_runs = row[0] if row else 0
-                        beacon_runs = row[1] if row else 0
-                        recent_safety_lock = row[2] if row else 0
+                        recent_safety_lock = (await cur.fetchone())[0]
 
                 if recent_safety_lock == 0:
+                    # 🔍 1b. Inspect the absolute latest record in beacon_history to check the directive state
+                    nexus_directive_needs_charging = True
+
+                    try:
+                        async with db_pool.connection() as conn:
+                            async with conn.cursor(row_factory=dict_row) as cur:
+                                await cur.execute("""
+                                    SELECT nexus_directive 
+                                    FROM beacon_history 
+                                    ORDER BY id DESC 
+                                    LIMIT 1;
+                                """)
+                                last_beacon_record = await cur.fetchone()
+
+                                # If a record exists and it has a valid directive, we are clear to run Beacon!
+                                if (
+                                    last_beacon_record
+                                    and last_beacon_record.get("nexus_directive")
+                                    is not None
+                                ):
+                                    nexus_directive_needs_charging = False
+                    except Exception as db_err:
+                        print(f"⚠️ Failed to inspect beacon_history ledger: {db_err}")
+                        # Defensive: If table check fails, default to running Nexus for safety
+
+                    # 🧠 1c. Fetch the active strategy vector
                     async with db_pool.connection() as conn:
                         async with conn.cursor(row_factory=dict_row) as cur:
                             await cur.execute("""
@@ -220,17 +241,16 @@ async def perpetual_awareness_loop(app_instance):
                             db_pool
                         )
 
-                        if nexus_runs == 0 or (
-                            beacon_runs >= 1 and nexus_runs <= beacon_runs
-                        ):
+                        # 🚨 THE RECHARGE INTERCEPTOR: If directive is missing/NULL, force Nexus first!
+                        if nexus_directive_needs_charging:
                             emit_executive_notification(
                                 ExecutiveNotificationEvent(
                                     source_agent="helix",
                                     event_type="pipeline_milestone",
                                     severity="info",
-                                    headline="Nexus Gate Engaged",
-                                    outcome=f"Nexus prioritized before Beacon for {active_strategy['industry_name']}.",
-                                    next_action="Await Nexus completion before Beacon deployment.",
+                                    headline="Nexus Interceptor Engaged",
+                                    outcome=f"Latest beacon_history row has a NULL directive. Forcing Nexus to charge target strategy.",
+                                    next_action="Deploying Nexus out-of-band ahead of Beacon.",
                                 )
                             )
 
@@ -245,6 +265,7 @@ async def perpetual_awareness_loop(app_instance):
                             await asyncio.sleep(60)
                             continue
 
+                        # ✅ CLEAR ROADWAY: Directive is active, fire Beacon directly
                         else:
                             emit_executive_notification(
                                 ExecutiveNotificationEvent(
@@ -252,9 +273,8 @@ async def perpetual_awareness_loop(app_instance):
                                     event_type="pipeline_milestone",
                                     severity="success",
                                     headline="Beacon Deployment Cleared",
-                                    outcome=f"Nexus gate passed; Beacon dispatched for {active_strategy['industry_name']}.",
-                                    impact=f"Nexus runs: {nexus_runs}, Beacon runs: {beacon_runs}",
-                                    next_action="Monitor Beacon output quality and completion logs.",
+                                    outcome=f"Valid nexus_directive verified in history. Dispatched Beacon for {active_strategy['industry_name']}.",
+                                    next_action="Monitor Beacon execution payload structures.",
                                 )
                             )
 
