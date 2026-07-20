@@ -16,28 +16,52 @@ from helix_optimizer import run_daily_prompt_optimization
 NEW_YORK_TZ = ZoneInfo("America/New_York")
 VENDOR_MYEMAILVERIFIER = "MyEmailVerifier"
 VENDOR_PHANTOMBUSTERS = "PhantomBusters"
-VENDOR_MOLTSET = "Moltset"
+VENDOR_MOLTSET = "MoltSet"
 VENDOR_ANTHROPIC = "Anthropic"
-
-# ❌ REMOVED: HARDCODED DAILY_EXECUTION_ROUTERS DICTIONARY
-# ❌ REMOVED: HARDCODED PUBLER_BEACON_SCHEDULE DICTIONARY
 
 
 async def load_vendor_isolation_matrix(db_pool) -> dict:
+    """
+    Loads the infrastructure ledger and evaluates circuit status.
+    Forces MoltSet isolation to apply to Nova if the break occurred today.
+    """
     vendor_isolation_matrix = {}
+    today_date = datetime.datetime.now(NEW_YORK_TZ).date()
+
     try:
         async with db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
+                # 🌟 Added last_updated_at to selection criteria
                 await cur.execute(
-                    "SELECT vendor_name, is_circuit_broken FROM helix_infrastructure_oracle_ledger;"
+                    "SELECT vendor_name, is_circuit_broken, last_updated_at FROM helix_infrastructure_oracle_ledger;"
                 )
                 rows = await cur.fetchall()
+
                 for row in rows:
-                    vendor_isolation_matrix[row["vendor_name"]] = bool(
-                        row["is_circuit_broken"]
+                    v_name = row["vendor_name"]
+                    is_broken = bool(row["is_circuit_broken"])
+
+                    # Core Requirement: Check if the timestamp matches today's date
+                    last_updated_date = (
+                        row["last_updated_at"].date()
+                        if row["last_updated_at"]
+                        else None
                     )
+                    is_updated_today = last_updated_date == today_date
+
+                    # Bind rule: If it's MoltSet, evaluate both the broken status AND the date rule
+                    if v_name.lower() == "moltset":
+                        if is_broken and is_updated_today:
+                            vendor_isolation_matrix[v_name] = True
+                        else:
+                            vendor_isolation_matrix[v_name] = False
+                    else:
+                        # Standard handling for other legacy systems
+                        vendor_isolation_matrix[v_name] = is_broken
+
     except Exception as exc:
         print(f"⚠️ Vendor isolation matrix load failed inside engine loop: {exc}")
+
     return vendor_isolation_matrix
 
 
