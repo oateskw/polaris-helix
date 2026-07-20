@@ -414,3 +414,42 @@ async def trigger_downstream_mesh_with_payload(
             send_telegram_broadcast(
                 "Vanguard outbound campaign sweep initiated successfully.", "verbose"
             )
+
+    # =====================================================================
+    # ⚡ 7. AURA AUTOMATED VIDEO & MEDIA ENGINE
+    # =====================================================================
+    if "aura" in agent_list:
+        url = os.getenv("AURA_API_URL", "https://polaris-aura.onrender.com").rstrip("/")
+        await write_helix_command_center_log(
+            db_pool,
+            "INFO",
+            "Dispatching strategic campaign parameters down-mesh to Aura video engine.",
+            "DISPATCH_AURA_REQUEST",
+            strategy["industry_name"],
+        )
+
+        aura_payload = {
+            "notification_type": strategy.get("notification_type"),
+            "nexus_directive": strategy.get("nexus_directive"),
+        }
+
+        asyncio.create_task(
+            async_http_post_proxy(
+                f"{url}/api/v1/aura",
+                {
+                    "x-aura-secret": master_token,
+                    "Content-Type": "application/json",
+                },
+                aura_payload,
+            )
+        )
+        emit_executive_notification(
+            ExecutiveNotificationEvent(
+                source_agent="aura",
+                event_type="pipeline_milestone",
+                severity="success",
+                headline="Aura Dispatch Started",
+                outcome=f"Aura orchestration payload successfully dispatched for {strategy['industry_name']}.",
+                next_action="Awaiting automated compilation and media rendering metrics.",
+            )
+        )
