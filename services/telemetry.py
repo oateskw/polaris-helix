@@ -53,6 +53,29 @@ def get_new_york_now() -> datetime.datetime:
     return datetime.datetime.now(NEW_YORK_TZ)
 
 
+async def is_vendor_circuit_healthy(db_pool, vendor_name: str) -> bool:
+    """Checks the infrastructure ledger to see if a vendor's circuit is broken."""
+    try:
+        async with db_pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT is_circuit_broken 
+                    FROM helix_infrastructure_oracle_ledger 
+                    WHERE vendor_name = %s LIMIT 1;
+                    """,
+                    (vendor_name,),
+                )
+                record = await cur.fetchone()
+                # If no record exists, assume safe; if it exists, return the inverse of the trip flag
+                if record:
+                    return not record.get("is_circuit_broken", False)
+                return True
+    except Exception as e:
+        print(f"⚠️ Circuit ledger lookup failed for {vendor_name}: {e}")
+        return True  # Fallback to true so a DB hiccup doesn't paralyze the system
+
+
 # Telegram and Command Logging
 def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -253,8 +276,11 @@ async def send_executive_summary_from_logs(
             for r in rows[:40]  # Analyze the 40 most recent log milestones
         ]
 
-        # FIX 2: Check for AI Client availability, generate smart analysis
-        if ai_client:
+        # Check the global safety gate before proceeding with Claude
+        anthropic_healthy = await is_vendor_circuit_healthy(db_pool, "Anthropic")
+
+        # FIX 2: Check for AI Client availability AND circuit health
+        if ai_client and anthropic_healthy:
             prompt = (
                 f"You are the Helix Executive Analytics Engine. Analyze the following recent system logs "
                 f"from the last {lookback_minutes} minutes and provide an executive summary scorecard. "
@@ -273,7 +299,12 @@ async def send_executive_summary_from_logs(
 
             # Send via our broadcast engine directly
             send_telegram_broadcast(ai_summary, "orchestration")
-        else:
+        else:  # Fallback to structural metrics block if AI client isn't available or circuit is broken
+            if not anthropic_healthy:
+                print(
+                    "🛑 [CIRCUIT BREAKER] Anthropic is currently tripped in ledger. Routing to local metrics."
+                )
+
             # Fallback to structural metrics block if AI client isn't available
             summary_lines = []
             for agent in set(r["agent_name"] for r in rows):
