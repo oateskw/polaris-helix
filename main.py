@@ -39,6 +39,7 @@ from services.telemetry import (
     process_roi_attribution_boost,
     get_new_york_now,
     log_helix_state,
+    is_vendor_circuit_healthy,
 )
 from services.mesh_client import trigger_downstream_mesh_with_payload
 from services.credit_sync import (
@@ -457,7 +458,11 @@ async def rotate_scheduler_target(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     resolved_category = "Professional and Business Services"
-    if app.state.ai_client:
+
+    # 🆕 CIRCUIT CHECK: Verify Anthropic health state before asking Claude to map categories
+    anthropic_healthy = await is_vendor_circuit_healthy(app.state.db_pool, "Anthropic")
+
+    if app.state.ai_client and anthropic_healthy:
         resolved_category = run_deterministic_moltset_mapping(
             app.state.ai_client, payload.industry_name
         )

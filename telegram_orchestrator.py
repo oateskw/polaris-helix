@@ -10,6 +10,7 @@ from services.telemetry import (
     ExecutiveNotificationEvent,
     emit_executive_notification,
     send_executive_summary_from_logs,
+    is_vendor_circuit_healthy,
 )
 
 router = APIRouter(prefix="/api/v1/telegram", tags=["telegram-control"])
@@ -44,6 +45,22 @@ async def telegram_webhook_handler(request: Request):
 
     # 2. Command Processing Matrix
     if text == "/optimize":
+        # 🆕 PREEMPTIVE CHECK
+        db_pool = request.app.state.db_pool
+        if not await is_vendor_circuit_healthy(db_pool, "Anthropic"):
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="action_blocked",
+                    severity="warning",
+                    headline="Optimization Aborted",
+                    outcome="❌ Command rejected: Anthropic circuit breaker is TRIPPED in infrastructure ledger.",
+                    next_action="Replenish API wallet balance and reset circuit ledger record.",
+                )
+            )
+            return {"status": "processed"}
+        # 🆕 END PREEMPTIVE CHECK
+
         emit_executive_notification(
             ExecutiveNotificationEvent(
                 source_agent="helix",
@@ -135,6 +152,19 @@ async def telegram_webhook_handler(request: Request):
             )
 
     elif text == "/history":
+        # 🆕 PREEMPTIVE CHECK
+        db_pool = request.app.state.db_pool
+        if not await is_vendor_circuit_healthy(db_pool, "Anthropic"):
+            print(
+                "⚠️ Telegram requested /history while Claude is tripped. Forcing local metrics fallback."
+            )
+            # Explicitly clear ai_client to force structural text generation safely
+            await send_executive_summary_from_logs(
+                db_pool, lookback_minutes=180, ai_client=None
+            )
+            return {"status": "processed"}
+        # 🆕 END PREEMPTIVE CHECK
+
         try:
             db_pool = request.app.state.db_pool
             ai_client = request.app.state.ai_client
