@@ -264,7 +264,7 @@ async def send_executive_summary_from_logs(
             )
 
             response = ai_client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                model="claude-haiku-4-5",  # <-- Downgraded from 'claude-3-5-sonnet-20241022' to protect your budget
                 max_tokens=1000,
                 temperature=0.3,
                 messages=[{"role": "user", "content": prompt}],
