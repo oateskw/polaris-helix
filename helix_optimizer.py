@@ -1,8 +1,34 @@
-import asyncio  # 🆕 ADD THIS IMPORT HERE
+import asyncio
 import os
 import json
 import re
 from anthropic import AsyncAnthropic
+
+
+async def is_vendor_circuit_healthy(db_pool, vendor_name: str) -> bool:
+    """
+    🆕 Checks the infrastructure ledger to see if a vendor's circuit is broken.
+    Prevents hitting external APIs when they are flagged out of funds.
+    """
+    try:
+        async with db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT is_circuit_broken 
+                    FROM helix_infrastructure_oracle_ledger 
+                    WHERE vendor_name = %s LIMIT 1;
+                    """,
+                    (vendor_name,),
+                )
+                row = await cur.fetchone()
+                if row:
+                    # row[0] is the boolean `is_circuit_broken`
+                    return not row[0]
+                return True
+    except Exception as e:
+        print(f"⚠️ Circuit ledger lookup failed for {vendor_name}: {e}")
+        return True
 
 
 async def check_anomaly_threshold(db_pool, threshold=5) -> bool:
@@ -25,6 +51,14 @@ async def run_daily_prompt_optimization(db_pool, force=False):
     """
     Intelligent prompt-tuning engine driven by Claude 3.5.
     """
+    # 🆕 SAFETY CHECK FIRST: Protect our budget and avoid calling a broken API
+    anthropic_healthy = await is_vendor_circuit_healthy(db_pool, "Anthropic")
+    if not anthropic_healthy:
+        print(
+            "🛑 [OPTIMIZER] [CIRCUIT BREAKER ENGAGED] Anthropic is flagged as broken/depleted. Aborting optimization."
+        )
+        return
+
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
     if not anthropic_key:
         print("⚠️ [OPTIMIZER] ANTHROPIC_API_KEY missing. Skipping.")
@@ -38,6 +72,10 @@ async def run_daily_prompt_optimization(db_pool, force=False):
                 "⏭️ [OPTIMIZER] System logs are clean. Skipping optimization to save tokens."
             )
             return
+
+    # Dynamic model downgrade to Haiku to dramatically slash costs if forced or running
+    # This also reads your environment configuration dynamically
+    target_model = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
 
     ai_client = AsyncAnthropic(api_key=anthropic_key)
 
@@ -79,7 +117,7 @@ async def run_daily_prompt_optimization(db_pool, force=False):
     for agent_name, prompt_key, current_prompt in raw_prompts:
         try:
             response = await ai_client.messages.create(
-                model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
+                model=target_model,
                 max_tokens=2000,
                 temperature=0.1,
                 system=(
@@ -125,14 +163,16 @@ async def run_daily_prompt_optimization(db_pool, force=False):
 async def reactive_optimizer_loop(db_pool):
     """Continuous background loop monitoring system metrics natively."""
     from config.settings import should_helix_workers_operate
-    
+
     print("🧠 [INTELLIGENT OPTIMIZER] Event-driven loop initialized.")
     while True:
         try:
             if should_helix_workers_operate():
                 await run_daily_prompt_optimization(db_pool, force=False)
             else:
-                print("⏸️ [INTELLIGENT OPTIMIZER] Standby mode - unassigned day. Skipping optimization.")
+                print(
+                    "⏸️ [INTELLIGENT OPTIMIZER] Standby mode - unassigned day. Skipping optimization."
+                )
         except Exception as e:
             print(f"⚠️ [INTELLIGENT OPTIMIZER] Loop iteration error: {e}")
         await asyncio.sleep(3600)  # Check every hour
