@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import os
+import requests
 from zoneinfo import ZoneInfo
 from psycopg.rows import dict_row
 
@@ -18,6 +19,77 @@ VENDOR_MYEMAILVERIFIER = "MyEmailVerifier"
 VENDOR_PHANTOMBUSTERS = "PhantomBusters"
 VENDOR_MOLTSET = "MoltSet"
 VENDOR_ANTHROPIC = "Anthropic"
+
+
+async def check_and_heal_moltset_circuit(db_pool):
+    """
+    Actively checks the MoltSet usage endpoint to verify if the account's
+    weekly search quota has refilled, healing the circuit breaker automatically.
+    """
+    moltset_key = os.getenv("MOLTSET_API_KEY")
+    api_endpoint = os.getenv(
+        "MOLTSET_API_ENDPOINT", "https://api.moltsets.com/api/v1/tools/"
+    ).strip()
+
+    if not moltset_key:
+        return
+
+    url = f"{api_endpoint.rstrip('/')}/get_account"
+    headers = {
+        "Authorization": f"Bearer {moltset_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        # Perform out-of-band balance check synchronously or with a standard request block
+        # wrapped in an executor to avoid blocking the asyncio event loop
+        loop = asyncio.get_event_loop()
+        res = await loop.run_in_executor(
+            None, lambda: requests.post(url, headers=headers, timeout=12)
+        )
+
+        if res.status_code == 200:
+            data = res.json()
+
+            # Navigate the payload schema defensively
+            results = data.get("results", {}) or {}
+            fair_use = results.get("fair_use", {}) or {}
+            search_metrics = fair_use.get("search", {}) or {}
+            records_1w = search_metrics.get("records", {}).get("1w", {}) or {}
+
+            remaining = records_1w.get("remaining", 0)
+
+            # If the quota has naturally cleared and refilled, heal the ledger!
+            if remaining > 0:
+                async with db_pool.connection() as conn:
+                    # 🚀 Wrap this in a transaction context to auto-commit to the database
+                    async with conn.transaction():
+                        async with conn.cursor() as cur:
+                            await cur.execute("""
+                                UPDATE helix_infrastructure_oracle_ledger 
+                                SET is_circuit_broken = FALSE, 
+                                    last_updated_at = NOW() 
+                                WHERE LOWER(vendor_name) = 'moltset' AND is_circuit_broken = TRUE;
+                            """)
+                            rowcount = cur.rowcount
+
+                    # Move telemetry notifications outside the cursor block
+                    if rowcount > 0:
+                        print(
+                            "🌤️ Central Orchestrator: MoltSet weekly search quota has been verified. Circuit healed."
+                        )
+                        emit_executive_notification(
+                            ExecutiveNotificationEvent(
+                                source_agent="helix",
+                                event_type="pipeline_milestone",
+                                severity="success",
+                                headline="Circuit Breaker Healed Automatically",
+                                outcome="MoltSet usage metrics verified positive credit balances. Circuit state cleared.",
+                                next_action="Nova processing queue cleared for operational sweeps.",
+                            )
+                        )
+    except Exception as e:
+        print(f"⚠️ Circuit tracking verification failed against MoltSet portal: {e}")
 
 
 async def load_vendor_isolation_matrix(db_pool) -> dict:
@@ -72,6 +144,9 @@ async def perpetual_awareness_loop(app_instance):
 
     while True:
         try:
+            # 🚀 INSERT THIS LINE RIGHT HERE:
+            await check_and_heal_moltset_circuit(db_pool)
+
             est_now = datetime.datetime.now(NEW_YORK_TZ)
             current_weekday = est_now.weekday()
             current_time = est_now.time()
