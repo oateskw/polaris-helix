@@ -95,17 +95,15 @@ async def check_and_heal_moltset_circuit(db_pool):
 async def load_vendor_isolation_matrix(db_pool) -> dict:
     """
     Loads the infrastructure ledger and evaluates circuit status.
-    Forces MoltSet isolation to apply to Nova if the break occurred today.
+    Enforces vendor isolation whenever is_circuit_broken is True.
     """
     vendor_isolation_matrix = {}
-    today_date = datetime.datetime.now(NEW_YORK_TZ).date()
 
     try:
         async with db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                # 🌟 Added last_updated_at to selection criteria
                 await cur.execute(
-                    "SELECT vendor_name, is_circuit_broken, last_updated_at FROM helix_infrastructure_oracle_ledger;"
+                    "SELECT vendor_name, is_circuit_broken FROM helix_infrastructure_oracle_ledger;"
                 )
                 rows = await cur.fetchall()
 
@@ -113,26 +111,8 @@ async def load_vendor_isolation_matrix(db_pool) -> dict:
                     v_name = row["vendor_name"]
                     is_broken = bool(row["is_circuit_broken"])
 
-                    # Treat MoltSet like all other vendors: enforce isolation whenever is_circuit_broken is True
+                    # Strictly enforce circuit breaker state across all vendors
                     vendor_isolation_matrix[v_name] = is_broken
-
-                    # Core Requirement: Check if the timestamp matches today's date
-                    last_updated_date = (
-                        row["last_updated_at"].date()
-                        if row["last_updated_at"]
-                        else None
-                    )
-                    is_updated_today = last_updated_date == today_date
-
-                    # Bind rule: If it's MoltSet, evaluate both the broken status AND the date rule
-                    if v_name.lower() == "moltset":
-                        if is_broken and is_updated_today:
-                            vendor_isolation_matrix[v_name] = True
-                        else:
-                            vendor_isolation_matrix[v_name] = False
-                    else:
-                        # Standard handling for other legacy systems
-                        vendor_isolation_matrix[v_name] = is_broken
 
     except Exception as exc:
         print(f"⚠️ Vendor isolation matrix load failed inside engine loop: {exc}")
@@ -425,7 +405,7 @@ async def perpetual_awareness_loop(app_instance):
                             is_isolated = True
 
                         if is_isolated:
-                            # 1. Check if we have already reported and logged a run for this isolated agent today
+                            # 1. Check if this isolated agent has already been logged today
                             async with db_pool.connection() as conn:
                                 async with conn.cursor() as check_cur:
                                     await check_cur.execute(
@@ -441,37 +421,45 @@ async def perpetual_awareness_loop(app_instance):
                                     ] > 0
 
                             if not already_ran_today:
-                                # 2. First time hitting broken circuit today: Report it and record the run
                                 vendor_name = (
                                     VENDOR_MOLTSET
                                     if candidate_agent == "nova"
-                                    else "Vendor"
+                                    else "Vendor Dependency"
                                 )
 
+                                # 2. Send Telegram Notification (Once Per Day)
                                 emit_executive_notification(
                                     ExecutiveNotificationEvent(
                                         source_agent="helix",
                                         event_type="pipeline_milestone",
                                         severity="warning",
                                         headline=f"{candidate_agent.capitalize()} Circuit Isolation Engaged",
-                                        outcome=f"Circuit for {vendor_name} is broken. {candidate_agent.capitalize()} executed once to register state.",
-                                        next_action=f"Halting {candidate_agent} schedule until circuit is healed.",
+                                        outcome=f"Circuit for {vendor_name} is broken. Registered standdown state for {candidate_agent.capitalize()}.",
+                                        next_action=f"Halting {candidate_agent} dispatches until circuit heals.",
                                     )
                                 )
 
-                                await write_helix_command_center_log(
-                                    db_pool,
-                                    "WARNING",
-                                    f"{candidate_agent.capitalize()} circuit is broken ({vendor_name}). Executed single standdown check. Halting agent for today.",
-                                    "CIRCUIT_STANDDOWN_LOGGED",
-                                )
+                                # 3. Log attributed directly to candidate_agent so run_counts_today increments!
+                                async with db_pool.connection() as conn:
+                                    async with conn.cursor() as log_cur:
+                                        await log_cur.execute(
+                                            """
+                                            INSERT INTO agent_system_logs (agent_name, log_level, message, action) 
+                                            VALUES (%s, 'WARNING', %s, 'CIRCUIT_STANDDOWN_LOGGED');
+                                            """,
+                                            (
+                                                candidate_agent,
+                                                f"Circuit broken ({vendor_name}). Registered single daily standdown check. Halting dispatches today.",
+                                            ),
+                                        )
+                                    await conn.commit()
 
-                                # 3. Resume schedule: Advance the standard drip timer so the loop moves on
-                                last_standard_drip_at = now_utc
-                                break
-                            else:
-                                # Already reported and executed once today; bypass until circuit clears
-                                continue
+                            # Continue evaluating remaining queue so healthy agents still execute
+                            continue
+
+                        # ✅ ADD THESE TWO LINES RIGHT HERE:
+                        next_agent_up = candidate_agent
+                        break
 
                     if next_agent_up:
                         async with db_pool.connection() as conn:
