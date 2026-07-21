@@ -1,14 +1,12 @@
 # main.py
 import os
 import hmac
-import datetime
 import asyncio
 import psycopg
 import json
 from typing import List, Optional, Literal
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 
-from config import settings
 from config.settings import MOLTSET_ALLOWED_CATEGORIES
 from database.connection import create_async_db_pool
 from helix_optimizer import reactive_optimizer_loop, run_daily_prompt_optimization
@@ -17,7 +15,6 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Query,
-    Request,
     Response,
     Header,
     BackgroundTasks,
@@ -31,7 +28,6 @@ from telegram_orchestrator import router as telegram_router
 # Submodule Imports
 from core.engine import perpetual_awareness_loop, load_vendor_isolation_matrix
 from services.telemetry import (
-    send_telegram_broadcast,
     ExecutiveNotificationEvent,
     emit_executive_notification,
     analyze_and_orchestrate_log,
@@ -46,10 +42,13 @@ from services.credit_sync import (
     sync_external_vendor_credits,
     credit_sync_scheduler_loop,
 )
+from core.auditor import (
+    evaluate_agent_performance,
+    dispatch_chiron_optimization,
+    run_agent_performance_audit_loop,
+)
 
 # --- GLOBAL SCHEDULE ENFORCER CORE MUTATION ---
-import core.engine
-
 load_dotenv()
 
 app = FastAPI(title="Helix Strategic Orchestration Core API")
@@ -68,7 +67,10 @@ async def lifespan(app: FastAPI):
     await app.state.db_pool.open(wait=True)
     await sync_external_vendor_credits(app.state.db_pool)
 
-    # Background Tasks - Ensure perpetual_awareness_loop respects DAILY_EXECUTION_ROUTERS
+    # Background Tasks - Ensure tasks respect operational constraints
+    app.state.auditor_task = asyncio.create_task(
+        run_agent_performance_audit_loop(app.state.db_pool)
+    )
     app.state.awareness_task = asyncio.create_task(perpetual_awareness_loop(app))
     app.state.credit_sync_task = asyncio.create_task(
         credit_sync_scheduler_loop(app.state.db_pool)
@@ -83,14 +85,15 @@ async def lifespan(app: FastAPI):
             event_type="pipeline_milestone",
             severity="success",
             headline="Helix Orchestrator Online",
-            outcome="Core orchestrator, credit sync, and optimizer workers started.",
+            outcome="Core orchestrator, auditor, credit sync, and optimizer workers started.",
             next_action="Monitoring active agent pipeline in real time.",
         )
     )
     yield
 
-    # Clean teardown with explicit cancellation order
+    # Clean teardown with explicit cancellation order including auditor_task
     tasks_to_cancel = [
+        app.state.auditor_task,
         app.state.awareness_task,
         app.state.credit_sync_task,
         app.state.optimizer_task,
@@ -220,8 +223,34 @@ async def root_heartbeat(response: Response):
     Catches automatic platform uptime pings (GET/HEAD)
     to keep logs clean and confirm the container is alive.
     """
-    # Using a minimal payload or empty body keeps responses fast and lightweight
     return {"status": "healthy", "service": "polaris-helix"}
+
+
+@app.post("/api/v1/audit/evaluate-agent")
+async def audit_agent_endpoint(
+    agent_name: str = Query(...),
+    x_helix_auth_token: Optional[str] = Header(default=None),
+):
+    """Manually forces a performance audit on an agent and triggers Chiron if underperforming."""
+    expected = os.getenv("HELIX_AUTH_TOKEN")
+    if expected and not (
+        x_helix_auth_token and hmac.compare_digest(x_helix_auth_token, expected)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    audit = await evaluate_agent_performance(app.state.db_pool, agent_name)
+    dispatched = False
+
+    if audit.get("status") == "UNDERPERFORMING":
+        dispatched = await dispatch_chiron_optimization(
+            app.state.db_pool, agent_name, audit
+        )
+
+    return {
+        "status": "completed",
+        "audit_summary": audit,
+        "chiron_dispatched": dispatched,
+    }
 
 
 @app.get("/api/v1/health")
@@ -349,12 +378,11 @@ async def update_lead_status(
 @app.post("/api/v1/logs")
 async def ingest_log(payload: LogIngestSchema):
     try:
-        # Convert Pydantic metadata model to a clean, JSON-serializable dict
         clean_metadata = None
         if payload.metadata:
-            if hasattr(payload.metadata, "model_dump"):  # Pydantic v2
+            if hasattr(payload.metadata, "model_dump"):
                 clean_metadata = payload.metadata.model_dump()
-            elif hasattr(payload.metadata, "dict"):  # Pydantic v1
+            elif hasattr(payload.metadata, "dict"):
                 clean_metadata = payload.metadata.dict()
             elif isinstance(payload.metadata, dict):
                 clean_metadata = payload.metadata
@@ -383,7 +411,6 @@ async def ingest_log(payload: LogIngestSchema):
         if not row:
             raise Exception("No ID returned from log insertion.")
 
-        # Fire off the background task with the completely sanitized, serializable metadata
         asyncio.create_task(
             analyze_and_orchestrate_log(
                 app.state.db_pool,
@@ -392,7 +419,7 @@ async def ingest_log(payload: LogIngestSchema):
                 payload.agent_name,
                 payload.log_level,
                 payload.message,
-                clean_metadata,  # <--- Clean dictionary prevents downstream 500s
+                clean_metadata,
             )
         )
         return {"status": "success", "logged_id": row[0]}
@@ -459,7 +486,6 @@ async def rotate_scheduler_target(
 
     resolved_category = "Professional and Business Services"
 
-    # 🆕 CIRCUIT CHECK: Verify Anthropic health state before asking Claude to map categories
     anthropic_healthy = await is_vendor_circuit_healthy(app.state.db_pool, "Anthropic")
 
     if app.state.ai_client and anthropic_healthy:
@@ -541,7 +567,6 @@ async def force_prompt_optimization(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        # Run optimization immediately, setting force=True to skip log counts
         await run_daily_prompt_optimization(app.state.db_pool, force=True)
 
         emit_executive_notification(
