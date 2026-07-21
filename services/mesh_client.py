@@ -12,6 +12,9 @@ VENDOR_MOLTSET = "Moltset"
 VENDOR_PHANTOMBUSTERS = "PhantomBusters"
 VENDOR_MYEMAILVERIFIER = "MyEmailVerifier"
 
+# 🧠 STEP 3: Import memory retrieval service
+from helix_memory import query_learned_guidelines
+
 
 def get_phantombuster_keyword_cap(app_state, industry_name: str | None = None) -> int:
     PHANTOMBUSTER_KEYWORD_STAIRCASE = [25, 12, 8, 5]
@@ -133,7 +136,6 @@ async def trigger_downstream_mesh_with_payload(
         emit_executive_notification,
     )
 
-    # SCHEDULING LEAK GUARD: Validate agent_list is non-empty before proceeding
     if not agent_list:
         await write_helix_command_center_log(
             db_pool,
@@ -145,6 +147,7 @@ async def trigger_downstream_mesh_with_payload(
         return
 
     master_token = os.getenv("HELIX_AUTH_TOKEN", "")
+    target_industry = strategy.get("industry_name", "General Operations")
 
     # 1. NEXUS OMNI-STRATEGIST (Enforced Dependency Barrier)
     if "nexus" in agent_list:
@@ -163,12 +166,18 @@ async def trigger_downstream_mesh_with_payload(
             url = os.getenv(
                 "NEXUS_NERVOUS_IMPULSE_URL", "https://polaris-nexus.onrender.com"
             ).rstrip("/")
+
+            # 🧠 Dynamic Memory Query for Nexus
+            nexus_guidelines = await query_learned_guidelines(
+                target_industry=target_industry, agent_name="nexus", top_k=3
+            )
+
             await write_helix_command_center_log(
                 db_pool,
                 "INFO",
-                "Dispatching tactical orchestration impulse to Nexus Omni-Strategist node.",
+                f"Dispatching tactical orchestration impulse to Nexus node with {len(nexus_guidelines)} learned guidelines.",
                 "DISPATCH_NEXUS_REQUEST",
-                strategy["industry_name"],
+                target_industry,
             )
 
             nexus_success = await async_http_post_proxy(
@@ -187,6 +196,7 @@ async def trigger_downstream_mesh_with_payload(
                     "target_region": strategy["target_region"],
                     "bottleneck_profile": strategy["bottleneck_profile"],
                     "pain_tokens": strategy["pain_tokens"],
+                    "learned_guidelines": nexus_guidelines,  # 🚀 Memory Injection
                 },
             )
 
@@ -197,7 +207,7 @@ async def trigger_downstream_mesh_with_payload(
                         event_type="critical_failure",
                         severity="critical",
                         headline="Orchestration Halted",
-                        outcome=f"Nexus failed to initialize for {strategy['industry_name']}.",
+                        outcome=f"Nexus failed to initialize for {target_industry}.",
                         impact="Downstream Nova/Beacon/Vanguard dispatch was suppressed.",
                         next_action="Inspect Nexus availability and payload integrity.",
                     )
@@ -207,9 +217,9 @@ async def trigger_downstream_mesh_with_payload(
                     "ERROR",
                     "Nexus initialization error caught. Mesh execution sequence terminated.",
                     "ABORT_DOWNSTREAM_MESH",
-                    strategy["industry_name"],
+                    target_industry,
                 )
-                return  # Hard execution block protecting Beacon
+                return
 
             emit_executive_notification(
                 ExecutiveNotificationEvent(
@@ -240,24 +250,31 @@ async def trigger_downstream_mesh_with_payload(
                 "WARNING",
                 "Nova dispatch blocked by Moltset isolation matrix.",
                 "SKIP_NOVA_ISOLATION",
-                strategy["industry_name"],
+                target_industry,
             )
         else:
             url = os.getenv("NOVA_API_URL", "https://polaris-nova.onrender.com").rstrip(
                 "/"
             )
+
+            # 🧠 Dynamic Memory Query for Nova
+            nova_guidelines = await query_learned_guidelines(
+                target_industry=target_industry, agent_name="nova", top_k=3
+            )
+
             await write_helix_command_center_log(
                 db_pool,
                 "INFO",
-                "Routing unrestricted lead harvesting job instructions to Nova edge node.",
+                f"Routing lead harvesting instructions to Nova node with {len(nova_guidelines)} learned guidelines.",
                 "DISPATCH_NOVA_REQUEST",
-                strategy["industry_name"],
+                target_industry,
             )
 
             nova_payload = {
                 "target_region": strategy["target_region"],
                 "daily_quota_limit": 500,
                 "target_company_limit": 35,
+                "learned_guidelines": nova_guidelines,  # 🚀 Memory Injection
                 "industries": [
                     {
                         "industry_id": strategy["industry_id"],
@@ -283,7 +300,7 @@ async def trigger_downstream_mesh_with_payload(
                     event_type="pipeline_milestone",
                     severity="success",
                     headline="Nova Dispatch Started",
-                    outcome=f"Nova execution initiated for {strategy['industry_name']}.",
+                    outcome=f"Nova execution initiated for {target_industry}.",
                     next_action="Monitor lead-harvest completion signal.",
                 )
             )
@@ -293,12 +310,18 @@ async def trigger_downstream_mesh_with_payload(
         url = os.getenv(
             "BEACON_API_URL", "https://polaris-beacon-agent.onrender.com"
         ).rstrip("/")
+
+        # 🧠 Dynamic Memory Query for Beacon
+        beacon_guidelines = await query_learned_guidelines(
+            target_industry=target_industry, agent_name="beacon", top_k=3
+        )
+
         await write_helix_command_center_log(
             db_pool,
             "INFO",
-            "Dispatching structural framework synthesis orders to Beacon.",
+            f"Dispatching structural framework synthesis orders to Beacon with {len(beacon_guidelines)} learned guidelines.",
             "DISPATCH_BEACON_REQUEST",
-            strategy["industry_name"],
+            target_industry,
         )
 
         asyncio.create_task(
@@ -313,6 +336,7 @@ async def trigger_downstream_mesh_with_payload(
                     "industry_name": strategy["industry_name"],
                     "target_region": strategy["target_region"],
                     "bottleneck_profile": strategy["bottleneck_profile"],
+                    "learned_guidelines": beacon_guidelines,  # 🚀 Memory Injection
                 },
             )
         )
@@ -334,12 +358,17 @@ async def trigger_downstream_mesh_with_payload(
             keyword_cap = get_phantombuster_keyword_cap(
                 app_state, strategy.get("industry_name")
             )
+
+            radar_guidelines = await query_learned_guidelines(
+                target_industry=target_industry, agent_name="radar", top_k=3
+            )
+
             await write_helix_command_center_log(
                 db_pool,
                 "INFO",
-                f"Deploying Radar scraping profiles with a bounded keyword threshold of {keyword_cap}.",
+                f"Deploying Radar scraping profiles with bounded keyword threshold {keyword_cap}.",
                 "DISPATCH_RADAR_REQUEST",
-                strategy["industry_name"],
+                target_industry,
             )
 
             asyncio.create_task(
@@ -355,6 +384,7 @@ async def trigger_downstream_mesh_with_payload(
                         "industry_name": strategy["industry_name"],
                         "target_region": strategy["target_region"],
                         "bottleneck_profile": strategy["bottleneck_profile"],
+                        "learned_guidelines": radar_guidelines,  # 🚀 Memory Injection
                     },
                 )
             )
@@ -367,16 +397,26 @@ async def trigger_downstream_mesh_with_payload(
         url = os.getenv("PULSAR_API_URL", "https://polaris-pulsar.onrender.com").rstrip(
             "/"
         )
+
+        pulsar_guidelines = await query_learned_guidelines(
+            target_industry=target_industry, agent_name="pulsar", top_k=3
+        )
+
         await write_helix_command_center_log(
             db_pool,
             "INFO",
-            "Triggering inbound comment monitoring sweep on Pulsar gateway node.",
+            f"Triggering inbound comment monitoring sweep on Pulsar node with {len(pulsar_guidelines)} learned guidelines.",
             "DISPATCH_PULSAR_REQUEST",
-            strategy["industry_name"],
+            target_industry,
         )
         asyncio.create_task(
             async_http_post_proxy(
-                f"{url}/api/v1/pulsar/sweep", {"X-Pulsar-Auth-Token": master_token}, {}
+                f"{url}/api/v1/pulsar/sweep",
+                {
+                    "X-Pulsar-Auth-Token": master_token,
+                    "Content-Type": "application/json",
+                },
+                {"learned_guidelines": pulsar_guidelines},  # 🚀 Memory Injection
             )
         )
         send_telegram_broadcast(
@@ -394,12 +434,18 @@ async def trigger_downstream_mesh_with_payload(
             url = os.getenv(
                 "VANGUARD_API_URL", "https://polaris-vanguard-core.onrender.com"
             ).rstrip("/")
+
+            # 🧠 Dynamic Memory Query for Vanguard
+            vanguard_guidelines = await query_learned_guidelines(
+                target_industry=target_industry, agent_name="vanguard", top_k=3
+            )
+
             await write_helix_command_center_log(
                 db_pool,
                 "INFO",
-                "Initiating secure outbound verification and email tracking sweeps via Vanguard.",
+                f"Initiating outbound email tracking sweeps via Vanguard with {len(vanguard_guidelines)} learned guidelines.",
                 "DISPATCH_VANGUARD_REQUEST",
-                strategy["industry_name"],
+                target_industry,
             )
             asyncio.create_task(
                 async_http_post_proxy(
@@ -408,29 +454,36 @@ async def trigger_downstream_mesh_with_payload(
                         "X-Vanguard-Auth-Token": master_token,
                         "Content-Type": "application/json",
                     },
-                    {},
+                    {
+                        "industry_name": target_industry,
+                        "learned_guidelines": vanguard_guidelines,  # 🚀 Memory Injection
+                    },
                 )
             )
             send_telegram_broadcast(
                 "Vanguard outbound campaign sweep initiated successfully.", "verbose"
             )
 
-    # =====================================================================
-    # ⚡ 7. AURA AUTOMATED VIDEO & MEDIA ENGINE
-    # =====================================================================
+    # 7. AURA AUTOMATED MEDIA ENGINE
     if "aura" in agent_list:
         url = os.getenv("AURA_API_URL", "https://polaris-aura.onrender.com").rstrip("/")
+
+        aura_guidelines = await query_learned_guidelines(
+            target_industry=target_industry, agent_name="aura", top_k=3
+        )
+
         await write_helix_command_center_log(
             db_pool,
             "INFO",
             "Dispatching strategic campaign parameters down-mesh to Aura video engine.",
             "DISPATCH_AURA_REQUEST",
-            strategy["industry_name"],
+            target_industry,
         )
 
         aura_payload = {
             "notification_type": strategy.get("notification_type"),
             "nexus_directive": strategy.get("nexus_directive"),
+            "learned_guidelines": aura_guidelines,  # 🚀 Memory Injection
         }
 
         asyncio.create_task(
@@ -449,7 +502,7 @@ async def trigger_downstream_mesh_with_payload(
                 event_type="pipeline_milestone",
                 severity="success",
                 headline="Aura Dispatch Started",
-                outcome=f"Aura orchestration payload successfully dispatched for {strategy['industry_name']}.",
+                outcome=f"Aura orchestration payload successfully dispatched for {target_industry}.",
                 next_action="Awaiting automated compilation and media rendering metrics.",
             )
         )

@@ -17,6 +17,7 @@ from config.settings import NEW_YORK_TZ, CHIRON_API_URL, ANTHROPIC_MODEL
 
 # Reimport to prevent circular loops
 from services.mesh_client import trigger_downstream_mesh_with_payload
+from helix_memory import record_experience
 
 # Rate limiting windows
 _GLOBAL_NOTIFICATION_HISTORY = deque()
@@ -454,12 +455,17 @@ async def evaluate_lead_density_and_escalate(
 async def process_roi_attribution_boost(email: str, status: str, db_pool):
     normalized_status = status.lower().strip()
     reward_weight = 0
+    outcome_type = "conversion"
+
     if "reply" in normalized_status:
         reward_weight = 15
+        outcome_type = "positive_reply"
     elif "meeting" in normalized_status or "booked" in normalized_status:
         reward_weight = 40
+        outcome_type = "meeting_booked"
     elif "won" in normalized_status or "converted" in normalized_status:
         reward_weight = 100
+        outcome_type = "deal_won"
 
     if reward_weight == 0:
         return
@@ -486,6 +492,16 @@ async def process_roi_attribution_boost(email: str, status: str, db_pool):
                     await conn.commit()
 
                     if updated_row:
+                        # 🧠 Automatically record high-converting campaign lesson to pgvector
+                        asyncio.create_task(
+                            record_experience(
+                                agent_name="vanguard",
+                                outcome_type=outcome_type,
+                                narrative_summary=f"Lead ({email}) hit status '{status}' in {target_industry}. Campaign messaging verified high-converting.",
+                                industry=target_industry,
+                            )
+                        )
+
                         emit_executive_notification(
                             ExecutiveNotificationEvent(
                                 source_agent="helix",
@@ -747,6 +763,15 @@ async def analyze_and_orchestrate_log(
                                     next_action="Rotate strategy target before rerun.",
                                 )
                             )
+                            # 🧠 Record failure/exhaustion memory
+                            asyncio.create_task(
+                                record_experience(
+                                    agent_name="nova",
+                                    outcome_type="unresponsive",
+                                    narrative_summary=f"MoltSet profile harvesting for {industry} returned 0 records. Target criteria exhausted or too narrow.",
+                                    industry=industry,
+                                )
+                            )
                             await cur.execute(
                                 "UPDATE helix_brain_scheduler SET is_active = FALSE WHERE industry_name = %s;",
                                 (industry,),
@@ -764,6 +789,17 @@ async def analyze_and_orchestrate_log(
                                     next_action="Continue sequential enrichment pipeline.",
                                 )
                             )
+
+                            # 🧠 Record successful harvest memory
+                            asyncio.create_task(
+                                record_experience(
+                                    agent_name="nova",
+                                    outcome_type="successful_harvest",
+                                    narrative_summary=f"Nova successfully mined {records_found} high-value leads for {industry}.",
+                                    industry=industry,
+                                )
+                            )
+
                             from core.engine import load_vendor_isolation_matrix
 
                             vendor_isolation_matrix = (
