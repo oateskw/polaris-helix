@@ -527,6 +527,7 @@ async def perpetual_awareness_loop(app_instance):
                         print(
                             "⏳ [ENGINE] All pending queue items are blocked by circuit isolation. Waiting..."
                         )
+                        last_standard_drip_at = now_utc
 
         except Exception as loop_crash:
             emit_executive_notification(
