@@ -404,7 +404,7 @@ async def telegram_webhook_handler(request: Request):
             import datetime
 
             est_now = datetime.datetime.now(NEW_YORK_TZ)
-            current_weekday = est_now.weekday()
+            current_weekday = int(est_now.strftime("%w"))
             day_name = est_now.strftime("%A")
 
             # Dedicated emoji mapping based on infrastructure layout

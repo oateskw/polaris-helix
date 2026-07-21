@@ -131,7 +131,7 @@ async def perpetual_awareness_loop(app_instance):
             await check_and_heal_moltset_circuit(db_pool)
 
             est_now = datetime.datetime.now(NEW_YORK_TZ)
-            current_weekday = est_now.weekday()
+            current_weekday = int(est_now.strftime("%w"))
             current_time = est_now.time()
             current_date_str = est_now.strftime("%Y-%m-%d")
 
