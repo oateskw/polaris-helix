@@ -515,11 +515,9 @@ async def perpetual_awareness_loop(app_instance):
                             )
                             last_standard_drip_at = now_utc
                     else:
-                        await write_helix_command_center_log(
-                            db_pool,
-                            "INFO",
-                            "All pending queue items are blocked by circuit isolation.",
-                            "ORCHESTRATOR_STALL_WAIT",
+                        # Print to console instead of spamming agent_system_logs table
+                        print(
+                            "⏳ [ENGINE] All pending queue items are blocked by circuit isolation. Waiting..."
                         )
 
         except Exception as loop_crash:
