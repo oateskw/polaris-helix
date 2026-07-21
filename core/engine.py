@@ -113,6 +113,9 @@ async def load_vendor_isolation_matrix(db_pool) -> dict:
                     v_name = row["vendor_name"]
                     is_broken = bool(row["is_circuit_broken"])
 
+                    # Treat MoltSet like all other vendors: enforce isolation whenever is_circuit_broken is True
+                    vendor_isolation_matrix[v_name] = is_broken
+
                     # Core Requirement: Check if the timestamp matches today's date
                     last_updated_date = (
                         row["last_updated_at"].date()
