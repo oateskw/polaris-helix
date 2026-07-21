@@ -242,7 +242,7 @@ async def telegram_webhook_handler(request: Request):
                 SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
                 FROM helix_brain_scheduler 
                 WHERE is_active = TRUE 
-                ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST 
+                ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC 
                 LIMIT 1;
             """
 
