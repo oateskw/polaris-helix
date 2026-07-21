@@ -425,15 +425,53 @@ async def perpetual_awareness_loop(app_instance):
                             is_isolated = True
 
                         if is_isolated:
-                            await write_helix_command_center_log(
-                                db_pool,
-                                "WARNING",
-                                f"Bypassed agent '{candidate_agent}' due to circuit isolation.",
-                                "QUEUE_BYPASS",
-                            )
-                            continue
-                        next_agent_up = candidate_agent
-                        break
+                            # 1. Check if we have already reported and logged a run for this isolated agent today
+                            async with db_pool.connection() as conn:
+                                async with conn.cursor() as check_cur:
+                                    await check_cur.execute(
+                                        """
+                                        SELECT COUNT(*) FROM agent_system_logs 
+                                        WHERE LOWER(agent_name) = %s 
+                                        AND timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date;
+                                        """,
+                                        (candidate_agent,),
+                                    )
+                                    already_ran_today = (await check_cur.fetchone())[
+                                        0
+                                    ] > 0
+
+                            if not already_ran_today:
+                                # 2. First time hitting broken circuit today: Report it and record the run
+                                vendor_name = (
+                                    VENDOR_MOLTSET
+                                    if candidate_agent == "nova"
+                                    else "Vendor"
+                                )
+
+                                emit_executive_notification(
+                                    ExecutiveNotificationEvent(
+                                        source_agent="helix",
+                                        event_type="pipeline_milestone",
+                                        severity="warning",
+                                        headline=f"{candidate_agent.capitalize()} Circuit Isolation Engaged",
+                                        outcome=f"Circuit for {vendor_name} is broken. {candidate_agent.capitalize()} executed once to register state.",
+                                        next_action=f"Halting {candidate_agent} schedule until circuit is healed.",
+                                    )
+                                )
+
+                                await write_helix_command_center_log(
+                                    db_pool,
+                                    "WARNING",
+                                    f"{candidate_agent.capitalize()} circuit is broken ({vendor_name}). Executed single standdown check. Halting agent for today.",
+                                    "CIRCUIT_STANDDOWN_LOGGED",
+                                )
+
+                                # 3. Resume schedule: Advance the standard drip timer so the loop moves on
+                                last_standard_drip_at = now_utc
+                                break
+                            else:
+                                # Already reported and executed once today; bypass until circuit clears
+                                continue
 
                     if next_agent_up:
                         async with db_pool.connection() as conn:
