@@ -981,7 +981,7 @@ async def analyze_and_orchestrate_log(
                                         {
                                             "target_region": strategy["target_region"],
                                             "daily_quota_limit": 150,
-                                            "target_company_limit": 35,
+                                            "target_company_limit": 25,
                                             "industries": [
                                                 {
                                                     "industry_id": strategy[
