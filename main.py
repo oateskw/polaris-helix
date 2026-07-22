@@ -446,6 +446,35 @@ async def get_latest_log(agent: str, x_inbound_key: str | None = Header(default=
     return {**row, "timestamp": row["timestamp"].isoformat()}
 
 
+@app.get("/api/v1/telemetry/errors-count")
+async def get_agent_errors_count(
+    agent: str, x_helix_auth_token: Optional[str] = Header(default=None)
+):
+    """Calculates active error/critical logs count for an agent within the last 24 hours."""
+    expected = os.getenv("HELIX_AUTH_TOKEN")
+    if expected and not (
+        x_helix_auth_token and hmac.compare_digest(x_helix_auth_token, expected)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    async with app.state.db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT COUNT(*) 
+                FROM agent_system_logs 
+                WHERE agent_name = %s 
+                  AND log_level IN ('ERROR', 'CRITICAL')
+                  AND timestamp >= NOW() - INTERVAL '24 hours';
+                """,
+                (agent.lower(),),
+            )
+            row = await cur.fetchone()
+            count = row[0] if row else 0
+
+    return {"agent": agent, "error_count": count}
+
+
 @app.get("/api/v1/scheduler/current")
 async def get_current_scheduler_target(
     x_inbound_key: str | None = Header(default=None),
