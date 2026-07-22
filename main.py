@@ -600,7 +600,7 @@ async def execute_orchestrated_master_cycle(
     async with app.state.db_pool.connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute("""
-                SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region, campaign_strategy
                 FROM helix_brain_scheduler WHERE is_active = TRUE AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
                 ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST LIMIT 1;
             """)

@@ -222,7 +222,7 @@ async def perpetual_awareness_loop(app_instance):
                     async with db_pool.connection() as conn:
                         async with conn.cursor(row_factory=dict_row) as cur:
                             await cur.execute("""
-                                SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region, campaign_strategy
                                 FROM helix_brain_scheduler 
                                 WHERE is_active = TRUE 
                                 ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC LIMIT 1;
@@ -486,13 +486,13 @@ async def perpetual_awareness_loop(app_instance):
                             async with conn.cursor(row_factory=dict_row) as cur:
                                 if next_agent_up in ["radar", "pulsar"]:
                                     await cur.execute("""
-                                        SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                        SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, campaign_strategy, target_region
                                         FROM helix_brain_scheduler WHERE is_active = TRUE 
                                         ORDER BY last_targeted_at DESC NULLS LAST LIMIT 1;
                                     """)
                                 else:
                                     await cur.execute("""
-                                        SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                                        SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, campaign_strategy, target_region
                                         FROM helix_brain_scheduler WHERE is_active = TRUE 
                                         AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
                                         ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC LIMIT 1;
