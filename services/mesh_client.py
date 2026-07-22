@@ -336,6 +336,10 @@ async def trigger_downstream_mesh_with_payload(
                     "industry_name": strategy["industry_name"],
                     "target_region": strategy["target_region"],
                     "bottleneck_profile": strategy["bottleneck_profile"],
+                    "campaign_strategy": strategy.get(
+                        "campaign_strategy", "BEFORE_AFTER"
+                    ),  # 👈 Added
+                    "nexus_directive": strategy.get("nexus_directive"),  # 👈 Added
                     "learned_guidelines": beacon_guidelines,  # 🚀 Memory Injection
                 },
             )
