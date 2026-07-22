@@ -21,11 +21,61 @@ VENDOR_MOLTSET = "MoltSet"
 VENDOR_ANTHROPIC = "Anthropic"
 
 
-async def check_and_heal_moltset_circuit(db_pool):
+async def check_and_heal_moltset_circuit(app_instance):
     """
-    Actively checks the MoltSet usage endpoint to verify if the account's
-    weekly search quota has refilled, healing the circuit breaker automatically.
+    Checks MoltSet circuit status once. If broken, reports the standdown state
+    a single time and permanently blocks further checks until application restart.
     """
+    db_pool = app_instance.state.db_pool
+
+    # Initialize a set on application state to track permanently disabled circuits
+    if not hasattr(app_instance.state, "disabled_circuits"):
+        app_instance.state.disabled_circuits = set()
+
+    # 1. Check if MoltSet is already marked broken in memory—if so, exit instantly
+    if "moltset" in app_instance.state.disabled_circuits:
+        return
+
+    try:
+        # 2. Check the ledger in the database
+        async with db_pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute("""
+                    SELECT is_circuit_broken 
+                    FROM helix_infrastructure_oracle_ledger 
+                    WHERE LOWER(vendor_name) = 'moltset';
+                """)
+                ledger_record = await cur.fetchone()
+
+        is_broken = (
+            ledger_record.get("is_circuit_broken", True) if ledger_record else True
+        )
+
+        # 3. If broken, report ONCE, block future runs in memory, and exit gracefully
+        if is_broken:
+            app_instance.state.disabled_circuits.add("moltset")
+
+            print(
+                "🛑 [CIRCUIT GUARD] MoltSet circuit is broken in ledger. Disabling API checks."
+            )
+
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="pipeline_milestone",
+                    severity="warning",
+                    headline="MoltSet Circuit Active Standdown",
+                    outcome="MoltSet circuit is marked broken. Operational checks suspended.",
+                    next_action="Manual manual record update required to restore service.",
+                )
+            )
+            return
+
+    except Exception as db_err:
+        print(f"⚠️ Failed to read MoltSet ledger state: {db_err}")
+        return
+
+    # 4. Read-only balance check if circuit is active (is_circuit_broken == False)
     moltset_key = os.getenv("MOLTSET_API_KEY")
     api_endpoint = os.getenv(
         "MOLTSET_API_ENDPOINT", "https://api.moltsets.com/api/v1/tools/"
@@ -41,53 +91,13 @@ async def check_and_heal_moltset_circuit(db_pool):
     }
 
     try:
-        # Perform out-of-band balance check synchronously or with a standard request block
-        # wrapped in an executor to avoid blocking the asyncio event loop
         loop = asyncio.get_event_loop()
         res = await loop.run_in_executor(
             None, lambda: requests.post(url, headers=headers, timeout=12)
         )
-
         if res.status_code == 200:
-            data = res.json()
-
-            # Navigate the payload schema defensively
-            results = data.get("results", {}) or {}
-            fair_use = results.get("fair_use", {}) or {}
-            search_metrics = fair_use.get("search", {}) or {}
-            records_1w = search_metrics.get("records", {}).get("1w", {}) or {}
-
-            remaining = records_1w.get("remaining", 0)
-
-            # If the quota has naturally cleared and refilled, heal the ledger!
-            if remaining > 0:
-                async with db_pool.connection() as conn:
-                    # 🚀 Wrap this in a transaction context to auto-commit to the database
-                    async with conn.transaction():
-                        async with conn.cursor() as cur:
-                            await cur.execute("""
-                                UPDATE helix_infrastructure_oracle_ledger 
-                                SET is_circuit_broken = FALSE, 
-                                    last_updated_at = NOW() 
-                                WHERE LOWER(vendor_name) = 'moltset' AND is_circuit_broken = TRUE;
-                            """)
-                            rowcount = cur.rowcount
-
-                    # Move telemetry notifications outside the cursor block
-                    if rowcount > 0:
-                        print(
-                            "🌤️ Central Orchestrator: MoltSet weekly search quota has been verified. Circuit healed."
-                        )
-                        emit_executive_notification(
-                            ExecutiveNotificationEvent(
-                                source_agent="helix",
-                                event_type="pipeline_milestone",
-                                severity="success",
-                                headline="Circuit Breaker Healed Automatically",
-                                outcome="MoltSet usage metrics verified positive credit balances. Circuit state cleared.",
-                                next_action="Nova processing queue cleared for operational sweeps.",
-                            )
-                        )
+            # Operational monitoring code (no DB UPDATE queries executed)
+            pass
     except Exception as e:
         print(f"⚠️ Circuit tracking verification failed against MoltSet portal: {e}")
 
