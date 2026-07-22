@@ -458,16 +458,18 @@ async def perpetual_awareness_loop(app_instance):
                                 )
 
                                 # 3. Log attributed directly to candidate_agent so run_counts_today increments!
+                                # Update around line 463 in engine.py:
                                 async with db_pool.connection() as conn:
                                     async with conn.cursor() as log_cur:
                                         await log_cur.execute(
                                             """
-                                            INSERT INTO agent_system_logs (agent_name, log_level, message, action) 
-                                            VALUES (%s, 'WARNING', %s, 'CIRCUIT_STANDDOWN_LOGGED');
+                                            INSERT INTO agent_system_logs (agent_name, log_level, message, metadata) 
+                                            VALUES (%s, 'WARNING', %s, %s::jsonb);
                                             """,
                                             (
                                                 candidate_agent,
                                                 f"Circuit broken ({vendor_name}). Registered single daily standdown check. Halting dispatches today.",
+                                                '{"action": "CIRCUIT_STANDDOWN_LOGGED"}',
                                             ),
                                         )
                                     await conn.commit()
