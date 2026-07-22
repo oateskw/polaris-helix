@@ -335,7 +335,27 @@ async def telegram_webhook_handler(request: Request):
             command, target_agent = text.split(maxsplit=1)
             target_agent = target_agent.strip().lower()
 
-            # 🛑 FAIL-SAFE: Helix can NEVER be disabled
+            # 🛑 1. Agent Name Validation
+            from main import LogIngestSchema
+            from typing import get_args
+
+            agent_field_type = LogIngestSchema.__annotations__["agent_name"]
+            valid_agents = get_args(agent_field_type)
+
+            if target_agent not in valid_agents:
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="helix",
+                        event_type="action_blocked",
+                        severity="warning",
+                        headline="Command Rejected",
+                        outcome=f"❌ Unknown agent '{target_agent}'. Valid agents: {', '.join(valid_agents)}",
+                        next_action="Provide a valid agent identifier.",
+                    )
+                )
+                return {"status": "processed"}
+
+            # 🛑 2. Fail-Safe: Helix can NEVER be disabled
             if target_agent == "helix" and command == "/disable":
                 emit_executive_notification(
                     ExecutiveNotificationEvent(
@@ -353,32 +373,20 @@ async def telegram_webhook_handler(request: Request):
             status_verb = "Enabled" if enable_state else "Disabled"
             status_emoji = "🟢" if enable_state else "🔴"
 
+            # 💾 3. Corrected Database Transaction with explicit commit
             async with db_pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
                         """
                         INSERT INTO helix_agent_schedule (agent_name, weekday_int, is_enabled)
-                        VALUES (%s, 0, %s), (%s, 1, %s), (%s, 2, %s), (%s, 3, %s), (%s, 4, %s), (%s, 5, %s), (%s, 6, %s)
+                        SELECT %s, w, %s
+                        FROM generate_series(0, 6) AS w
                         ON CONFLICT (agent_name, weekday_int) 
                         DO UPDATE SET is_enabled = EXCLUDED.is_enabled;
-                    """,
-                        [
-                            target_agent,
-                            enable_state,
-                            target_agent,
-                            enable_state,
-                            target_agent,
-                            enable_state,
-                            target_agent,
-                            enable_state,
-                            target_agent,
-                            enable_state,
-                            target_agent,
-                            enable_state,
-                            target_agent,
-                            enable_state,
-                        ],
+                        """,
+                        (target_agent, enable_state),
                     )
+                await conn.commit()
 
             emit_executive_notification(
                 ExecutiveNotificationEvent(
@@ -392,8 +400,17 @@ async def telegram_webhook_handler(request: Request):
             )
 
         except Exception as err:
-            # Error handling here...
-            pass
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="critical_failure",
+                    severity="critical",
+                    headline="Schedule Command Failed",
+                    outcome=f"Could not update schedule state for target agent.",
+                    impact=str(err),
+                    next_action="Inspect database connectivity and query parameters.",
+                )
+            )
 
     # 2. Smart /today Fetching (Supports Multiple Runs)
     elif text == "/today":
