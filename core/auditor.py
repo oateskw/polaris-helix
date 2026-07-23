@@ -51,12 +51,12 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
     try:
         async with db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                # 1. Evaluate log health & error density
+                # 1. Evaluate log health & error density for ALL agents
                 await cur.execute(
                     """
                     SELECT log_level, COUNT(*) as count
                     FROM agent_system_logs
-                    WHERE agent_name = %s
+                    WHERE LOWER(agent_name) = %s
                     AND timestamp >= NOW() - (%s || ' days')::INTERVAL
                     GROUP BY log_level;
                     """,
@@ -68,13 +68,12 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                         metrics["error_count"] = row["count"]
                     metrics["total_runs"] += row["count"]
 
-                # 2. Agent-Specific Metric Evaluation
+                # 2. Agent-Specific KPI Evaluation
                 if normalized_agent == "beacon":
-                    # Check impressions and referral clicks logged in metadata
                     await cur.execute("""
                         SELECT metadata
                         FROM agent_system_logs
-                        WHERE agent_name = 'beacon'
+                        WHERE LOWER(agent_name) = 'beacon'
                         AND log_level = 'INFO'
                         AND timestamp >= NOW() - INTERVAL '7 days';
                         """)
@@ -99,7 +98,6 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                         "total_clicks": total_clicks,
                     }
 
-                    # Evaluate against threshold
                     min_impressions = thresholds.get("min_avg_impressions", 150)
                     if post_count > 0 and avg_impressions < min_impressions:
                         metrics["status"] = "UNDERPERFORMING"
@@ -114,6 +112,46 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                         metrics["issues"].append(
                             f"Total referral traffic clicks ({total_clicks}) in the last 7 days is too low. CTA / hook alignment is failing."
                         )
+
+                elif normalized_agent == "nova":
+                    # Nova evaluation: check average contacts/leads harvested per run
+                    await cur.execute("""
+                        SELECT metadata
+                        FROM agent_system_logs
+                        WHERE LOWER(agent_name) = 'nova'
+                        AND log_level = 'INFO'
+                        AND timestamp >= NOW() - INTERVAL '3 days';
+                        """)
+                    nova_logs = await cur.fetchall()
+
+                    harvested_leads = 0
+                    nova_runs = 0
+                    for log in nova_logs:
+                        meta = log.get("metadata") or {}
+                        if isinstance(meta, dict) and "harvested_count" in meta:
+                            harvested_leads += int(meta.get("harvested_count", 0))
+                            nova_runs += 1
+
+                    avg_harvest = harvested_leads / max(nova_runs, 1)
+                    metrics["performance_signals"] = {
+                        "runs_analyzed": nova_runs,
+                        "total_harvested": harvested_leads,
+                        "avg_harvest_per_run": avg_harvest,
+                    }
+
+                    min_yield = thresholds.get("min_harvest_yield_per_run", 10)
+                    if nova_runs > 0 and avg_harvest < min_yield:
+                        metrics["status"] = "UNDERPERFORMING"
+                        metrics["issues"].append(
+                            f"Nova average lead harvest yield ({avg_harvest:.1f}/run) fell below threshold ({min_yield}). Targeting scope may be exhausted."
+                        )
+
+                # 3. Universal Error Density Threshold (Applies to ALL Agents)
+                if metrics["error_count"] > 5:
+                    metrics["status"] = "UNDERPERFORMING"
+                    metrics["issues"].append(
+                        f"High error density detected: {metrics['error_count']} ERROR logs in the last {lookback_days} days."
+                    )
 
     except Exception as e:
         print(f"⚠️ Performance evaluation error for {agent_name}: {e}")
@@ -135,7 +173,6 @@ async def dispatch_chiron_optimization(
         print("⚠️ HELIX_AUTH_TOKEN missing. Cannot dispatch optimization to Chiron.")
         return False
 
-    # Verify Anthropic health before waking Chiron
     if not await is_vendor_circuit_healthy(db_pool, "Anthropic"):
         print("🛑 Anthropic circuit broken. Aborting Chiron dispatch.")
         return False
@@ -144,12 +181,11 @@ async def dispatch_chiron_optimization(
         [f"• {issue}" for issue in audit_results.get("issues", [])]
     )
 
-    # Agent-specific refactoring directives for Chiron
     refactor_instructions = {
         "beacon": (
             "REFACTORING GOAL: Optimize LinkedIn engagement, algorithm reach, and inbound conversions.\n"
             "1. Update beacon_agent.py prompt structures to use high-converting curiosity gap hooks.\n"
-            "2. Remove outbound website links from post bodies to avoid LinkedIn algorithm suppression. Move CTAs to comment keyword triggers (e.g. 'Comment BLUEPRINT below').\n"
+            "2. Remove outbound website links from post bodies to avoid LinkedIn algorithm suppression. Move CTAs to comment keyword triggers.\n"
             "3. Format text copy with mobile-friendly short paragraphs and bullet points.\n"
             "4. Align copy to drive users directly to Prism and ScopingPage inbound tools."
         ),
@@ -157,6 +193,11 @@ async def dispatch_chiron_optimization(
             "REFACTORING GOAL: Improve email open rates and deliverability.\n"
             "1. Shorten subject lines to under 4 words.\n"
             "2. Ensure exact 4-paragraph Markdown-free body layouts."
+        ),
+        "nova": (
+            "REFACTORING GOAL: Optimize enrichment yields and target discovery.\n"
+            "1. Broaden search criteria when encountering depleted pool metrics.\n"
+            "2. Optimize payload parameters passed to MoltSet."
         ),
     }
 
@@ -210,7 +251,7 @@ async def dispatch_chiron_optimization(
 
 async def run_agent_performance_audit_loop(db_pool):
     """
-    Background loop running inside Helix that audits key agents on a daily schedule
+    Background loop running inside Helix that audits key agents from helix_agent_manifests
     and automatically triggers Chiron when performance degrades.
     """
     from config.settings import should_helix_workers_operate
@@ -219,7 +260,24 @@ async def run_agent_performance_audit_loop(db_pool):
     while True:
         try:
             if should_helix_workers_operate():
-                for agent_name in ["beacon", "vanguard"]:
+                # 1. Fetch all active agents dynamically from helix_agent_manifests
+                async with db_pool.connection() as conn:
+                    async with conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute("""
+                            SELECT LOWER(agent_name) as agent_name 
+                            FROM helix_agent_manifests 
+                            WHERE is_active = TRUE;
+                        """)
+                        manifest_agents = await cur.fetchall()
+
+                active_agent_names = [row["agent_name"] for row in manifest_agents]
+
+                # Fallback defaults if table is empty
+                if not active_agent_names:
+                    active_agent_names = ["beacon", "vanguard", "nova"]
+
+                # 2. Iterate through and audit every active agent
+                for agent_name in active_agent_names:
                     audit = await evaluate_agent_performance(db_pool, agent_name)
                     if audit.get("status") == "UNDERPERFORMING":
                         print(
