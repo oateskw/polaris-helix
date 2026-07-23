@@ -137,7 +137,6 @@ async def perpetual_awareness_loop(app_instance):
 
     while True:
         try:
-            # 🚀 INSERT THIS LINE RIGHT HERE:
             await check_and_heal_moltset_circuit(app_instance)
 
             est_now = datetime.datetime.now(NEW_YORK_TZ)
@@ -165,13 +164,11 @@ async def perpetual_awareness_loop(app_instance):
 
             should_trigger_beacon = False
             for row in time_locked_agents:
-                # We target beacon specifically for your out-of-band sequential gating rule
                 if row["agent_name"].lower() == "beacon":
                     target_time = row["scheduled_time"]
                     target_dt = datetime.datetime.combine(
                         est_now.date(), target_time, tzinfo=NEW_YORK_TZ
                     )
-                    # Check if current time falls within the 15-minute operational window
                     if (
                         target_dt
                         <= est_now
@@ -181,7 +178,6 @@ async def perpetual_awareness_loop(app_instance):
                         break
 
             if should_trigger_beacon:
-                # 🛡️ 1a. Pull recent safety locks to prevent tight concurrent firing loops
                 async with db_pool.connection() as conn:
                     async with conn.cursor() as cur:
                         await cur.execute("""
@@ -193,7 +189,6 @@ async def perpetual_awareness_loop(app_instance):
                         recent_safety_lock = (await cur.fetchone())[0]
 
                 if recent_safety_lock == 0:
-                    # 🔍 1b. Inspect the absolute latest record in beacon_history to check the directive state
                     nexus_directive_needs_charging = True
 
                     try:
@@ -207,7 +202,6 @@ async def perpetual_awareness_loop(app_instance):
                                 """)
                                 last_beacon_record = await cur.fetchone()
 
-                                # If a record exists and it has a valid directive, we are clear to run Beacon!
                                 if (
                                     last_beacon_record
                                     and last_beacon_record.get("nexus_directive")
@@ -216,9 +210,7 @@ async def perpetual_awareness_loop(app_instance):
                                     nexus_directive_needs_charging = False
                     except Exception as db_err:
                         print(f"⚠️ Failed to inspect beacon_history ledger: {db_err}")
-                        # Defensive: If table check fails, default to running Nexus for safety
 
-                    # 🧠 1c. Fetch the active strategy vector
                     async with db_pool.connection() as conn:
                         async with conn.cursor(row_factory=dict_row) as cur:
                             await cur.execute("""
@@ -229,7 +221,6 @@ async def perpetual_awareness_loop(app_instance):
                             """)
                             active_strategy = await cur.fetchone()
 
-                            # 💥 ADD THIS UPDATE BLOCK RIGHT HERE:
                             if active_strategy:
                                 await cur.execute(
                                     "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
@@ -242,7 +233,6 @@ async def perpetual_awareness_loop(app_instance):
                             db_pool
                         )
 
-                        # 🚨 THE RECHARGE INTERCEPTOR: If directive is missing/NULL, force Nexus first!
                         if nexus_directive_needs_charging:
                             emit_executive_notification(
                                 ExecutiveNotificationEvent(
@@ -266,7 +256,6 @@ async def perpetual_awareness_loop(app_instance):
                             await asyncio.sleep(60)
                             continue
 
-                        # ✅ CLEAR ROADWAY: Directive is active, fire Beacon directly
                         else:
                             emit_executive_notification(
                                 ExecutiveNotificationEvent(
@@ -288,7 +277,7 @@ async def perpetual_awareness_loop(app_instance):
                             )
 
             # =====================================================================
-            # 🧠 2. DAILY PROMPT OPTIMIZATION TRIGGER (Helix is exempt from DB, runs continuous)
+            # 🧠 2. DAILY PROMPT OPTIMIZATION TRIGGER
             # =====================================================================
             if est_now.hour == 23:
                 if (
@@ -318,7 +307,6 @@ async def perpetual_awareness_loop(app_instance):
 
                 async with db_pool.connection() as conn:
                     async with conn.cursor(row_factory=dict_row) as cur:
-                        # 3a. Pull current enabled continuous agents (where scheduled_time IS NULL)
                         await cur.execute(
                             """
                             SELECT agent_name, max_daily_runs 
@@ -330,7 +318,6 @@ async def perpetual_awareness_loop(app_instance):
                         )
                         db_scheduled_agents = await cur.fetchall()
 
-                        # 3b. Look up total run histories for today to see who has remaining quota
                         await cur.execute("""
                             SELECT DISTINCT LOWER(agent_name) as executed_agent, COUNT(*) as actual_runs
                             FROM agent_system_logs 
@@ -342,13 +329,11 @@ async def perpetual_awareness_loop(app_instance):
                             r["executed_agent"]: r["actual_runs"] for r in log_rows
                         }
 
-                # Construct list of eligible continuous loop agents based on current table configuration
                 scheduled_agents_list = [
                     row["agent_name"].lower() for row in db_scheduled_agents
                 ]
 
                 if not scheduled_agents_list:
-                    # Helix falls back safely if table is empty, printing info without stalling core execution loop
                     await write_helix_command_center_log(
                         db_pool,
                         "INFO",
@@ -359,7 +344,6 @@ async def perpetual_awareness_loop(app_instance):
                     await asyncio.sleep(60)
                     continue
 
-                # Filter out any agents that have met or exceeded their max_daily_runs restriction
                 pending_agents_for_today = []
                 for row in db_scheduled_agents:
                     agent = row["agent_name"].lower()
@@ -368,7 +352,7 @@ async def perpetual_awareness_loop(app_instance):
                     if completed_count < max_allowed:
                         pending_agents_for_today.append(agent)
 
-                # Maintain your explicit nova backoff bypass logic rules
+                # Maintain Nova backoff bypass logic with auto-recycle fallback
                 if (
                     "nova" in scheduled_agents_list
                     and "nova" not in pending_agents_for_today
@@ -380,7 +364,21 @@ async def perpetual_awareness_loop(app_instance):
                                 WHERE is_active = TRUE 
                                 AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL);
                             """)
-                            if (await retry_cur.fetchone())[0] > 0:
+                            runnable_count = (await retry_cur.fetchone())[0]
+
+                            # 🌟 OPTION B FALLBACK: If 0 targets are eligible due to 24h cooldown, auto-recycle!
+                            if runnable_count == 0:
+                                await retry_cur.execute("""
+                                    UPDATE helix_brain_scheduler 
+                                    SET last_targeted_at = NULL 
+                                    WHERE is_active = TRUE;
+                                """)
+                                await conn.commit()
+                                print(
+                                    "🔄 [SCHEDULER RECYCLE] Auto-cleared cooldown timestamps for Nova bypass."
+                                )
+                                pending_agents_for_today.append("nova")
+                            elif runnable_count > 0:
                                 pending_agents_for_today.append("nova")
 
                 if not pending_agents_for_today:
@@ -423,7 +421,6 @@ async def perpetual_awareness_loop(app_instance):
                             is_isolated = True
 
                         if is_isolated:
-                            # 1. Check if this isolated agent has already been logged today
                             async with db_pool.connection() as conn:
                                 async with conn.cursor() as check_cur:
                                     await check_cur.execute(
@@ -445,7 +442,6 @@ async def perpetual_awareness_loop(app_instance):
                                     else "Vendor Dependency"
                                 )
 
-                                # 2. Send Telegram Notification (Once Per Day)
                                 emit_executive_notification(
                                     ExecutiveNotificationEvent(
                                         source_agent="helix",
@@ -457,8 +453,6 @@ async def perpetual_awareness_loop(app_instance):
                                     )
                                 )
 
-                                # 3. Log attributed directly to candidate_agent so run_counts_today increments!
-                                # Update around line 463 in engine.py:
                                 async with db_pool.connection() as conn:
                                     async with conn.cursor() as log_cur:
                                         await log_cur.execute(
@@ -474,10 +468,8 @@ async def perpetual_awareness_loop(app_instance):
                                         )
                                     await conn.commit()
 
-                            # Continue evaluating remaining queue so healthy agents still execute
                             continue
 
-                        # ✅ ADD THESE TWO LINES RIGHT HERE:
                         next_agent_up = candidate_agent
                         break
 
@@ -490,14 +482,39 @@ async def perpetual_awareness_loop(app_instance):
                                         FROM helix_brain_scheduler WHERE is_active = TRUE 
                                         ORDER BY last_targeted_at DESC NULLS LAST LIMIT 1;
                                     """)
+                                    active_strategy = await cur.fetchone()
                                 else:
+                                    # 🌟 OPTION B SELECTION LOGIC: Check if runnable strategies exist first
+                                    await cur.execute("""
+                                        SELECT COUNT(*) as valid_targets
+                                        FROM helix_brain_scheduler WHERE is_active = TRUE 
+                                        AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL);
+                                    """)
+                                    target_check = await cur.fetchone()
+
+                                    # If ALL active targets are locked in 24h cooldown, recycle them automatically!
+                                    if (
+                                        target_check
+                                        and target_check["valid_targets"] == 0
+                                    ):
+                                        await cur.execute("""
+                                            UPDATE helix_brain_scheduler 
+                                            SET last_targeted_at = NULL 
+                                            WHERE is_active = TRUE;
+                                        """)
+                                        await conn.commit()
+                                        print(
+                                            "🔄 [SCHEDULER RECYCLE] Auto-cleared cooldown timestamps for standard dispatch."
+                                        )
+
                                     await cur.execute("""
                                         SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, campaign_strategy, target_region
                                         FROM helix_brain_scheduler WHERE is_active = TRUE 
                                         AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
                                         ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC LIMIT 1;
                                     """)
-                                active_strategy = await cur.fetchone()
+                                    active_strategy = await cur.fetchone()
+
                                 if active_strategy:
                                     await cur.execute(
                                         "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
@@ -535,7 +552,6 @@ async def perpetual_awareness_loop(app_instance):
                             )
                             last_standard_drip_at = now_utc
                     else:
-                        # Print to console instead of spamming agent_system_logs table
                         print(
                             "⏳ [ENGINE] All pending queue items are blocked by circuit isolation. Waiting..."
                         )
