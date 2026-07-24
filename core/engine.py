@@ -21,22 +21,33 @@ VENDOR_MOLTSET = "MoltSet"
 VENDOR_ANTHROPIC = "Anthropic"
 
 
+# In core/engine.py
+
+
 async def check_and_heal_moltset_circuit(app_instance):
     """
-    Checks MoltSet circuit status. If broken, pings MoltSet /get_account.
-    If MoltSet returns HTTP 200 OK, automatically heals the circuit in DB and memory.
+    Checks MoltSet circuit status every 30 minutes.
+    Queries /get_account, updates credits_remaining in the DB,
+    and automatically heals the circuit if MoltSet returns HTTP 200.
     """
     db_pool = app_instance.state.db_pool
 
     if not hasattr(app_instance.state, "disabled_circuits"):
         app_instance.state.disabled_circuits = set()
 
-    # 1. Read ledger record from DB
+    # 1. Enforce 30-Minute Probe Cooldown
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    last_probe = getattr(app_instance.state, "last_moltset_probe_time", None)
+
+    if last_probe and (now_utc - last_probe) < datetime.timedelta(minutes=30):
+        return  # Stand down until the 30-minute window elapses
+
+    # 2. Check if circuit is currently broken in DB
     try:
         async with db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute("""
-                    SELECT is_circuit_broken 
+                    SELECT is_circuit_broken, credits_remaining 
                     FROM helix_infrastructure_oracle_ledger 
                     WHERE LOWER(vendor_name) = 'moltset';
                 """)
@@ -49,12 +60,12 @@ async def check_and_heal_moltset_circuit(app_instance):
         print(f"⚠️ Failed to read MoltSet ledger state: {db_err}")
         return
 
-    # 2. If healthy in DB, ensure memory is clean and exit
+    # If the circuit is healthy, clean state and exit
     if not is_broken:
         app_instance.state.disabled_circuits.discard("moltset")
         return
 
-    # 3. Circuit IS broken in DB — Ping MoltSet /get_account to check if service/credits recovered
+    # 3. Circuit IS broken — Ping MoltSet /get_account to probe balance & rate limits
     moltset_key = os.getenv("MOLTSET_API_KEY")
     api_endpoint = os.getenv(
         "MOLTSET_API_ENDPOINT", "https://api.moltsets.com/api/v1/tools/"
@@ -62,6 +73,9 @@ async def check_and_heal_moltset_circuit(app_instance):
 
     if not moltset_key:
         return
+
+    # Update last probe attempt timestamp
+    app_instance.state.last_moltset_probe_time = now_utc
 
     url = f"{api_endpoint.rstrip('/')}/get_account"
     headers = {
@@ -75,23 +89,38 @@ async def check_and_heal_moltset_circuit(app_instance):
             None, lambda: requests.post(url, headers=headers, timeout=12)
         )
 
-        # 4. If MoltSet returns 200 OK, HEAL THE CIRCUIT!
+        # 4. Process HTTP Response & Parse Available Balance/Credits
         if res.status_code == 200:
+            data = res.json() or {}
+
+            # Extract credits/tokens from MoltSet response payload safely
+            # (Fallback to 100.00 if balance keys aren't in payload)
+            tokens_remaining = (
+                data.get("tokens_remaining")
+                or data.get("credits")
+                or data.get("balance")
+                or 100.00
+            )
+
             async with db_pool.connection() as conn:
                 async with conn.cursor() as cur:
-                    await cur.execute("""
+                    await cur.execute(
+                        """
                         UPDATE helix_infrastructure_oracle_ledger 
-                        SET is_circuit_broken = FALSE, 
+                        SET is_circuit_broken = FALSE,
+                            credits_remaining = %s,
                             last_updated_at = NOW() 
                         WHERE LOWER(vendor_name) = 'moltset';
-                    """)
+                    """,
+                        (float(tokens_remaining),),
+                    )
                 await conn.commit()
 
-            # Remove from memory block set
+            # Restore in-memory state
             app_instance.state.disabled_circuits.discard("moltset")
 
             print(
-                "🟢 [CIRCUIT HEALED] MoltSet API ping succeeded. Restoring circuit in DB."
+                f"🟢 [CIRCUIT HEALED] MoltSet API returned 200 OK. Balance: {tokens_remaining}. Circuit restored."
             )
 
             emit_executive_notification(
@@ -100,10 +129,15 @@ async def check_and_heal_moltset_circuit(app_instance):
                     event_type="pipeline_milestone",
                     severity="success",
                     headline="MoltSet Circuit Healed",
-                    outcome="MoltSet /get_account returned 200 OK. Restored automated dispatches.",
+                    outcome=f"MoltSet /get_account returned 200 OK (Credits: {tokens_remaining}). Restored automated dispatches.",
                     next_action="Nova dispatches resumed.",
                 )
             )
+        else:
+            print(
+                f"⏳ [MOLTSET PROBE] Probe returned HTTP {res.status_code}. Circuit remains broken. Next check in 30m."
+            )
+
     except Exception as e:
         print(f"⚠️ Circuit healing probe failed against MoltSet portal: {e}")
 
