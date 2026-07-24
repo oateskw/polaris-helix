@@ -54,13 +54,13 @@ async def check_and_heal_moltset_circuit(app_instance):
                 ledger_record = await cur.fetchone()
 
         is_broken = (
-            ledger_record.get("is_circuit_broken", True) if ledger_record else False
+            ledger_record.get("is_circuit_broken", False) if ledger_record else False
         )
     except Exception as db_err:
         print(f"⚠️ Failed to read MoltSet ledger state: {db_err}")
         return
 
-    # If the circuit is healthy, clean state and exit
+    # If the database already shows the circuit is healthy, clear memory state & exit cleanly
     if not is_broken:
         app_instance.state.disabled_circuits.discard("moltset")
         return
@@ -441,7 +441,6 @@ async def perpetual_awareness_loop(app_instance):
                         f"All dynamic queue items for weekday {current_weekday} maximized quota allocations. Standing down.",
                         "ORCHESTRATOR_COMPLETE",
                     )
-                    last_standard_drip_at = now_utc
                     await asyncio.sleep(60)
                     continue
 
@@ -603,12 +602,12 @@ async def perpetual_awareness_loop(app_instance):
                                 [next_agent_up],
                                 vendor_isolation_matrix,
                             )
-                            last_standard_drip_at = now_utc
+
+                        last_standard_drip_at = now_utc
                     else:
                         print(
                             "⏳ [ENGINE] All pending queue items are blocked by circuit isolation. Waiting..."
                         )
-                        last_standard_drip_at = now_utc
 
         except Exception as loop_crash:
             emit_executive_notification(
