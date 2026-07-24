@@ -93,35 +93,35 @@ async def check_and_heal_moltset_circuit(app_instance):
         if res.status_code == 200:
             data = res.json() or {}
 
-            # Extract credits/tokens from MoltSet response payload safely
-            # (Fallback to 100.00 if balance keys aren't in payload)
-            tokens_remaining = (
+            tokens_remaining = float(
                 data.get("tokens_remaining")
                 or data.get("credits")
                 or data.get("balance")
                 or 100.00
             )
 
-            async with db_pool.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        """
-                        UPDATE helix_infrastructure_oracle_ledger 
-                        SET is_circuit_broken = FALSE,
-                            credits_remaining = %s,
-                            last_updated_at = NOW() 
-                        WHERE LOWER(vendor_name) = 'moltset';
-                    """,
-                        (float(tokens_remaining),),
-                    )
-                await conn.commit()
+            # 👈 FIX: Only heal the circuit if actual credits/tokens remain (> 0)
+            if tokens_remaining > 0:
+                async with db_pool.connection() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            UPDATE helix_infrastructure_oracle_ledger 
+                            SET is_circuit_broken = FALSE,
+                                credits_remaining = %s,
+                                last_updated_at = NOW() 
+                            WHERE LOWER(vendor_name) = 'moltset';
+                        """,
+                            (tokens_remaining,),
+                        )
+                    await conn.commit()
 
-            # Restore in-memory state
-            app_instance.state.disabled_circuits.discard("moltset")
+                # Restore in-memory state
+                app_instance.state.disabled_circuits.discard("moltset")
 
-            print(
-                f"🟢 [CIRCUIT HEALED] MoltSet API returned 200 OK. Balance: {tokens_remaining}. Circuit restored."
-            )
+                print(
+                    f"🟢 [CIRCUIT HEALED] MoltSet API returned 200 OK. Balance: {tokens_remaining}. Circuit restored."
+                )
 
             emit_executive_notification(
                 ExecutiveNotificationEvent(
@@ -135,7 +135,7 @@ async def check_and_heal_moltset_circuit(app_instance):
             )
         else:
             print(
-                f"⏳ [MOLTSET PROBE] Probe returned HTTP {res.status_code}. Circuit remains broken. Next check in 30m."
+                f"⏳ [MOLTSET PROBE] Probe returned 200 OK but remaining balance is 0. Circuit remains broken."
             )
 
     except Exception as e:
