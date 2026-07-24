@@ -21,14 +21,11 @@ VENDOR_MOLTSET = "MoltSet"
 VENDOR_ANTHROPIC = "Anthropic"
 
 
-# In core/engine.py
-
-
 async def check_and_heal_moltset_circuit(app_instance):
     """
     Checks MoltSet circuit status every 30 minutes.
-    Queries /get_account, updates credits_remaining in the DB,
-    and automatically heals the circuit if MoltSet returns HTTP 200.
+    Queries /getAccess, updates credits_remaining in the DB,
+    and automatically heals the circuit if MoltSet returns HTTP 200 with available requests.
     """
     db_pool = app_instance.state.db_pool
 
@@ -65,7 +62,7 @@ async def check_and_heal_moltset_circuit(app_instance):
         app_instance.state.disabled_circuits.discard("moltset")
         return
 
-    # 3. Circuit IS broken — Ping MoltSet /get_account to probe balance & rate limits
+    # 3. Circuit IS broken — Probe MoltSet getAccess endpoint
     moltset_key = os.getenv("MOLTSET_API_KEY")
     api_endpoint = os.getenv(
         "MOLTSET_API_ENDPOINT", "https://api.moltsets.com/api/v1/tools/"
@@ -77,7 +74,8 @@ async def check_and_heal_moltset_circuit(app_instance):
     # Update last probe attempt timestamp
     app_instance.state.last_moltset_probe_time = now_utc
 
-    url = f"{api_endpoint.rstrip('/')}/get_account"
+    # ✅ Query getAccess endpoint
+    url = f"{api_endpoint.rstrip('/')}/getAccess"
     headers = {
         "Authorization": f"Bearer {moltset_key}",
         "Content-Type": "application/json",
@@ -93,15 +91,15 @@ async def check_and_heal_moltset_circuit(app_instance):
         if res.status_code == 200:
             data = res.json() or {}
 
-            tokens_remaining = float(
-                data.get("tokens_remaining")
+            requests_remaining = float(
+                data.get("requests_remaining")
+                or data.get("tokens_remaining")
                 or data.get("credits")
-                or data.get("balance")
                 or 100.00
             )
 
-            # 👈 FIX: Only heal the circuit if actual credits/tokens remain (> 0)
-            if tokens_remaining > 0:
+            # Only heal the circuit if actual requests/tokens remain (> 0)
+            if requests_remaining > 0:
                 async with db_pool.connection() as conn:
                     async with conn.cursor() as cur:
                         await cur.execute(
@@ -111,8 +109,8 @@ async def check_and_heal_moltset_circuit(app_instance):
                                 credits_remaining = %s,
                                 last_updated_at = NOW() 
                             WHERE LOWER(vendor_name) = 'moltset';
-                        """,
-                            (tokens_remaining,),
+                            """,
+                            (requests_remaining,),
                         )
                     await conn.commit()
 
@@ -120,22 +118,26 @@ async def check_and_heal_moltset_circuit(app_instance):
                 app_instance.state.disabled_circuits.discard("moltset")
 
                 print(
-                    f"🟢 [CIRCUIT HEALED] MoltSet API returned 200 OK. Balance: {tokens_remaining}. Circuit restored."
+                    f"🟢 [CIRCUIT HEALED] MoltSet getAccess returned 200 OK. Requests: {requests_remaining}. Circuit restored."
                 )
 
-            emit_executive_notification(
-                ExecutiveNotificationEvent(
-                    source_agent="helix",
-                    event_type="pipeline_milestone",
-                    severity="success",
-                    headline="MoltSet Circuit Healed",
-                    outcome=f"MoltSet /get_account returned 200 OK (Credits: {tokens_remaining}). Restored automated dispatches.",
-                    next_action="Nova dispatches resumed.",
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="helix",
+                        event_type="pipeline_milestone",
+                        severity="success",
+                        headline="MoltSet Circuit Healed",
+                        outcome=f"MoltSet getAccess returned 200 OK (Requests: {requests_remaining}). Restored automated dispatches.",
+                        next_action="Nova dispatches resumed.",
+                    )
                 )
-            )
+            else:
+                print(
+                    f"⏳ [MOLTSET PROBE] getAccess returned 200 OK but remaining requests balance is 0. Circuit remains broken."
+                )
         else:
             print(
-                f"⏳ [MOLTSET PROBE] Probe returned 200 OK but remaining balance is 0. Circuit remains broken."
+                f"⏳ [MOLTSET PROBE] getAccess probe failed with status {res.status_code}. Circuit remains broken."
             )
 
     except Exception as e:

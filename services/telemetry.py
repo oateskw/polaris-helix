@@ -671,6 +671,40 @@ async def analyze_and_orchestrate_log(
     extended_error_context = f"{norm_msg} {meta_string_dump}"
 
     try:
+        # ------------------------------------------------------------------
+        # 🌟 PASTE MOLTSET CIRCUIT BREAKER CODE HERE
+        # ------------------------------------------------------------------
+        if agent_name.lower() == "nova" and (
+            "429" in norm_msg
+            or "rate limit" in norm_msg
+            or "moltset" in extended_error_context
+            or meta.get("status") == "RATE_LIMITED"
+        ):
+            async with db_pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("""
+                        UPDATE helix_infrastructure_oracle_ledger 
+                        SET is_circuit_broken = TRUE, 
+                            credits_remaining = 0, 
+                            last_updated_at = NOW() 
+                        WHERE LOWER(vendor_name) = 'moltset';
+                    """)
+                await conn.commit()
+
+            if hasattr(app_state, "disabled_circuits"):
+                app_state.disabled_circuits.add("moltset")
+
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="vendor_circuit_breaker",
+                    severity="critical",
+                    headline="MoltSet Circuit Broken (Nova 429 Captured)",
+                    outcome="Nova hit MoltSet rate limit/429. Set MoltSet is_circuit_broken = TRUE.",
+                    next_action="Nova dispatches halted. Engine will probe getAccess every 30m.",
+                )
+            )
+
         async with db_pool.connection() as conn:
             async with conn.cursor() as cur:
                 if normalized_log_level == "INFO":
