@@ -153,6 +153,37 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                         f"High error density detected: {metrics['error_count']} ERROR logs in the last {lookback_days} days."
                     )
 
+                # Add zero-yield inspection for lead generation agents (nexus / nova / phantombuster)
+                if normalized_agent in ["nexus", "nova", "radar"]:
+                    await cur.execute(
+                        """
+                        SELECT metadata
+                        FROM agent_system_logs
+                        WHERE LOWER(agent_name) = %s
+                        AND timestamp >= NOW() - INTERVAL '24 hours'
+                        ORDER BY id DESC LIMIT 5;
+                    """,
+                        (normalized_agent,),
+                    )
+                    recent_logs = await cur.fetchall()
+
+                    zero_yield_runs = 0
+                    for r in recent_logs:
+                        meta = r.get("metadata") or {}
+                        # Catch runs where requested > 0 but processed == 0 (all duplicates/skipped)
+                        if (
+                            isinstance(meta, dict)
+                            and meta.get("requested", 0) > 0
+                            and meta.get("processed", 0) == 0
+                        ):
+                            zero_yield_runs += 1
+
+                    if zero_yield_runs >= 2:
+                        metrics["status"] = "UNDERPERFORMING"
+                        metrics["issues"].append(
+                            f"Zero-yield burnout detected: Last {zero_yield_runs} sweeps yielded 0 new processed leads due to duplicate saturation."
+                        )
+
     except Exception as e:
         print(f"⚠️ Performance evaluation error for {agent_name}: {e}")
         metrics["status"] = "UNKNOWN"
@@ -247,6 +278,35 @@ async def dispatch_chiron_optimization(
     except Exception as e:
         print(f"💥 Failed to dispatch Chiron optimization: {e}")
         return False
+
+
+async def run_preflight_audit(db_pool) -> dict:
+    """
+    Executes a pre-flight sanity check across active agents BEFORE
+    the main morning dispatch cycle fires.
+    """
+    print("🛫 [AUDITOR] Running pre-flight system diagnostics...")
+    async with db_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT LOWER(agent_name) as agent_name 
+                FROM helix_agent_manifests 
+                WHERE is_active = TRUE;
+            """)
+            active_agents = [r["agent_name"] for r in await cur.fetchall()]
+
+    preflight_issues = []
+    for agent in active_agents or ["beacon", "vanguard", "nova", "nexus"]:
+        audit = await evaluate_agent_performance(db_pool, agent)
+        if audit.get("status") == "UNDERPERFORMING":
+            preflight_issues.append((agent, audit))
+
+    # Trigger Chiron proactively if pre-flight flags issues
+    for agent_name, audit in preflight_issues:
+        print(f"⚠️ [PRE-FLIGHT] Proactively dispatching Chiron for '{agent_name}'")
+        await dispatch_chiron_optimization(db_pool, agent_name, audit)
+
+    return {"status": "completed", "issues_found": len(preflight_issues)}
 
 
 async def run_agent_performance_audit_loop(db_pool):

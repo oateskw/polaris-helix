@@ -147,8 +147,21 @@ async def perpetual_awareness_loop(app_instance):
 
             est_now = datetime.datetime.now(NEW_YORK_TZ)
             current_weekday = int(est_now.strftime("%w"))
-            current_time = est_now.time()
             current_date_str = est_now.strftime("%Y-%m-%d")
+
+            # Define morning execution window (e.g., 4:30 AM EST pre-flight)
+            if est_now.hour == 4 and est_now.minute == 30:
+                preflight_key = f"preflight_{current_date_str}"
+                if (
+                    getattr(app_instance.state, "last_preflight_date", None)
+                    != preflight_key
+                ):
+                    app_instance.state.last_preflight_date = preflight_key
+
+                    # Run proactive audit before the main morning drip fires!
+                    from core.auditor import run_preflight_audit
+
+                    await run_preflight_audit(db_pool)
 
             # OPEN ONE CONNECTION CONTEXT FOR THE ENTIRE TICK'S READ OPERATIONS
             async with db_pool.connection() as conn:

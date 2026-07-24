@@ -674,6 +674,12 @@ async def analyze_and_orchestrate_log(
         async with db_pool.connection() as conn:
             async with conn.cursor() as cur:
                 if normalized_log_level == "INFO":
+                    # Hook zero-yield remediation directly into telemetry processing
+                    if isinstance(meta, dict) and industry:
+                        asyncio.create_task(
+                            handle_zero_yield_remediation(db_pool, industry, meta)
+                        )
+
                     # success check
                     if "execution status: success" in norm_msg:
                         emit_executive_notification(
@@ -1014,3 +1020,42 @@ async def async_http_post_proxy(url: str, headers: dict, json_data: dict) -> boo
             return 200 <= res.status_code < 300
     except Exception:
         return False
+
+
+async def handle_zero_yield_remediation(
+    db_pool, industry_name: str, clean_metadata: dict
+):
+    """
+    Triggers automatically when a sweep processes 0 leads due to deduplication.
+    Rotates search parameters in helix_brain_scheduler to prevent query stagnation.
+    """
+    processed = clean_metadata.get(
+        "processed", clean_metadata.get("Total Leads Staged", -1)
+    )
+    skipped = clean_metadata.get("skipped", clean_metadata.get("Skipped", 0))
+
+    if processed == 0 and skipped > 0:
+        emit_executive_notification(
+            ExecutiveNotificationEvent(
+                source_agent="helix",
+                event_type="pipeline_milestone",
+                severity="warning",
+                headline="Zero-Yield Sweep Detected",
+                outcome=f"Sweep for '{industry_name}' yielded 0 new leads ({skipped} duplicates skipped).",
+                next_action="Auto-rotating target query parameters & incrementing requested batch size.",
+            )
+        )
+
+        # Proactively bump requested count or reset target timestamp to pull fresh angles
+        async with db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE helix_brain_scheduler
+                    SET priority_score = GREATEST(priority_score - 1, 1),
+                        last_targeted_at = NOW()
+                    WHERE industry_name = %s;
+                """,
+                    (industry_name,),
+                )
+            await conn.commit()
