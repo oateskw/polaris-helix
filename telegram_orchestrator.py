@@ -1,14 +1,15 @@
 import os
 import asyncio
-from datetime import datetime
+import hmac
+import html
+import datetime
 from zoneinfo import ZoneInfo
+import httpx
 from fastapi import APIRouter, Request, HTTPException
 from psycopg.rows import dict_row
 from helix_optimizer import run_daily_prompt_optimization
 from services.telemetry import (
-    send_telegram_broadcast,
     ExecutiveNotificationEvent,
-    emit_executive_notification,
     send_executive_summary_from_logs,
     is_vendor_circuit_healthy,
 )
@@ -18,6 +19,90 @@ router = APIRouter(prefix="/api/v1/telegram", tags=["telegram-control"])
 # Bind directly to your existing environment variable string
 TELEGRAM_ADMIN_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 EASTERN_TZ = ZoneInfo("America/New_York")
+DISPATCHABLE_AGENTS = frozenset(
+    {"nexus", "nova", "beacon", "radar", "pulsar", "vanguard", "aura"}
+)
+SCHEDULABLE_AGENTS = DISPATCHABLE_AGENTS | {"helix"}
+
+
+async def _send_command_notification(event: ExecutiveNotificationEvent) -> None:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        print("Telegram command response skipped: credentials are not configured.")
+        return
+
+    lines = [
+        f"<b>{html.escape(event.headline)}</b>",
+        f"Agent: <code>{html.escape(event.source_agent)}</code>",
+        f"Outcome: {html.escape(event.outcome)}",
+    ]
+    if event.impact:
+        lines.append(f"Impact: {html.escape(event.impact)}")
+    if event.next_action:
+        lines.append(f"Next: {html.escape(event.next_action)}")
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            response = await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": "\n".join(lines),
+                    "parse_mode": "HTML",
+                },
+            )
+            if response.status_code != 200:
+                print(
+                    "Telegram command response rejected "
+                    f"with HTTP {response.status_code}: {response.text[:300]}"
+                )
+    except Exception as exc:
+        print(f"Telegram command response failed: {exc}")
+
+
+def emit_executive_notification(event: ExecutiveNotificationEvent) -> None:
+    asyncio.create_task(_send_command_notification(event))
+
+
+def _parse_command(text: str) -> tuple[str, str | None]:
+    parts = text.strip().split(maxsplit=1)
+    if not parts:
+        return "", None
+    command = parts[0].split("@", 1)[0].lower()
+    argument = parts[1].strip().lower() if len(parts) > 1 else None
+    return command, argument
+
+
+async def _claim_update(db_pool, update_id: int, command: str) -> bool:
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO telegram_processed_updates (update_id, command)
+                VALUES (%s, %s)
+                ON CONFLICT (update_id) DO NOTHING
+                RETURNING update_id;
+                """,
+                (update_id, command),
+            )
+            claimed = await cur.fetchone()
+            await cur.execute(
+                "DELETE FROM telegram_processed_updates WHERE processed_at < NOW() - INTERVAL '30 days';"
+            )
+        await conn.commit()
+    return claimed is not None
+
+
+def _worker_status(task) -> str:
+    if task is None:
+        return "not initialized"
+    if task.cancelled():
+        return "cancelled"
+    if not task.done():
+        return "running"
+    exception = task.exception()
+    return f"crashed: {str(exception)[:80]}" if exception else "stopped"
 
 
 @router.post("/webhook")
@@ -26,25 +111,52 @@ async def telegram_webhook_handler(request: Request):
     Secure incoming webhook endpoint handling interactive commands
     sent to @Polaris_Inbound_Lead_bot.
     """
+    expected_secret = os.getenv("HELIX_AUTH_TOKEN", "")
+    provided_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if (
+        not expected_secret
+        or not provided_secret
+        or not hmac.compare_digest(provided_secret, expected_secret)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    if "message" not in payload or "text" not in payload["message"]:
+    message = payload.get("message")
+    if not isinstance(message, dict) or not isinstance(message.get("text"), str):
         return {"status": "ignored"}
 
-    message = payload["message"]
-    user_id = str(message["from"]["id"]).strip()
+    sender = message.get("from")
+    chat = message.get("chat")
+    if not isinstance(sender, dict) or not isinstance(chat, dict):
+        return {"status": "ignored"}
+
+    user_id = str(sender.get("id", "")).strip()
+    chat_id = str(chat.get("id", "")).strip()
     text = message.get("text", "").strip()
 
-    # 1. Strict Security Perimeter Check matching your variable
-    if user_id != TELEGRAM_ADMIN_CHAT_ID:
+    admin_chat_id = os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_ADMIN_CHAT_ID).strip()
+    if not admin_chat_id or user_id != admin_chat_id or chat_id != admin_chat_id:
         # Ignore unauthorized users silently to prevent exploit scanning
         return {"status": "unauthorized_user_dropped"}
 
+    command, argument = _parse_command(text)
+    if not command.startswith("/"):
+        return {"status": "ignored"}
+
+    update_id = payload.get("update_id")
+    if not isinstance(update_id, int):
+        raise HTTPException(status_code=400, detail="Missing Telegram update_id")
+
+    db_pool = request.app.state.db_pool
+    if not await _claim_update(db_pool, update_id, command):
+        return {"status": "duplicate"}
+
     # 2. Command Processing Matrix
-    if text == "/optimize":
+    if command == "/optimize":
         # 🆕 PREEMPTIVE CHECK
         db_pool = request.app.state.db_pool
         if not await is_vendor_circuit_healthy(db_pool, "Anthropic"):
@@ -103,7 +215,7 @@ async def telegram_webhook_handler(request: Request):
                 )
             )
 
-    elif text == "/status":
+    elif command == "/status":
         try:
             app_state = request.app.state
             db_pool = getattr(app_state, "db_pool", None)
@@ -113,28 +225,35 @@ async def telegram_webhook_handler(request: Request):
                 "Stable 🟢" if db_pool and not db_pool.closed else "Disconnected ❌"
             )
 
-            # 2. Verify if the autonomous background tasks are still alive or crashed
-            optimizer_task = getattr(app_state, "optimizer_task", None)
-            if optimizer_task and not optimizer_task.done():
-                optimizer_status = "Autonomous Background Daemon Active 🟢"
-            elif optimizer_task and optimizer_task.done():
-                # Check if it exited with an unhandled exception
-                exc = optimizer_task.exception()
-                optimizer_status = (
-                    f"Crashed ❌ (`{str(exc)[:30]}`)" if exc else "Stopped ⚠️"
+            worker_states = {
+                worker_name: _worker_status(getattr(app_state, state_name, None))
+                for worker_name, state_name in (
+                    ("auditor", "auditor_task"),
+                    ("awareness", "awareness_task"),
+                    ("credit sync", "credit_sync_task"),
+                    ("optimizer", "optimizer_task"),
+                    ("digest", "digest_task"),
+                    ("watchdog", "watchdog_task"),
                 )
-            else:
-                optimizer_status = "Not Initialized ⚠️"
+            }
+            workers_summary = "; ".join(
+                f"{name}: {status}" for name, status in worker_states.items()
+            )
+            degraded = any(status != "running" for status in worker_states.values())
 
             # 3. Compile and broadcast
             emit_executive_notification(
                 ExecutiveNotificationEvent(
                     source_agent="helix",
                     event_type="manual_command_ack",
-                    severity="info",
+                    severity="warning" if degraded else "info",
                     headline="Helix Status Snapshot",
-                    outcome=f"Database: {db_status}; Optimizer: {optimizer_status}",
-                    next_action="No action needed unless health is degraded.",
+                    outcome=f"Database: {db_status}; Workers: {workers_summary}",
+                    next_action=(
+                        "Inspect stopped or crashed workers."
+                        if degraded
+                        else "No action needed."
+                    ),
                 )
             )
 
@@ -151,7 +270,7 @@ async def telegram_webhook_handler(request: Request):
                 )
             )
 
-    elif text == "/history":
+    elif command == "/history":
         # 🆕 PREEMPTIVE CHECK
         db_pool = request.app.state.db_pool
         if not await is_vendor_circuit_healthy(db_pool, "Anthropic"):
@@ -185,21 +304,12 @@ async def telegram_webhook_handler(request: Request):
                 )
             )
 
-    elif text.startswith("/execute"):
+    elif command == "/execute":
         try:
-            # Split out the argument if one exists (e.g., "/execute nexus")
-            parts = text.split(maxsplit=1)
-            target_agent = parts[1].lower().strip() if len(parts) > 1 else None
-
-            # Dynamically extract allowed agent names directly from your main.py schema
-            from main import LogIngestSchema
-            from typing import get_args
-
-            agent_field_type = LogIngestSchema.__annotations__["agent_name"]
-            valid_agents = get_args(agent_field_type)
+            target_agent = argument
 
             # Validate if a single agent was specified
-            if target_agent and target_agent not in valid_agents:
+            if target_agent and target_agent not in DISPATCHABLE_AGENTS:
                 emit_executive_notification(
                     ExecutiveNotificationEvent(
                         source_agent="helix",
@@ -251,13 +361,6 @@ async def telegram_webhook_handler(request: Request):
                     await cur.execute(query)
                     strategy = await cur.fetchone()
 
-                    if strategy:
-                        await cur.execute(
-                            "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
-                            (strategy["industry_id"],),
-                        )
-                await conn.commit()
-
             if not strategy:
                 emit_executive_notification(
                     ExecutiveNotificationEvent(
@@ -284,13 +387,7 @@ async def telegram_webhook_handler(request: Request):
                 else ["nexus", "beacon", "nova", "vanguard", "pulsar"]
             )
 
-            # 4. Handoff to background mesh
-            from fastapi import BackgroundTasks
-
-            bg_tasks = BackgroundTasks()
-
-            bg_tasks.add_task(
-                trigger_downstream_mesh_with_payload,
+            dispatch_results = await trigger_downstream_mesh_with_payload(
                 db_pool,
                 request.app.state,
                 strategy,
@@ -298,21 +395,51 @@ async def telegram_webhook_handler(request: Request):
                 vendor_matrix,
             )
 
-            await bg_tasks()
+            accepted_agents = sorted(
+                agent for agent, accepted in dispatch_results.items() if accepted
+            )
+            failed_agents = sorted(
+                agent for agent, accepted in dispatch_results.items() if not accepted
+            )
 
-            # Clean up array representation for clean markdown printing
-            agents_string = ", ".join(agents_to_run)
+            if accepted_agents:
+                async with db_pool.connection() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
+                            (strategy["industry_id"],),
+                        )
+                    await conn.commit()
+
             target_region_str = strategy["target_region"] or "Global"
+            accepted_string = ", ".join(accepted_agents) or "none"
+            failed_string = ", ".join(failed_agents) or "none"
 
             emit_executive_notification(
                 ExecutiveNotificationEvent(
                     source_agent="helix",
                     event_type="pipeline_milestone",
-                    severity="success",
-                    headline="Mesh Sequence Deployed",
-                    outcome=f"Agents [{agents_string}] dispatched for {strategy['industry_name']}.",
-                    impact=f"Region: {target_region_str}",
-                    next_action="Track agent completions in Helix logs.",
+                    severity=(
+                        "success"
+                        if accepted_agents and not failed_agents
+                        else "warning"
+                    ),
+                    headline=(
+                        "Mesh Sequence Deployed"
+                        if accepted_agents
+                        else "Mesh Dispatch Failed"
+                    ),
+                    outcome=(
+                        f"Accepted: {accepted_string}; failed or blocked: {failed_string}."
+                    ),
+                    impact=(
+                        f"Industry: {strategy['industry_name']}; region: {target_region_str}"
+                    ),
+                    next_action=(
+                        "Track accepted agent completions in Helix logs."
+                        if accepted_agents
+                        else "Inspect downstream availability and circuit breakers."
+                    ),
                 )
             )
 
@@ -329,27 +456,22 @@ async def telegram_webhook_handler(request: Request):
                 )
             )
 
-    elif text.startswith(("/enable ", "/disable ")):
+    elif command in {"/enable", "/disable"}:
         try:
             db_pool = request.app.state.db_pool
-            command, target_agent = text.split(maxsplit=1)
-            target_agent = target_agent.strip().lower()
+            target_agent = argument or ""
 
-            # 🛑 1. Agent Name Validation
-            from main import LogIngestSchema
-            from typing import get_args
-
-            agent_field_type = LogIngestSchema.__annotations__["agent_name"]
-            valid_agents = get_args(agent_field_type)
-
-            if target_agent not in valid_agents:
+            if target_agent not in SCHEDULABLE_AGENTS:
                 emit_executive_notification(
                     ExecutiveNotificationEvent(
                         source_agent="helix",
                         event_type="action_blocked",
                         severity="warning",
                         headline="Command Rejected",
-                        outcome=f"❌ Unknown agent '{target_agent}'. Valid agents: {', '.join(valid_agents)}",
+                        outcome=(
+                            f"Unknown or unschedulable agent '{target_agent}'. Valid agents: "
+                            f"{', '.join(sorted(SCHEDULABLE_AGENTS))}"
+                        ),
                         next_action="Provide a valid agent identifier.",
                     )
                 )
@@ -413,14 +535,12 @@ async def telegram_webhook_handler(request: Request):
             )
 
     # 2. Smart /today Fetching (Supports Multiple Runs)
-    elif text == "/today":
+    elif command == "/today":
+        day_name = datetime.datetime.now(EASTERN_TZ).strftime("%A")
         try:
             db_pool = request.app.state.db_pool
 
-            from core.engine import NEW_YORK_TZ
-            import datetime
-
-            est_now = datetime.datetime.now(NEW_YORK_TZ)
+            est_now = datetime.datetime.now(EASTERN_TZ)
             current_weekday = int(est_now.strftime("%w"))
             day_name = est_now.strftime("%A")
 
@@ -439,19 +559,34 @@ async def telegram_webhook_handler(request: Request):
             async with db_pool.connection() as conn:
                 async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute("""
-                        SELECT LOWER(agent_name) as agent, COUNT(*) as run_count
+                        SELECT
+                            LOWER(agent_name) AS agent,
+                            COUNT(DISTINCT COALESCE(
+                                metadata->>'run_id',
+                                metadata->>'event_id',
+                                id::text
+                            )) AS run_count
                         FROM agent_system_logs 
-                        WHERE timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date
+                        WHERE timestamp >= (
+                            date_trunc('day', NOW() AT TIME ZONE 'America/New_York')
+                            AT TIME ZONE 'America/New_York'
+                        )
+                          AND (
+                              UPPER(COALESCE(metadata->>'status', '')) = 'COMPLETED'
+                              OR UPPER(COALESCE(metadata->>'lifecycle_event', '')) IN ('COMPLETED', 'RUN_COMPLETED')
+                              OR LOWER(message) LIKE '%execution status: success%'
+                          )
                         GROUP BY LOWER(agent_name);
                     """)
                     log_rows = await cur.fetchall()
                     run_counts = {r["agent"]: r["run_count"] for r in log_rows}
 
-            # 2. Hard-lock Helix metrics so it bypasses DB table data entirely
             helix_runs = run_counts.get("helix", 0)
-            completed_lines = [
-                f"  {EMOJI_MATRIX.get('helix', '⚙️')} *helix:* {max(helix_runs, 1)} / 1x runs"
-            ]
+            completed_lines = []
+            if helix_runs:
+                completed_lines.append(
+                    f"  {EMOJI_MATRIX.get('helix', '⚙️')} *helix:* {helix_runs} completed"
+                )
             pending_lines = []
 
             # 3. Query the database table for ALL OTHER agents
@@ -492,7 +627,11 @@ async def telegram_webhook_handler(request: Request):
                             f"  ⏳ *{agent}* ({max_runs - actual_runs} left)"
                         )
 
-            completed_str = "\n" + "\n".join(completed_lines)
+            completed_str = (
+                "\n" + "\n".join(completed_lines)
+                if completed_lines
+                else "\n  _No completed runs recorded._"
+            )
             pending_str = (
                 ("\n" + "\n".join(pending_lines))
                 if pending_lines
@@ -521,5 +660,31 @@ async def telegram_webhook_handler(request: Request):
                     next_action="Verify database connectivity.",
                 )
             )
+
+    elif command == "/help":
+        emit_executive_notification(
+            ExecutiveNotificationEvent(
+                source_agent="helix",
+                event_type="manual_command_ack",
+                severity="info",
+                headline="Helix Command Reference",
+                outcome=(
+                    "/status, /today, /history, /optimize, /execute [agent], "
+                    "/enable <agent>, /disable <agent>"
+                ),
+                next_action="Choose a command from the available control surface.",
+            )
+        )
+    else:
+        emit_executive_notification(
+            ExecutiveNotificationEvent(
+                source_agent="helix",
+                event_type="manual_command_ack",
+                severity="warning",
+                headline="Unknown Telegram Command",
+                outcome=f"Command '{command}' is not supported.",
+                next_action="Use /help to view available commands.",
+            )
+        )
 
     return {"status": "processed"}

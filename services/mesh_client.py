@@ -357,33 +357,32 @@ async def trigger_downstream_mesh_with_payload(
             target_industry,
         )
 
-        asyncio.create_task(
-            async_http_post_proxy(
-                f"{url}/api/v1/beacon/execute",
-                {
-                    "X-Beacon-Auth-Token": master_token,
-                    "Content-Type": "application/json",
-                },
-                {
-                    "industry_id": strategy["industry_id"],
-                    "industry_name": strategy["industry_name"],
-                    "target_region": strategy["target_region"],
-                    "bottleneck_profile": strategy["bottleneck_profile"],
-                    "campaign_strategy": strategy.get(
-                        "campaign_strategy", "BEFORE_AFTER"
-                    ),  # 👈 Added
-                    "nexus_directive": strategy.get("nexus_directive"),  # 👈 Added
-                    "learned_guidelines": beacon_guidelines,  # 🚀 Memory Injection
-                },
+        dispatch_results["beacon"] = await async_http_post_proxy(
+            f"{url}/api/v1/beacon/execute",
+            {
+                "X-Beacon-Auth-Token": master_token,
+                "Content-Type": "application/json",
+            },
+            {
+                "industry_id": strategy["industry_id"],
+                "industry_name": strategy["industry_name"],
+                "target_region": strategy["target_region"],
+                "bottleneck_profile": strategy["bottleneck_profile"],
+                "campaign_strategy": strategy.get("campaign_strategy", "BEFORE_AFTER"),
+                "nexus_directive": strategy.get("nexus_directive"),
+                "learned_guidelines": beacon_guidelines,
+            },
+        )
+        if dispatch_results["beacon"]:
+            send_telegram_broadcast(
+                "Beacon task instructions successfully dispatched down-mesh.",
+                "verbose",
             )
-        )
-        send_telegram_broadcast(
-            "Beacon task instructions successfully dispatched down-mesh.", "verbose"
-        )
 
     # 4. RADAR
     if "radar" in agent_list:
         if isolation_matrix.get(VENDOR_PHANTOMBUSTERS, False):
+            dispatch_results["radar"] = False
             send_telegram_broadcast(
                 "Skipping Radar lead scraping cycle. PhantomBusters circuit breaker is TRIPPED.",
                 "critical",
@@ -408,26 +407,26 @@ async def trigger_downstream_mesh_with_payload(
                 target_industry,
             )
 
-            asyncio.create_task(
-                async_http_post_proxy(
-                    f"{url}/api/v1/radar/execute",
-                    {
-                        "X-Radar-Auth-Token": master_token,
-                        "X-Helix-Keyword-Cap": str(keyword_cap),
-                        "Content-Type": "application/json",
-                    },
-                    {
-                        "industry_id": strategy["industry_id"],
-                        "industry_name": strategy["industry_name"],
-                        "target_region": strategy["target_region"],
-                        "bottleneck_profile": strategy["bottleneck_profile"],
-                        "learned_guidelines": radar_guidelines,  # 🚀 Memory Injection
-                    },
+            dispatch_results["radar"] = await async_http_post_proxy(
+                f"{url}/api/v1/radar/execute",
+                {
+                    "X-Radar-Auth-Token": master_token,
+                    "X-Helix-Keyword-Cap": str(keyword_cap),
+                    "Content-Type": "application/json",
+                },
+                {
+                    "industry_id": strategy["industry_id"],
+                    "industry_name": strategy["industry_name"],
+                    "target_region": strategy["target_region"],
+                    "bottleneck_profile": strategy["bottleneck_profile"],
+                    "learned_guidelines": radar_guidelines,
+                },
+            )
+            if dispatch_results["radar"]:
+                send_telegram_broadcast(
+                    "Radar lead scraping cycle successfully deployed down-mesh.",
+                    "verbose",
                 )
-            )
-            send_telegram_broadcast(
-                "Radar lead scraping cycle successfully deployed down-mesh.", "verbose"
-            )
 
     # 5. PULSAR
     if "pulsar" in agent_list:
@@ -446,23 +445,23 @@ async def trigger_downstream_mesh_with_payload(
             "DISPATCH_PULSAR_REQUEST",
             target_industry,
         )
-        asyncio.create_task(
-            async_http_post_proxy(
-                f"{url}/api/v1/pulsar/sweep",
-                {
-                    "X-Pulsar-Auth-Token": master_token,
-                    "Content-Type": "application/json",
-                },
-                {"learned_guidelines": pulsar_guidelines},  # 🚀 Memory Injection
+        dispatch_results["pulsar"] = await async_http_post_proxy(
+            f"{url}/api/v1/pulsar/sweep",
+            {
+                "X-Pulsar-Auth-Token": master_token,
+                "Content-Type": "application/json",
+            },
+            {"learned_guidelines": pulsar_guidelines},
+        )
+        if dispatch_results["pulsar"]:
+            send_telegram_broadcast(
+                "Pulsar sweep trigger successfully deployed down-mesh.", "verbose"
             )
-        )
-        send_telegram_broadcast(
-            "Pulsar sweep trigger successfully deployed down-mesh.", "verbose"
-        )
 
     # 6. VANGUARD OUTBOUND SWEEP
     if "vanguard" in agent_list:
         if isolation_matrix.get(VENDOR_MYEMAILVERIFIER, False):
+            dispatch_results["vanguard"] = False
             send_telegram_broadcast(
                 "Skipping Vanguard outbound campaign sweep. Validation credit ledger reported isolation.",
                 "critical",
@@ -484,22 +483,22 @@ async def trigger_downstream_mesh_with_payload(
                 "DISPATCH_VANGUARD_REQUEST",
                 target_industry,
             )
-            asyncio.create_task(
-                async_http_post_proxy(
-                    f"{url}/api/v1/dispatch/sweep",
-                    {
-                        "X-Vanguard-Auth-Token": master_token,
-                        "Content-Type": "application/json",
-                    },
-                    {
-                        "industry_name": target_industry,
-                        "learned_guidelines": vanguard_guidelines,  # 🚀 Memory Injection
-                    },
+            dispatch_results["vanguard"] = await async_http_post_proxy(
+                f"{url}/api/v1/dispatch/sweep",
+                {
+                    "X-Vanguard-Auth-Token": master_token,
+                    "Content-Type": "application/json",
+                },
+                {
+                    "industry_name": target_industry,
+                    "learned_guidelines": vanguard_guidelines,
+                },
+            )
+            if dispatch_results["vanguard"]:
+                send_telegram_broadcast(
+                    "Vanguard outbound campaign sweep initiated successfully.",
+                    "verbose",
                 )
-            )
-            send_telegram_broadcast(
-                "Vanguard outbound campaign sweep initiated successfully.", "verbose"
-            )
 
     # 7. AURA AUTOMATED MEDIA ENGINE
     if "aura" in agent_list:
@@ -523,25 +522,24 @@ async def trigger_downstream_mesh_with_payload(
             "learned_guidelines": aura_guidelines,  # 🚀 Memory Injection
         }
 
-        asyncio.create_task(
-            async_http_post_proxy(
-                f"{url}/api/v1/aura",
-                {
-                    "x-aura-secret": master_token,
-                    "Content-Type": "application/json",
-                },
-                aura_payload,
-            )
+        dispatch_results["aura"] = await async_http_post_proxy(
+            f"{url}/api/v1/aura",
+            {
+                "x-aura-secret": master_token,
+                "Content-Type": "application/json",
+            },
+            aura_payload,
         )
-        emit_executive_notification(
-            ExecutiveNotificationEvent(
-                source_agent="aura",
-                event_type="pipeline_milestone",
-                severity="success",
-                headline="Aura Dispatch Started",
-                outcome=f"Aura orchestration payload successfully dispatched for {target_industry}.",
-                next_action="Awaiting automated compilation and media rendering metrics.",
+        if dispatch_results["aura"]:
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="aura",
+                    event_type="pipeline_milestone",
+                    severity="success",
+                    headline="Aura Dispatch Started",
+                    outcome=f"Aura orchestration payload successfully dispatched for {target_industry}.",
+                    next_action="Awaiting automated compilation and media rendering metrics.",
+                )
             )
-        )
 
     return dispatch_results

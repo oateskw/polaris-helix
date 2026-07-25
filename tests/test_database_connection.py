@@ -101,3 +101,9 @@ def test_schema_requires_python_traceback_for_new_error_logs():
     assert "log_level <> 'ERROR'" in PROVISION_SQL
     assert "metadata->>'traceback'" in PROVISION_SQL
     assert "NOT VALID" in PROVISION_SQL
+
+
+def test_schema_provisions_telegram_update_deduplication():
+    assert "CREATE TABLE IF NOT EXISTS telegram_processed_updates" in PROVISION_SQL
+    assert "update_id    BIGINT      PRIMARY KEY" in PROVISION_SQL
+    assert "idx_tpu_processed_at" in PROVISION_SQL
