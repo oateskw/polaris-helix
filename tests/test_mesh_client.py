@@ -170,3 +170,64 @@ async def test_beacon_mesh_posts_nexus_campaign_strategy(db_pool_factory, monkey
 
     assert post_proxy.await_args.args[2]["campaign_strategy"] == "OBJECTION_KILLER"
     assert result == {"beacon": True}
+
+
+@pytest.mark.anyio
+async def test_nexus_mesh_normalizes_quoted_helix_auth_token(
+    db_pool_factory, monkeypatch
+):
+    pool, _, _ = db_pool_factory()
+    post_proxy = AsyncMock(return_value=True)
+    monkeypatch.setenv("HELIX_AUTH_TOKEN", ' "shared-token" ')
+    monkeypatch.setattr(
+        "services.mesh_client.query_learned_guidelines", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr("services.mesh_client.async_http_post_proxy", post_proxy)
+    monkeypatch.setattr(
+        "services.telemetry.write_helix_command_center_log", AsyncMock()
+    )
+    monkeypatch.setattr("services.telemetry.emit_executive_notification", MagicMock())
+
+    result = await trigger_downstream_mesh_with_payload(
+        pool,
+        SimpleNamespace(),
+        {
+            "industry_id": 42,
+            "industry_name": "Logistics",
+            "target_region": "Texas",
+            "bottleneck_profile": "Manual dispatching",
+            "pain_tokens": ["delay"],
+        },
+        ["nexus"],
+        {},
+    )
+
+    assert post_proxy.await_args.args[1]["X-Nexus-Auth-Token"] == "shared-token"
+    assert result == {"nexus": True}
+
+
+@pytest.mark.anyio
+async def test_nexus_mesh_skips_dispatch_without_helix_auth_token(
+    db_pool_factory, monkeypatch
+):
+    pool, _, _ = db_pool_factory()
+    post_proxy = AsyncMock()
+    command_log = AsyncMock()
+    monkeypatch.delenv("HELIX_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr("services.mesh_client.async_http_post_proxy", post_proxy)
+    monkeypatch.setattr(
+        "services.telemetry.write_helix_command_center_log", command_log
+    )
+    monkeypatch.setattr("services.telemetry.emit_executive_notification", MagicMock())
+
+    result = await trigger_downstream_mesh_with_payload(
+        pool,
+        SimpleNamespace(),
+        {"industry_name": "Logistics"},
+        ["nexus"],
+        {},
+    )
+
+    post_proxy.assert_not_awaited()
+    assert command_log.await_args.args[3] == "SKIP_NEXUS_AUTH_UNAVAILABLE"
+    assert result == {"nexus": False}

@@ -20,6 +20,13 @@ VALID_CAMPAIGN_STRATEGIES = frozenset(
 from helix_memory import query_learned_guidelines
 
 
+def normalize_auth_token(value: str | None) -> str:
+    token = (value or "").strip()
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
+        token = token[1:-1].strip()
+    return token
+
+
 def build_nova_ignition_payload(
     strategy: dict[str, Any], learned_guidelines: list[str], run_id: str | None = None
 ) -> dict[str, Any]:
@@ -193,12 +200,32 @@ async def trigger_downstream_mesh_with_payload(
         )
         return dispatch_results
 
-    master_token = os.getenv("HELIX_AUTH_TOKEN", "")
+    master_token = normalize_auth_token(os.getenv("HELIX_AUTH_TOKEN"))
     target_industry = strategy.get("industry_name", "General Operations")
 
     # 1. NEXUS OMNI-STRATEGIST (Enforced Dependency Barrier)
     if "nexus" in agent_list:
-        if isolation_matrix.get(VENDOR_ANTHROPIC, False):
+        if not master_token:
+            dispatch_results["nexus"] = False
+            await write_helix_command_center_log(
+                db_pool,
+                "CRITICAL",
+                "Nexus dispatch blocked because HELIX_AUTH_TOKEN is not configured.",
+                "SKIP_NEXUS_AUTH_UNAVAILABLE",
+                target_industry,
+            )
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="critical_failure",
+                    severity="critical",
+                    headline="Nexus Authentication Unavailable",
+                    outcome="Helix has no configured token for the Nexus request.",
+                    next_action="Set the same HELIX_AUTH_TOKEN on Helix and Nexus, then redeploy both services.",
+                )
+            )
+            return dispatch_results
+        elif isolation_matrix.get(VENDOR_ANTHROPIC, False):
             dispatch_results["nexus"] = False
             emit_executive_notification(
                 ExecutiveNotificationEvent(
