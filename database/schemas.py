@@ -19,6 +19,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_asl_event_id
     ON agent_system_logs ((metadata->>'event_id'))
     WHERE metadata->>'event_id' IS NOT NULL;
 
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'error_logs_require_python_traceback'
+          AND conrelid = 'agent_system_logs'::regclass
+    ) THEN
+        ALTER TABLE agent_system_logs
+        ADD CONSTRAINT error_logs_require_python_traceback
+        CHECK (
+            log_level <> 'ERROR'
+            OR COALESCE(
+                jsonb_typeof(metadata) = 'object'
+                AND LENGTH(BTRIM(metadata->>'traceback')) > 0
+                AND (metadata->>'traceback') ~ 'File "[^"]+", line [0-9]+',
+                FALSE
+            )
+        ) NOT VALID;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS cold_leads (
     email       TEXT         PRIMARY KEY,
     first_name  TEXT,

@@ -4,6 +4,7 @@ import hmac
 import asyncio
 import psycopg
 import json
+import re
 import traceback
 import httpx
 from typing import List, Optional, Literal
@@ -21,7 +22,7 @@ from fastapi import (
     Header,
     BackgroundTasks,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from anthropic import Anthropic
@@ -328,6 +329,20 @@ class LogIngestSchema(BaseModel):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     message: str
     metadata: Optional[LogMetadataSchema] = None
+
+    @model_validator(mode="after")
+    def require_python_traceback_for_errors(self):
+        if self.log_level != "ERROR":
+            return self
+
+        traceback_text = self.metadata.traceback if self.metadata else None
+        if not traceback_text or not traceback_text.strip():
+            raise ValueError("metadata.traceback is required for ERROR logs")
+        if not re.search(r'File "[^"]+", line \d+', traceback_text):
+            raise ValueError(
+                "metadata.traceback must contain a parseable Python traceback frame"
+            )
+        return self
 
 
 class LeadIngestModel(BaseModel):

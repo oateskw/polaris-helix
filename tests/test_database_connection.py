@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import AsyncMock, patch
 
 import database.connection as connection
+from database.schemas import PROVISION_SQL
 
 
 @pytest.mark.anyio
@@ -14,14 +15,14 @@ async def test_placeholder_async_marker():
 async def test_pool_lifecycle_respects_scheduling_constraints(monkeypatch):
     """Verify pool closes cleanly when scheduling constraints require standdown."""
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
-    
+
     mock_pool = AsyncMock()
     mock_pool.close = AsyncMock()
-    
+
     with patch.object(connection, "AsyncConnectionPool", return_value=mock_pool):
         pool = connection.create_async_db_pool()
         pool.open = True
-        
+
         # Simulate standdown scenario
         await pool.close()
         mock_pool.close.assert_called_once()
@@ -76,18 +77,27 @@ def test_create_async_db_pool_contract(monkeypatch):
 def test_pool_initialization_deferred_for_scheduling_compliance(monkeypatch):
     """Ensure pool remains closed until explicitly opened per scheduling rules."""
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
-    
+
     captured = {}
-    
+
     class PoolSpy:
         check_connection = object()
-        
+
         def __init__(self, **kwargs):
             captured.update(kwargs)
-    
+
     monkeypatch.setattr(connection, "AsyncConnectionPool", PoolSpy)
-    
+
     pool = connection.create_async_db_pool()
-    
+
     # Critical: pool must start closed to prevent resource leaks on unassigned days
-    assert captured["open"] is False, "Pool must not auto-open to respect scheduling constraints"
+    assert (
+        captured["open"] is False
+    ), "Pool must not auto-open to respect scheduling constraints"
+
+
+def test_schema_requires_python_traceback_for_new_error_logs():
+    assert "error_logs_require_python_traceback" in PROVISION_SQL
+    assert "log_level <> 'ERROR'" in PROVISION_SQL
+    assert "metadata->>'traceback'" in PROVISION_SQL
+    assert "NOT VALID" in PROVISION_SQL

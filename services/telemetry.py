@@ -3,6 +3,7 @@ import json
 import asyncio
 import traceback
 import hashlib
+import re
 import httpx
 import requests
 import datetime
@@ -363,9 +364,17 @@ async def write_helix_command_center_log(
     normalized_level = str(log_level or "INFO").upper()
     if normalized_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         print(
-            f"[WARNING] [HELIX] Unsupported log level '{log_level}' normalized to ERROR."
+            f"[WARNING] [HELIX] Unsupported log level '{log_level}' normalized to WARNING."
         )
-        normalized_level = "ERROR"
+        normalized_level = "WARNING"
+    traceback_text = (
+        extra_metadata.get("traceback") if isinstance(extra_metadata, dict) else None
+    )
+    if normalized_level == "ERROR" and not (
+        isinstance(traceback_text, str)
+        and re.search(r'File "[^"]+", line \d+', traceback_text)
+    ):
+        normalized_level = "WARNING"
     print(f"[{normalized_level}] [HELIX] [{action_taken}] {message}")
     metadata_payload = {
         "command_center_view": {

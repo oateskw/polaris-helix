@@ -202,6 +202,57 @@ async def test_ingest_log_accepts_debug_level(
     assert response.json()["logged_id"] == 91
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [None, {}, {"traceback": ""}, {"traceback": "ValueError: malformed"}],
+)
+async def test_ingest_log_rejects_error_without_python_traceback(
+    app_module, app_client, db_pool_factory, metadata
+):
+    pool, _, cursors = db_pool_factory(fetchone_sequence=[(91,)])
+    app_module.app.state.db_pool = pool
+
+    response = await app_client.post(
+        "/api/v1/logs",
+        headers={"X-Helix-Auth-Token": TEST_AUTH_TOKEN},
+        json={
+            "agent_name": "nova",
+            "log_level": "ERROR",
+            "message": "ValueError: malformed",
+            "metadata": metadata,
+        },
+    )
+
+    assert response.status_code == 422
+    assert cursors[0].executed == []
+
+
+async def test_ingest_log_accepts_error_with_python_traceback(
+    app_module, app_client, db_pool_factory, monkeypatch
+):
+    pool, _, _ = db_pool_factory(fetchone_sequence=[(92,)])
+    app_module.app.state.db_pool = pool
+    monkeypatch.setattr(
+        app_module.asyncio, "create_task", lambda coroutine: coroutine.close()
+    )
+
+    response = await app_client.post(
+        "/api/v1/logs",
+        headers={"X-Helix-Auth-Token": TEST_AUTH_TOKEN},
+        json={
+            "agent_name": "nova",
+            "log_level": "ERROR",
+            "message": "ValueError: malformed",
+            "metadata": {
+                "traceback": 'Traceback (most recent call last):\n  File "/app/nova_agent.py", line 42, in run\n    raise ValueError("malformed")\nValueError: malformed'
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["logged_id"] == 92
+
+
 async def test_ingest_log_requires_authentication(app_client):
     response = await app_client.post(
         "/api/v1/logs",
