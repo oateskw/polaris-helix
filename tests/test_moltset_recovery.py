@@ -120,24 +120,26 @@ async def test_due_moltset_probe_claims_window_heals_and_logs(
     cursors[1].fetchone_values.append(("MoltSet",))
     app = SimpleNamespace(state=SimpleNamespace(db_pool=pool))
 
-    response = MagicMock(status_code=200)
-    response.json.return_value = {
+    account_response = MagicMock(status_code=200)
+    account_response.json.return_value = {
         "status": "ok",
         "results": {
             "status": "active",
             "fair_use": {"search": {"requests": {"5h": {"remaining": 2382}}}},
         },
     }
-    post = MagicMock(return_value=response)
+    post = MagicMock(return_value=account_response)
     command_log = AsyncMock()
     monkeypatch.setenv("MOLTSET_API_KEY", "test-key")
     monkeypatch.setattr("core.engine.requests.post", post)
     monkeypatch.setattr("core.engine.write_helix_command_center_log", command_log)
     monkeypatch.setattr("core.engine.emit_executive_notification", MagicMock())
 
-    await check_and_heal_moltset_circuit(app)
+    healed = await check_and_heal_moltset_circuit(app)
 
+    assert healed is True
     post.assert_called_once()
+    assert post.call_args.args[0].endswith("/get_account")
     assert "last_updated_at = NOW()" in cursors[1].executed[0][0]
     assert "is_circuit_broken = FALSE" in cursors[2].executed[0][0]
     assert "moltset" not in app.state.disabled_circuits

@@ -54,11 +54,10 @@ def is_moltset_probe_due(
     return check_time - last_updated_at >= MOLTSET_RECOVERY_COOLDOWN
 
 
-async def check_and_heal_moltset_circuit(app_instance):
+async def check_and_heal_moltset_circuit(app_instance) -> bool:
     """
     Checks MoltSet circuit status every 30 minutes.
-    Queries /get_account and heals only when the active account reports
-    positive five-hour search-request capacity.
+    Queries the quota-free /get_account endpoint before healing the circuit.
     """
     db_pool = app_instance.state.db_pool
 
@@ -83,16 +82,16 @@ async def check_and_heal_moltset_circuit(app_instance):
         )
     except Exception as db_err:
         print(f"⚠️ Failed to read MoltSet ledger state: {db_err}")
-        return
+        return False
 
     # If the database already shows the circuit is healthy, clear memory state & exit cleanly
     if not is_broken:
         app_instance.state.disabled_circuits.discard("moltset")
-        return
+        return False
 
     app_instance.state.disabled_circuits.add("moltset")
     if not is_moltset_probe_due(ledger_record.get("last_updated_at"), now_utc):
-        return
+        return False
 
     # 3. Circuit IS broken — Probe MoltSet get_account endpoint
     moltset_key = os.getenv("MOLTSET_API_KEY")
@@ -101,7 +100,7 @@ async def check_and_heal_moltset_circuit(app_instance):
     ).strip()
 
     if not moltset_key:
-        return
+        return False
 
     # Atomically claim this recovery probe. This persists the next cooldown and
     # prevents multiple Render instances from probing or healing concurrently.
@@ -119,7 +118,7 @@ async def check_and_heal_moltset_circuit(app_instance):
         await conn.commit()
 
     if not claimed_probe:
-        return
+        return False
 
     await write_helix_command_center_log(
         db_pool,
@@ -146,7 +145,6 @@ async def check_and_heal_moltset_circuit(app_instance):
             data = res.json() or {}
             requests_remaining = parse_moltset_search_capacity(data)
 
-            # Only heal the circuit if actual requests/tokens remain (> 0)
             if requests_remaining is not None and requests_remaining > 0:
                 async with db_pool.connection() as conn:
                     async with conn.cursor() as cur:
@@ -182,11 +180,12 @@ async def check_and_heal_moltset_circuit(app_instance):
                 await write_helix_command_center_log(
                     db_pool,
                     "INFO",
-                    f"MoltSet circuit healed with {requests_remaining} five-hour search requests available.",
+                    f"MoltSet circuit healed from quota-free account capacity verification ({requests_remaining} requests available).",
                     "MOLTSET_CIRCUIT_HEALED",
                     "MoltSet",
                     {"requests_remaining": requests_remaining},
                 )
+                return True
             else:
                 print(
                     "⏳ [MOLTSET PROBE] get_account did not report positive active-account search capacity. Circuit remains broken."
@@ -221,6 +220,8 @@ async def check_and_heal_moltset_circuit(app_instance):
             "MoltSet",
             {"error_type": type(e).__name__},
         )
+
+    return False
 
 
 async def load_vendor_isolation_matrix(db_pool) -> dict:
@@ -261,11 +262,15 @@ async def dispatch_nova_if_due(app_instance) -> None:
                 FROM agent_system_logs
                 WHERE agent_name = 'helix'
                   AND timestamp >= NOW() - INTERVAL '30 minutes'
-                  AND metadata->'command_center_view'->>'action_taken' = 'DISPATCH_NOVA_30_MINUTE';
+                  AND metadata->'command_center_view'->>'action_taken' IN (
+                      'DISPATCH_NOVA_30_MINUTE',
+                      'DISPATCH_NOVA_REJECTED',
+                      'SKIP_NOVA_ISOLATION'
+                  );
             """)
-            recent_dispatch = (await cur.fetchone())[0]
+            recent_attempt = (await cur.fetchone())[0]
 
-    if recent_dispatch:
+    if recent_attempt:
         return
 
     vendor_isolation_matrix = await load_vendor_isolation_matrix(db_pool)
@@ -294,13 +299,16 @@ async def dispatch_nova_if_due(app_instance) -> None:
     if not strategy:
         return
 
-    await trigger_downstream_mesh_with_payload(
+    dispatch_results = await trigger_downstream_mesh_with_payload(
         db_pool,
         app_instance.state,
         strategy,
         ["nova"],
         vendor_isolation_matrix,
     )
+    if not dispatch_results.get("nova", False):
+        return
+
     await write_helix_command_center_log(
         db_pool,
         "INFO",
@@ -318,13 +326,14 @@ async def perpetual_awareness_loop(app_instance):
 
     while True:
         try:
-            await check_and_heal_moltset_circuit(app_instance)
+            moltset_healed = await check_and_heal_moltset_circuit(app_instance)
 
             est_now = datetime.datetime.now(NEW_YORK_TZ)
             current_weekday = int(est_now.strftime("%w"))
             current_date_str = est_now.strftime("%Y-%m-%d")
 
-            await dispatch_nova_if_due(app_instance)
+            if not moltset_healed:
+                await dispatch_nova_if_due(app_instance)
 
             # Define morning execution window (e.g., 4:30 AM EST pre-flight)
             if est_now.hour == 4 and est_now.minute == 30:

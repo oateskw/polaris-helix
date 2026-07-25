@@ -1,4 +1,12 @@
-from services.mesh_client import build_nova_ignition_payload
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from services.mesh_client import (
+    build_nova_ignition_payload,
+    trigger_downstream_mesh_with_payload,
+)
 
 
 def test_build_nova_ignition_payload_matches_nova_schema():
@@ -50,3 +58,39 @@ def test_build_nova_ignition_payload_defaults_nullable_strategy_text():
             "bottleneck_profile": "Operational inefficiency",
         }
     ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("accepted", [True, False])
+async def test_nova_mesh_propagates_ignition_acceptance(
+    accepted, db_pool_factory, monkeypatch
+):
+    pool, _, _ = db_pool_factory()
+    post_proxy = AsyncMock(return_value=accepted)
+    monkeypatch.setattr(
+        "services.mesh_client.query_learned_guidelines",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr("services.mesh_client.async_http_post_proxy", post_proxy)
+    monkeypatch.setattr(
+        "services.telemetry.write_helix_command_center_log", AsyncMock()
+    )
+    monkeypatch.setattr("services.telemetry.emit_executive_notification", MagicMock())
+
+    result = await trigger_downstream_mesh_with_payload(
+        pool,
+        SimpleNamespace(),
+        {
+            "industry_id": 42,
+            "industry_name": "Logistics",
+            "moltset_category": "Transportation",
+            "bottleneck_profile": "Manual dispatching",
+            "pain_tokens": [],
+            "target_region": "Texas",
+        },
+        ["nova"],
+        {},
+    )
+
+    post_proxy.assert_awaited_once()
+    assert result == {"nova": accepted}

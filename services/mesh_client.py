@@ -26,8 +26,7 @@ def build_nova_ignition_payload(
         "industries": [
             {
                 "industry_id": strategy["industry_id"],
-                "industry_name": strategy.get("industry_name")
-                or "General Operations",
+                "industry_name": strategy.get("industry_name") or "General Operations",
                 "moltset_category": strategy.get("moltset_category")
                 or "Professional Services",
                 "bottleneck_profile": strategy.get("bottleneck_profile")
@@ -149,13 +148,15 @@ async def async_http_post_proxy(
 
 async def trigger_downstream_mesh_with_payload(
     db_pool, app_state, strategy: dict, agent_list: list, isolation_matrix: dict
-):
+) -> dict[str, bool]:
     from services.telemetry import (
         send_telegram_broadcast,
         write_helix_command_center_log,
         ExecutiveNotificationEvent,
         emit_executive_notification,
     )
+
+    dispatch_results: dict[str, bool] = {}
 
     if not agent_list:
         await write_helix_command_center_log(
@@ -165,7 +166,7 @@ async def trigger_downstream_mesh_with_payload(
             "SKIP_MESH_DISPATCH_EMPTY_AGENT_LIST",
             strategy.get("industry_name", "UNKNOWN"),
         )
-        return
+        return dispatch_results
 
     master_token = os.getenv("HELIX_AUTH_TOKEN", "")
     target_industry = strategy.get("industry_name", "General Operations")
@@ -173,6 +174,7 @@ async def trigger_downstream_mesh_with_payload(
     # 1. NEXUS OMNI-STRATEGIST (Enforced Dependency Barrier)
     if "nexus" in agent_list:
         if isolation_matrix.get(VENDOR_ANTHROPIC, False):
+            dispatch_results["nexus"] = False
             emit_executive_notification(
                 ExecutiveNotificationEvent(
                     source_agent="nexus",
@@ -222,6 +224,7 @@ async def trigger_downstream_mesh_with_payload(
             )
 
             if not nexus_success:
+                dispatch_results["nexus"] = False
                 emit_executive_notification(
                     ExecutiveNotificationEvent(
                         source_agent="nexus",
@@ -240,7 +243,9 @@ async def trigger_downstream_mesh_with_payload(
                     "ABORT_DOWNSTREAM_MESH",
                     target_industry,
                 )
-                return
+                return dispatch_results
+
+            dispatch_results["nexus"] = True
 
             emit_executive_notification(
                 ExecutiveNotificationEvent(
@@ -256,6 +261,7 @@ async def trigger_downstream_mesh_with_payload(
     # 2. NOVA (Lead Harvesting Production Loop)
     if "nova" in agent_list:
         if isolation_matrix.get(VENDOR_MOLTSET, False):
+            dispatch_results["nova"] = False
             emit_executive_notification(
                 ExecutiveNotificationEvent(
                     source_agent="nova",
@@ -302,6 +308,7 @@ async def trigger_downstream_mesh_with_payload(
             )
 
             if nova_accepted:
+                dispatch_results["nova"] = True
                 emit_executive_notification(
                     ExecutiveNotificationEvent(
                         source_agent="nova",
@@ -313,6 +320,7 @@ async def trigger_downstream_mesh_with_payload(
                     )
                 )
             else:
+                dispatch_results["nova"] = False
                 await write_helix_command_center_log(
                     db_pool,
                     "ERROR",
@@ -526,3 +534,5 @@ async def trigger_downstream_mesh_with_payload(
                 next_action="Awaiting automated compilation and media rendering metrics.",
             )
         )
+
+    return dispatch_results
