@@ -30,6 +30,23 @@ CREATE INDEX IF NOT EXISTS idx_tpu_processed_at
 
 DO $$
 BEGIN
+    IF to_regclass('helix_agent_manifests') IS NOT NULL THEN
+        ALTER TABLE helix_agent_manifests
+            ADD COLUMN IF NOT EXISTS optimization_status TEXT NOT NULL DEFAULT 'IDLE',
+            ADD COLUMN IF NOT EXISTS last_optimized_at TIMESTAMPTZ;
+
+        UPDATE helix_agent_manifests
+        SET optimization_status = 'IDLE'
+        WHERE optimization_status IS NULL;
+
+        EXECUTE 'CREATE INDEX IF NOT EXISTS idx_ham_chiron_eligibility '
+                'ON helix_agent_manifests '
+                '(is_active, optimization_status, last_optimized_at, LOWER(agent_name))';
+    END IF;
+END $$;
+
+DO $$
+BEGIN
     IF NOT EXISTS (
         SELECT 1
         FROM pg_constraint

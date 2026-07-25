@@ -123,6 +123,23 @@ async def ensure_observability_schema(db_pool) -> None:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_asl_event_id
                 ON agent_system_logs ((metadata->>'event_id'))
                 WHERE metadata->>'event_id' IS NOT NULL;
+
+                DO $$
+                BEGIN
+                    IF to_regclass('helix_agent_manifests') IS NOT NULL THEN
+                        ALTER TABLE helix_agent_manifests
+                            ADD COLUMN IF NOT EXISTS optimization_status TEXT NOT NULL DEFAULT 'IDLE',
+                            ADD COLUMN IF NOT EXISTS last_optimized_at TIMESTAMPTZ;
+
+                        UPDATE helix_agent_manifests
+                        SET optimization_status = 'IDLE'
+                        WHERE optimization_status IS NULL;
+
+                        EXECUTE 'CREATE INDEX IF NOT EXISTS idx_ham_chiron_eligibility '
+                                'ON helix_agent_manifests '
+                                '(is_active, optimization_status, last_optimized_at, LOWER(agent_name))';
+                    END IF;
+                END $$;
             """)
         await conn.commit()
 

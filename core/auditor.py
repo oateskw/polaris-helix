@@ -27,7 +27,46 @@ AGENT_PERFORMANCE_THRESHOLDS = {
         "min_harvest_yield_per_run": 10,
         "lookback_days": 3,
     },
+    "radar": {"min_processed_rate": 0.10, "lookback_days": 3},
+    "pulsar": {"min_dms_per_batch": 1, "lookback_days": 3},
+    "nexus": {"min_records_per_run": 1, "lookback_days": 3},
 }
+
+DEFAULT_CHIRON_COOLDOWN_HOURS = 7 * 24
+
+
+async def get_chiron_audit_candidates(db_pool) -> list[str]:
+    cooldown_hours = max(
+        1,
+        int(
+            os.getenv(
+                "CHIRON_OPTIMIZATION_COOLDOWN_HOURS",
+                str(DEFAULT_CHIRON_COOLDOWN_HOURS),
+            )
+        ),
+    )
+    async with db_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT LOWER(agent_name) AS agent_name,
+                       MAX(last_optimized_at) AS last_optimized_at
+                FROM helix_agent_manifests
+                WHERE is_active = TRUE
+                GROUP BY LOWER(agent_name)
+                HAVING (
+                    MAX(last_optimized_at) IS NULL
+                    OR MAX(last_optimized_at) <= NOW() - (%s || ' hours')::INTERVAL
+                )
+                AND NOT BOOL_OR(
+                    COALESCE(optimization_status, 'IDLE') IN ('QUEUED', 'RUNNING')
+                )
+                ORDER BY MAX(last_optimized_at) ASC NULLS FIRST, LOWER(agent_name);
+                """,
+                (cooldown_hours,),
+            )
+            rows = await cur.fetchall()
+    return [row["agent_name"] for row in rows]
 
 
 async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]:
@@ -41,7 +80,7 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
 
     metrics = {
         "agent": normalized_agent,
-        "status": "HEALTHY",
+        "status": "INSUFFICIENT_DATA",
         "total_runs": 0,
         "error_count": 0,
         "performance_signals": {},
@@ -85,7 +124,9 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
 
                     for log in beacon_logs:
                         meta = log.get("metadata") or {}
-                        if isinstance(meta, dict):
+                        if isinstance(meta, dict) and (
+                            "impressions" in meta or "clicks" in meta
+                        ):
                             total_impressions += int(meta.get("impressions", 0))
                             total_clicks += int(meta.get("clicks", 0))
                             post_count += 1
@@ -98,20 +139,60 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                         "total_clicks": total_clicks,
                     }
 
-                    min_impressions = thresholds.get("min_avg_impressions", 150)
-                    if post_count > 0 and avg_impressions < min_impressions:
-                        metrics["status"] = "UNDERPERFORMING"
-                        metrics["issues"].append(
-                            f"Average post impressions ({avg_impressions:.1f}) fell below target baseline ({min_impressions}). Post reach is severely throttled."
-                        )
+                    if post_count > 0:
+                        metrics["status"] = "HEALTHY"
+                        min_impressions = thresholds.get("min_avg_impressions", 150)
+                        if avg_impressions < min_impressions:
+                            metrics["status"] = "UNDERPERFORMING"
+                            metrics["issues"].append(
+                                f"Average post impressions ({avg_impressions:.1f}) fell below target baseline ({min_impressions}). Post reach is severely throttled."
+                            )
 
-                    if post_count > 0 and total_clicks < thresholds.get(
-                        "min_link_clicks", 5
-                    ):
-                        metrics["status"] = "UNDERPERFORMING"
-                        metrics["issues"].append(
-                            f"Total referral traffic clicks ({total_clicks}) in the last 7 days is too low. CTA / hook alignment is failing."
-                        )
+                        if total_clicks < thresholds.get("min_link_clicks", 5):
+                            metrics["status"] = "UNDERPERFORMING"
+                            metrics["issues"].append(
+                                f"Total referral traffic clicks ({total_clicks}) in the last 7 days is too low. CTA / hook alignment is failing."
+                            )
+
+                elif normalized_agent == "vanguard":
+                    await cur.execute("""
+                        SELECT metadata
+                        FROM agent_system_logs
+                        WHERE LOWER(agent_name) = 'vanguard'
+                        AND log_level = 'INFO'
+                        AND timestamp >= NOW() - INTERVAL '7 days'
+                        ORDER BY id DESC LIMIT 10;
+                    """)
+                    snapshots = [
+                        row.get("metadata") or {}
+                        for row in await cur.fetchall()
+                        if isinstance(row.get("metadata"), dict)
+                        and "processed_leads_total" in row.get("metadata", {})
+                    ]
+                    metrics["performance_signals"] = {
+                        "snapshots_analyzed": len(snapshots),
+                        "latest_processed_leads_total": (
+                            int(snapshots[0].get("processed_leads_total", 0))
+                            if snapshots
+                            else 0
+                        ),
+                        "latest_cold_leads_total": (
+                            int(snapshots[0].get("cold_leads_total", 0))
+                            if snapshots
+                            else 0
+                        ),
+                    }
+                    if snapshots:
+                        metrics["status"] = "HEALTHY"
+                        latest = snapshots[0]
+                        if (
+                            int(latest.get("cold_leads_total", 0)) > 0
+                            and int(latest.get("processed_leads_total", 0)) == 0
+                        ):
+                            metrics["status"] = "UNDERPERFORMING"
+                            metrics["issues"].append(
+                                "Vanguard has available cold leads but no processed leads."
+                            )
 
                 elif normalized_agent == "nova":
                     # Nova evaluation: check average contacts/leads harvested per run
@@ -128,8 +209,15 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                     nova_runs = 0
                     for log in nova_logs:
                         meta = log.get("metadata") or {}
-                        if isinstance(meta, dict) and "harvested_count" in meta:
-                            harvested_leads += int(meta.get("harvested_count", 0))
+                        if isinstance(meta, dict) and (
+                            "harvested_count" in meta
+                            or meta.get("lifecycle_event") == "RUN_COMPLETED"
+                        ):
+                            harvested_leads += int(
+                                meta.get(
+                                    "harvested_count", meta.get("records_found", 0)
+                                )
+                            )
                             nova_runs += 1
 
                     avg_harvest = harvested_leads / max(nova_runs, 1)
@@ -139,12 +227,109 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                         "avg_harvest_per_run": avg_harvest,
                     }
 
-                    min_yield = thresholds.get("min_harvest_yield_per_run", 10)
-                    if nova_runs > 0 and avg_harvest < min_yield:
-                        metrics["status"] = "UNDERPERFORMING"
-                        metrics["issues"].append(
-                            f"Nova average lead harvest yield ({avg_harvest:.1f}/run) fell below threshold ({min_yield}). Targeting scope may be exhausted."
+                    if nova_runs > 0:
+                        metrics["status"] = "HEALTHY"
+                        min_yield = thresholds.get("min_harvest_yield_per_run", 10)
+                        if avg_harvest < min_yield:
+                            metrics["status"] = "UNDERPERFORMING"
+                            metrics["issues"].append(
+                                f"Nova average lead harvest yield ({avg_harvest:.1f}/run) fell below threshold ({min_yield}). Targeting scope may be exhausted."
+                            )
+
+                elif normalized_agent in {"nexus", "radar", "pulsar"}:
+                    await cur.execute(
+                        """
+                        SELECT metadata
+                        FROM agent_system_logs
+                        WHERE LOWER(agent_name) = %s
+                        AND log_level = 'INFO'
+                        AND timestamp >= NOW() - (%s || ' days')::INTERVAL
+                        ORDER BY id DESC LIMIT 10;
+                        """,
+                        (normalized_agent, lookback_days),
+                    )
+                    info_metadata = [
+                        row.get("metadata") or {}
+                        for row in await cur.fetchall()
+                        if isinstance(row.get("metadata"), dict)
+                    ]
+
+                    if normalized_agent == "radar":
+                        completed = [
+                            meta
+                            for meta in info_metadata
+                            if meta.get("stage") == "batch_complete"
+                            and "requested_leads" in meta
+                            and "processed_leads" in meta
+                        ]
+                        requested = sum(
+                            int(meta["requested_leads"]) for meta in completed
                         )
+                        processed = sum(
+                            int(meta["processed_leads"]) for meta in completed
+                        )
+                        processed_rate = processed / max(requested, 1)
+                        metrics["performance_signals"] = {
+                            "batches_analyzed": len(completed),
+                            "requested_leads": requested,
+                            "processed_leads": processed,
+                            "processed_rate": processed_rate,
+                        }
+                        if completed:
+                            metrics["status"] = "HEALTHY"
+                            if (
+                                len(completed) >= 2
+                                and requested > 0
+                                and processed_rate
+                                < thresholds.get("min_processed_rate", 0.10)
+                            ):
+                                metrics["status"] = "UNDERPERFORMING"
+                                metrics["issues"].append(
+                                    f"Radar processed-rate ({processed_rate:.1%}) is below the minimum target."
+                                )
+                    elif normalized_agent == "pulsar":
+                        completed = [
+                            meta for meta in info_metadata if "dms_skipped" in meta
+                        ]
+                        sent = sum(
+                            int(meta.get("records_found", 0)) for meta in completed
+                        )
+                        metrics["performance_signals"] = {
+                            "batches_analyzed": len(completed),
+                            "dms_sent": sent,
+                        }
+                        if completed:
+                            metrics["status"] = "HEALTHY"
+                            if len(completed) >= 2 and sent < thresholds.get(
+                                "min_dms_per_batch", 1
+                            ):
+                                metrics["status"] = "UNDERPERFORMING"
+                                metrics["issues"].append(
+                                    "Pulsar completed multiple batches without sending a DM."
+                                )
+                    else:
+                        completed = [
+                            meta
+                            for meta in info_metadata
+                            if meta.get("status") in {"SUCCESS", "RESCUE_RUN"}
+                            and "records_found" in meta
+                        ]
+                        records = sum(
+                            int(meta.get("records_found", 0)) for meta in completed
+                        )
+                        metrics["performance_signals"] = {
+                            "runs_analyzed": len(completed),
+                            "records_found": records,
+                        }
+                        if completed:
+                            metrics["status"] = "HEALTHY"
+                            if len(completed) >= 2 and records < thresholds.get(
+                                "min_records_per_run", 1
+                            ):
+                                metrics["status"] = "UNDERPERFORMING"
+                                metrics["issues"].append(
+                                    "Nexus completed multiple runs without producing records."
+                                )
 
                 # 3. Universal Error Density Threshold (Applies to ALL Agents)
                 if metrics["error_count"] > 5:
@@ -152,36 +337,6 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                     metrics["issues"].append(
                         f"High error density detected: {metrics['error_count']} ERROR logs in the last {lookback_days} days."
                     )
-
-                # Add zero-yield inspection for lead generation agents (nexus / nova / radar)
-                if normalized_agent in ["nexus", "nova", "radar"]:
-                    await cur.execute(
-                        """
-                        SELECT metadata
-                        FROM agent_system_logs
-                        WHERE LOWER(agent_name) = %s
-                        AND timestamp >= NOW() - INTERVAL '24 hours'
-                        ORDER BY id DESC LIMIT 5;
-                    """,
-                        (normalized_agent,),
-                    )
-                    recent_logs = await cur.fetchall()
-
-                    zero_yield_runs = 0
-                    for r in recent_logs:
-                        meta = r.get("metadata") or {}
-                        if (
-                            isinstance(meta, dict)
-                            and meta.get("requested", 0) > 0
-                            and meta.get("processed", 0) == 0
-                        ):
-                            zero_yield_runs += 1
-
-                    if zero_yield_runs >= 2:
-                        metrics["status"] = "UNDERPERFORMING"
-                        metrics["issues"].append(
-                            f"Zero-yield burnout detected: Last {zero_yield_runs} sweeps yielded 0 new processed leads due to duplicate saturation."
-                        )
 
     except Exception as e:
         print(f"⚠️ Performance evaluation error for {agent_name}: {e}")
@@ -255,7 +410,12 @@ async def dispatch_chiron_optimization(
                 json=optimization_payload,
             )
 
-            if res.status_code in [200, 201, 202]:
+            response_payload = res.json() if res.content else {}
+            response_status = response_payload.get("status")
+            if (
+                res.status_code in [200, 201, 202]
+                and response_status == "optimization_analysis_queued"
+            ):
                 # 🚀 UPDATE DB TIMESTAMP: Mark manifest as optimized
                 try:
                     async with db_pool.connection() as conn:
@@ -263,7 +423,8 @@ async def dispatch_chiron_optimization(
                             await cur.execute(
                                 """
                                 UPDATE helix_agent_manifests 
-                                SET last_optimized_at = NOW() 
+                                SET last_optimized_at = NOW(),
+                                    optimization_status = 'QUEUED'
                                 WHERE LOWER(agent_name) = %s;
                                 """,
                                 (agent_name.lower(),),
@@ -287,6 +448,10 @@ async def dispatch_chiron_optimization(
                 )
                 return True
 
+            if response_status == "optimization_analysis_already_queued":
+                print(f"ℹ️ Chiron optimization already queued for {agent_name}.")
+                return False
+
             print(
                 f"❌ Chiron optimization dispatch rejected: {res.status_code} - {res.text}"
             )
@@ -306,27 +471,36 @@ async def run_preflight_audit(db_pool) -> dict:
     # Clean up logs before evaluating preflight metrics
     await run_routine_log_maintenance(db_pool, retention_days=30)
 
-    async with db_pool.connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute("""
-                SELECT LOWER(agent_name) as agent_name 
-                FROM helix_agent_manifests 
-                WHERE is_active = TRUE;
-            """)
-            active_agents = [r["agent_name"] for r in await cur.fetchall()]
+    result = await run_agent_performance_audit_pass(db_pool)
+    return {
+        "status": "completed",
+        "issues_found": int(result["audit_status"] == "UNDERPERFORMING"),
+        **result,
+    }
 
-    preflight_issues = []
-    for agent in active_agents or ["beacon", "vanguard", "nova", "nexus"]:
-        audit = await evaluate_agent_performance(db_pool, agent)
-        if audit.get("status") == "UNDERPERFORMING":
-            preflight_issues.append((agent, audit))
 
-    # Trigger Chiron proactively if pre-flight flags issues
-    for agent_name, audit in preflight_issues:
-        print(f"⚠️ [PRE-FLIGHT] Proactively dispatching Chiron for '{agent_name}'")
-        await dispatch_chiron_optimization(db_pool, agent_name, audit)
+async def run_agent_performance_audit_pass(db_pool) -> dict[str, Any]:
+    candidates = await get_chiron_audit_candidates(db_pool)
+    for agent_name in candidates:
+        audit = await evaluate_agent_performance(db_pool, agent_name)
+        if audit.get("status") != "UNDERPERFORMING":
+            continue
 
-    return {"status": "completed", "issues_found": len(preflight_issues)}
+        print(
+            f"⚠️ [AUDITOR] Agent '{agent_name}' is UNDERPERFORMING. Triggering Chiron..."
+        )
+        dispatched = await dispatch_chiron_optimization(db_pool, agent_name, audit)
+        return {
+            "target_agent": agent_name,
+            "audit_status": audit["status"],
+            "dispatched": dispatched,
+        }
+
+    return {
+        "target_agent": None,
+        "audit_status": "NO_ELIGIBLE_UNDERPERFORMER",
+        "dispatched": False,
+    }
 
 
 async def run_agent_performance_audit_loop(db_pool):
@@ -339,26 +513,7 @@ async def run_agent_performance_audit_loop(db_pool):
         try:
             await run_routine_log_maintenance(db_pool, retention_days=30)
 
-            async with db_pool.connection() as conn:
-                async with conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute("""
-                        SELECT LOWER(agent_name) as agent_name
-                        FROM helix_agent_manifests
-                        WHERE is_active = TRUE;
-                    """)
-                    manifest_agents = await cur.fetchall()
-
-            active_agent_names = [row["agent_name"] for row in manifest_agents]
-            if not active_agent_names:
-                active_agent_names = ["beacon", "vanguard", "nova"]
-
-            for agent_name in active_agent_names:
-                audit = await evaluate_agent_performance(db_pool, agent_name)
-                if audit.get("status") == "UNDERPERFORMING":
-                    print(
-                        f"⚠️ [AUDITOR] Agent '{agent_name}' is UNDERPERFORMING. Triggering Chiron..."
-                    )
-                    await dispatch_chiron_optimization(db_pool, agent_name, audit)
+            await run_agent_performance_audit_pass(db_pool)
         except Exception as e:
             print(f"⚠️ [AUDITOR] Loop iteration anomaly: {e}")
 
