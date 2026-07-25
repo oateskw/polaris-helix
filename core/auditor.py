@@ -153,7 +153,7 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                         f"High error density detected: {metrics['error_count']} ERROR logs in the last {lookback_days} days."
                     )
 
-                # Add zero-yield inspection for lead generation agents (nexus / nova / phantombuster)
+                # Add zero-yield inspection for lead generation agents (nexus / nova / radar)
                 if normalized_agent in ["nexus", "nova", "radar"]:
                     await cur.execute(
                         """
@@ -170,7 +170,6 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                     zero_yield_runs = 0
                     for r in recent_logs:
                         meta = r.get("metadata") or {}
-                        # Catch runs where requested > 0 but processed == 0 (all duplicates/skipped)
                         if (
                             isinstance(meta, dict)
                             and meta.get("requested", 0) > 0
@@ -257,6 +256,24 @@ async def dispatch_chiron_optimization(
             )
 
             if res.status_code in [200, 201, 202]:
+                # 🚀 UPDATE DB TIMESTAMP: Mark manifest as optimized
+                try:
+                    async with db_pool.connection() as conn:
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                """
+                                UPDATE helix_agent_manifests 
+                                SET last_optimized_at = NOW() 
+                                WHERE LOWER(agent_name) = %s;
+                                """,
+                                (agent_name.lower(),),
+                            )
+                        await conn.commit()
+                except Exception as db_err:
+                    print(
+                        f"⚠️ Failed to update last_optimized_at for {agent_name}: {db_err}"
+                    )
+
                 emit_executive_notification(
                     ExecutiveNotificationEvent(
                         source_agent="helix",
@@ -349,5 +366,5 @@ async def run_agent_performance_audit_loop(db_pool):
         except Exception as e:
             print(f"⚠️ [AUDITOR] Loop iteration anomaly: {e}")
 
-        # Run performance audit every 12 hours
-        await asyncio.sleep(12 * 3600)
+        # 🚀 Hourly audit check
+        await asyncio.sleep(3600)
