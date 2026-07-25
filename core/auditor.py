@@ -303,6 +303,9 @@ async def run_preflight_audit(db_pool) -> dict:
     the main morning dispatch cycle fires.
     """
     print("🛫 [AUDITOR] Running pre-flight system diagnostics...")
+    # Clean up logs before evaluating preflight metrics
+    await run_routine_log_maintenance(db_pool, retention_days=30)
+
     async with db_pool.connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute("""
@@ -337,7 +340,10 @@ async def run_agent_performance_audit_loop(db_pool):
     while True:
         try:
             if should_helix_workers_operate():
-                # 1. Fetch all active agents dynamically from helix_agent_manifests
+                # 🧹 1. Run maintenance to purge old logs before evaluation
+                await run_routine_log_maintenance(db_pool, retention_days=30)
+
+                # 2. Fetch all active agents dynamically from helix_agent_manifests
                 async with db_pool.connection() as conn:
                     async with conn.cursor(row_factory=dict_row) as cur:
                         await cur.execute("""
@@ -353,7 +359,7 @@ async def run_agent_performance_audit_loop(db_pool):
                 if not active_agent_names:
                     active_agent_names = ["beacon", "vanguard", "nova"]
 
-                # 2. Iterate through and audit every active agent
+                # 3. Iterate through and audit every active agent
                 for agent_name in active_agent_names:
                     audit = await evaluate_agent_performance(db_pool, agent_name)
                     if audit.get("status") == "UNDERPERFORMING":
@@ -368,3 +374,23 @@ async def run_agent_performance_audit_loop(db_pool):
 
         # 🚀 Hourly audit check
         await asyncio.sleep(3600)
+
+
+async def run_routine_log_maintenance(db_pool, retention_days: int = 30) -> None:
+    """Purge system logs older than the retention threshold."""
+    try:
+        async with db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    DELETE FROM agent_system_logs 
+                    WHERE timestamp < NOW() - (%s || ' days')::INTERVAL;
+                    """,
+                    (retention_days,),
+                )
+            await conn.commit()
+            print(
+                f"🧹 [MAINTENANCE] Stale system logs older than {retention_days} days purged."
+            )
+    except Exception as e:
+        print(f"⚠️ [MAINTENANCE] Failed to purge stale logs: {e}")
