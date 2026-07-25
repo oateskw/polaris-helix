@@ -12,6 +12,9 @@ VENDOR_ANTHROPIC = "Anthropic"
 VENDOR_MOLTSET = "MoltSet"
 VENDOR_PHANTOMBUSTERS = "PhantomBusters"
 VENDOR_MYEMAILVERIFIER = "MyEmailVerifier"
+VALID_CAMPAIGN_STRATEGIES = frozenset(
+    {"LIVE_AUDIT", "OBJECTION_KILLER", "BUILD_IN_PUBLIC", "BEFORE_AFTER"}
+)
 
 # 🧠 STEP 3: Import memory retrieval service
 from helix_memory import query_learned_guidelines
@@ -35,6 +38,26 @@ def build_nova_ignition_payload(
                 or "Operational inefficiency",
             }
         ],
+    }
+
+
+def build_beacon_execution_payload(
+    strategy: dict[str, Any], learned_guidelines: list[str]
+) -> dict[str, Any]:
+    campaign_strategy = strategy.get("campaign_strategy")
+    if campaign_strategy not in VALID_CAMPAIGN_STRATEGIES:
+        raise ValueError(
+            "Beacon dispatch requires a valid campaign_strategy selected by Nexus"
+        )
+
+    return {
+        "industry_id": strategy["industry_id"],
+        "industry_name": strategy["industry_name"],
+        "target_region": strategy["target_region"],
+        "bottleneck_profile": strategy["bottleneck_profile"],
+        "campaign_strategy": campaign_strategy,
+        "nexus_directive": strategy.get("nexus_directive"),
+        "learned_guidelines": learned_guidelines,
     }
 
 
@@ -363,15 +386,7 @@ async def trigger_downstream_mesh_with_payload(
                 "X-Beacon-Auth-Token": master_token,
                 "Content-Type": "application/json",
             },
-            {
-                "industry_id": strategy["industry_id"],
-                "industry_name": strategy["industry_name"],
-                "target_region": strategy["target_region"],
-                "bottleneck_profile": strategy["bottleneck_profile"],
-                "campaign_strategy": strategy.get("campaign_strategy", "BEFORE_AFTER"),
-                "nexus_directive": strategy.get("nexus_directive"),
-                "learned_guidelines": beacon_guidelines,
-            },
+            build_beacon_execution_payload(strategy, beacon_guidelines),
         )
         if dispatch_results["beacon"]:
             send_telegram_broadcast(

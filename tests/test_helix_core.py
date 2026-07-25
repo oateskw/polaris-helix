@@ -62,6 +62,7 @@ def mock_app_database_state():
                 "bottleneck_profile": "High Fluidity",
                 "pain_tokens": ["delay"],
                 "target_region": "US-East",
+                "campaign_strategy": "LIVE_AUDIT",
             }
         )
     )

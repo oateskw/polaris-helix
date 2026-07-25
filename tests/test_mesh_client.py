@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from services.mesh_client import (
+    build_beacon_execution_payload,
     build_nova_ignition_payload,
     trigger_downstream_mesh_with_payload,
 )
@@ -63,6 +64,45 @@ def test_build_nova_ignition_payload_defaults_nullable_strategy_text():
     ]
 
 
+def test_build_beacon_execution_payload_propagates_nexus_strategy():
+    payload = build_beacon_execution_payload(
+        {
+            "industry_id": 42,
+            "industry_name": "Logistics",
+            "target_region": "Texas",
+            "bottleneck_profile": "Manual dispatching",
+            "campaign_strategy": "LIVE_AUDIT",
+            "nexus_directive": "Calculate the hidden payroll drain.",
+        },
+        ["Use concrete payroll figures."],
+    )
+
+    assert payload == {
+        "industry_id": 42,
+        "industry_name": "Logistics",
+        "target_region": "Texas",
+        "bottleneck_profile": "Manual dispatching",
+        "campaign_strategy": "LIVE_AUDIT",
+        "nexus_directive": "Calculate the hidden payroll drain.",
+        "learned_guidelines": ["Use concrete payroll figures."],
+    }
+
+
+@pytest.mark.parametrize("campaign_strategy", [None, "UNSUPPORTED_STRATEGY"])
+def test_build_beacon_execution_payload_rejects_invalid_strategy(campaign_strategy):
+    with pytest.raises(ValueError, match="selected by Nexus"):
+        build_beacon_execution_payload(
+            {
+                "industry_id": 42,
+                "industry_name": "Logistics",
+                "target_region": "Texas",
+                "bottleneck_profile": "Manual dispatching",
+                "campaign_strategy": campaign_strategy,
+            },
+            [],
+        )
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("accepted", [True, False])
 async def test_nova_mesh_propagates_ignition_acceptance(
@@ -97,3 +137,36 @@ async def test_nova_mesh_propagates_ignition_acceptance(
 
     post_proxy.assert_awaited_once()
     assert result == {"nova": accepted}
+
+
+@pytest.mark.anyio
+async def test_beacon_mesh_posts_nexus_campaign_strategy(db_pool_factory, monkeypatch):
+    pool, _, _ = db_pool_factory()
+    post_proxy = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "services.mesh_client.query_learned_guidelines",
+        AsyncMock(return_value=["Use concrete payroll figures."]),
+    )
+    monkeypatch.setattr("services.mesh_client.async_http_post_proxy", post_proxy)
+    monkeypatch.setattr(
+        "services.telemetry.write_helix_command_center_log", AsyncMock()
+    )
+    monkeypatch.setattr("services.telemetry.send_telegram_broadcast", MagicMock())
+
+    result = await trigger_downstream_mesh_with_payload(
+        pool,
+        SimpleNamespace(),
+        {
+            "industry_id": 42,
+            "industry_name": "Logistics",
+            "target_region": "Texas",
+            "bottleneck_profile": "Manual dispatching",
+            "campaign_strategy": "OBJECTION_KILLER",
+            "nexus_directive": "Address reliability concerns directly.",
+        },
+        ["beacon"],
+        {},
+    )
+
+    assert post_proxy.await_args.args[2]["campaign_strategy"] == "OBJECTION_KILLER"
+    assert result == {"beacon": True}

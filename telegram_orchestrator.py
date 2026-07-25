@@ -349,7 +349,7 @@ async def telegram_webhook_handler(request: Request):
             # 2. Extract active strategy from DB
             db_pool = request.app.state.db_pool
             query = """
-                SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region
+                SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region, campaign_strategy
                 FROM helix_brain_scheduler 
                 WHERE is_active = TRUE 
                 ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC 
