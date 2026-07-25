@@ -19,13 +19,33 @@ VENDOR_MYEMAILVERIFIER = "MyEmailVerifier"
 VENDOR_PHANTOMBUSTERS = "PhantomBusters"
 VENDOR_MOLTSET = "MoltSet"
 VENDOR_ANTHROPIC = "Anthropic"
+NEXUS_MORNING_HOUR = int(os.getenv("NEXUS_MORNING_HOUR", "6"))
+
+
+def parse_moltset_search_capacity(data: dict) -> float | None:
+    account = data.get("results") or {}
+    remaining = (
+        account.get("fair_use", {})
+        .get("search", {})
+        .get("requests", {})
+        .get("5h", {})
+        .get("remaining")
+    )
+    if (
+        data.get("status") != "ok"
+        or account.get("status") != "active"
+        or isinstance(remaining, bool)
+        or not isinstance(remaining, (int, float))
+    ):
+        return None
+    return float(remaining)
 
 
 async def check_and_heal_moltset_circuit(app_instance):
     """
     Checks MoltSet circuit status every 30 minutes.
-    Queries /getAccess, updates credits_remaining in the DB,
-    and automatically heals the circuit if MoltSet returns HTTP 200 with available requests.
+    Queries /get_account and heals only when the active account reports
+    positive five-hour search-request capacity.
     """
     db_pool = app_instance.state.db_pool
 
@@ -62,7 +82,7 @@ async def check_and_heal_moltset_circuit(app_instance):
         app_instance.state.disabled_circuits.discard("moltset")
         return
 
-    # 3. Circuit IS broken — Probe MoltSet getAccess endpoint
+    # 3. Circuit IS broken — Probe MoltSet get_account endpoint
     moltset_key = os.getenv("MOLTSET_API_KEY")
     api_endpoint = os.getenv(
         "MOLTSET_API_ENDPOINT", "https://api.moltsets.com/api/v1/tools/"
@@ -74,8 +94,7 @@ async def check_and_heal_moltset_circuit(app_instance):
     # Update last probe attempt timestamp
     app_instance.state.last_moltset_probe_time = now_utc
 
-    # ✅ Query getAccess endpoint
-    url = f"{api_endpoint.rstrip('/')}/getAccess"
+    url = f"{api_endpoint.rstrip('/')}/get_account"
     headers = {
         "Authorization": f"Bearer {moltset_key}",
         "Content-Type": "application/json",
@@ -84,22 +103,16 @@ async def check_and_heal_moltset_circuit(app_instance):
     try:
         loop = asyncio.get_event_loop()
         res = await loop.run_in_executor(
-            None, lambda: requests.post(url, headers=headers, timeout=12)
+            None, lambda: requests.post(url, headers=headers, json={}, timeout=12)
         )
 
-        # 4. Process HTTP Response & Parse Available Balance/Credits
+        # 4. Process HTTP Response & Parse Available Search Requests
         if res.status_code == 200:
             data = res.json() or {}
-
-            requests_remaining = float(
-                data.get("requests_remaining")
-                or data.get("tokens_remaining")
-                or data.get("credits")
-                or 100.00
-            )
+            requests_remaining = parse_moltset_search_capacity(data)
 
             # Only heal the circuit if actual requests/tokens remain (> 0)
-            if requests_remaining > 0:
+            if requests_remaining is not None and requests_remaining > 0:
                 async with db_pool.connection() as conn:
                     async with conn.cursor() as cur:
                         await cur.execute(
@@ -118,7 +131,7 @@ async def check_and_heal_moltset_circuit(app_instance):
                 app_instance.state.disabled_circuits.discard("moltset")
 
                 print(
-                    f"🟢 [CIRCUIT HEALED] MoltSet getAccess returned 200 OK. Requests: {requests_remaining}. Circuit restored."
+                    f"🟢 [CIRCUIT HEALED] MoltSet get_account reported {requests_remaining} search requests. Circuit restored."
                 )
 
                 emit_executive_notification(
@@ -127,17 +140,17 @@ async def check_and_heal_moltset_circuit(app_instance):
                         event_type="pipeline_milestone",
                         severity="success",
                         headline="MoltSet Circuit Healed",
-                        outcome=f"MoltSet getAccess returned 200 OK (Requests: {requests_remaining}). Restored automated dispatches.",
+                        outcome=f"MoltSet get_account reported {requests_remaining} five-hour search requests. Restored automated dispatches.",
                         next_action="Nova dispatches resumed.",
                     )
                 )
             else:
                 print(
-                    f"⏳ [MOLTSET PROBE] getAccess returned 200 OK but remaining requests balance is 0. Circuit remains broken."
+                    "⏳ [MOLTSET PROBE] get_account did not report positive active-account search capacity. Circuit remains broken."
                 )
         else:
             print(
-                f"⏳ [MOLTSET PROBE] getAccess probe failed with status {res.status_code}. Circuit remains broken."
+                f"⏳ [MOLTSET PROBE] get_account probe failed with status {res.status_code}. Circuit remains broken."
             )
 
     except Exception as e:
@@ -172,6 +185,66 @@ async def load_vendor_isolation_matrix(db_pool) -> dict:
     return vendor_isolation_matrix
 
 
+async def dispatch_nova_if_due(app_instance) -> None:
+    """Dispatch Nova every 30 minutes while the MoltSet circuit is healthy."""
+    db_pool = app_instance.state.db_pool
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                SELECT COUNT(*)
+                FROM agent_system_logs
+                WHERE agent_name = 'helix'
+                  AND timestamp >= NOW() - INTERVAL '30 minutes'
+                  AND metadata->'command_center_view'->>'action_taken' = 'DISPATCH_NOVA_30_MINUTE';
+            """)
+            recent_dispatch = (await cur.fetchone())[0]
+
+    if recent_dispatch:
+        return
+
+    vendor_isolation_matrix = await load_vendor_isolation_matrix(db_pool)
+    if vendor_isolation_matrix.get(VENDOR_MOLTSET, False):
+        return
+
+    async with db_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT industry_id, industry_name, moltset_category,
+                       bottleneck_profile, pain_tokens, target_region,
+                       campaign_strategy
+                FROM helix_brain_scheduler
+                WHERE is_active = TRUE
+                ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC
+                LIMIT 1;
+            """)
+            strategy = await cur.fetchone()
+            if strategy:
+                await cur.execute(
+                    "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
+                    (strategy["industry_id"],),
+                )
+        await conn.commit()
+
+    if not strategy:
+        return
+
+    await trigger_downstream_mesh_with_payload(
+        db_pool,
+        app_instance.state,
+        strategy,
+        ["nova"],
+        vendor_isolation_matrix,
+    )
+    await write_helix_command_center_log(
+        db_pool,
+        "INFO",
+        f"Completed 30-minute Nova dispatch for {strategy['industry_name']}.",
+        "DISPATCH_NOVA_30_MINUTE",
+        strategy["industry_name"],
+        {"strategy_id": strategy["industry_id"]},
+    )
+
+
 async def perpetual_awareness_loop(app_instance):
     print("🚀 [PERPETUAL BRAIN ENGINE] Staggered drip pipeline loop active...")
     db_pool = app_instance.state.db_pool
@@ -184,6 +257,8 @@ async def perpetual_awareness_loop(app_instance):
             est_now = datetime.datetime.now(NEW_YORK_TZ)
             current_weekday = int(est_now.strftime("%w"))
             current_date_str = est_now.strftime("%Y-%m-%d")
+
+            await dispatch_nova_if_due(app_instance)
 
             # Define morning execution window (e.g., 4:30 AM EST pre-flight)
             if est_now.hour == 4 and est_now.minute == 30:
@@ -216,6 +291,50 @@ async def perpetual_awareness_loop(app_instance):
                         [current_weekday],
                     )
                     time_locked_agents = await cur.fetchall()
+
+            if est_now.hour >= NEXUS_MORNING_HOUR:
+                async with db_pool.connection() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("""
+                            SELECT COUNT(*)
+                            FROM agent_system_logs
+                            WHERE agent_name = 'helix'
+                              AND timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date
+                              AND metadata->'command_center_view'->>'action_taken' = 'DISPATCH_NEXUS_MORNING';
+                            """)
+                        nexus_morning_dispatches = (await cur.fetchone())[0]
+
+                if nexus_morning_dispatches == 0:
+                    async with db_pool.connection() as conn:
+                        async with conn.cursor(row_factory=dict_row) as cur:
+                            await cur.execute("""
+                                SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region, campaign_strategy
+                                FROM helix_brain_scheduler
+                                WHERE is_active = TRUE
+                                ORDER BY priority_score DESC, last_targeted_at ASC NULLS FIRST
+                                LIMIT 1;
+                            """)
+                            nexus_strategy = await cur.fetchone()
+
+                    if nexus_strategy:
+                        vendor_isolation_matrix = await load_vendor_isolation_matrix(
+                            db_pool
+                        )
+                        await trigger_downstream_mesh_with_payload(
+                            db_pool,
+                            app_instance.state,
+                            nexus_strategy,
+                            ["nexus"],
+                            vendor_isolation_matrix,
+                        )
+                        await write_helix_command_center_log(
+                            db_pool,
+                            "INFO",
+                            f"Completed scheduled morning Nexus dispatch for {nexus_strategy['industry_name']}.",
+                            "DISPATCH_NEXUS_MORNING",
+                            nexus_strategy["industry_name"],
+                            {"strategy_id": nexus_strategy["industry_id"]},
+                        )
 
             should_trigger_beacon = False
             for row in time_locked_agents:
@@ -367,7 +486,8 @@ async def perpetual_awareness_loop(app_instance):
                             SELECT agent_name, max_daily_runs 
                             FROM helix_agent_schedule 
                             WHERE weekday_int = %s AND is_enabled = TRUE 
-                            AND scheduled_time IS NULL AND LOWER(agent_name) != 'helix';
+                            AND scheduled_time IS NULL
+                            AND LOWER(agent_name) NOT IN ('helix', 'nova');
                         """,
                             [current_weekday],
                         )
@@ -406,35 +526,6 @@ async def perpetual_awareness_loop(app_instance):
                     completed_count = run_counts_today.get(agent, 0)
                     if completed_count < max_allowed:
                         pending_agents_for_today.append(agent)
-
-                # Maintain Nova backoff bypass logic with auto-recycle fallback
-                if (
-                    "nova" in scheduled_agents_list
-                    and "nova" not in pending_agents_for_today
-                ):
-                    async with db_pool.connection() as conn:
-                        async with conn.cursor() as retry_cur:
-                            await retry_cur.execute("""
-                                SELECT COUNT(*) FROM helix_brain_scheduler 
-                                WHERE is_active = TRUE 
-                                AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL);
-                            """)
-                            runnable_count = (await retry_cur.fetchone())[0]
-
-                            # 🌟 OPTION B FALLBACK: If 0 targets are eligible due to 24h cooldown, auto-recycle!
-                            if runnable_count == 0:
-                                await retry_cur.execute("""
-                                    UPDATE helix_brain_scheduler 
-                                    SET last_targeted_at = NULL 
-                                    WHERE is_active = TRUE;
-                                """)
-                                await conn.commit()
-                                print(
-                                    "🔄 [SCHEDULER RECYCLE] Auto-cleared cooldown timestamps for Nova bypass."
-                                )
-                                pending_agents_for_today.append("nova")
-                            elif runnable_count > 0:
-                                pending_agents_for_today.append("nova")
 
                 if not pending_agents_for_today:
                     await write_helix_command_center_log(

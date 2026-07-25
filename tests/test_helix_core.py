@@ -100,7 +100,10 @@ async def test_01_health_matrix_endpoint():
     ) as ac:
         response = await ac.get("/api/v1/health")
     assert response.status_code == 200
-    assert response.json()["status"] == "healthy"
+    assert response.json()["status"] == "degraded"
+    assert all(
+        status == "not_started" for status in response.json()["workers"].values()
+    )
 
 
 @pytest.mark.anyio

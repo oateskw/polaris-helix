@@ -671,13 +671,9 @@ async def analyze_and_orchestrate_log(
     extended_error_context = f"{norm_msg} {meta_string_dump}"
 
     try:
-        # ------------------------------------------------------------------
-        # 🌟 PASTE MOLTSET CIRCUIT BREAKER CODE HERE
-        # ------------------------------------------------------------------
         if agent_name.lower() == "nova" and (
-            "429" in norm_msg
-            or "rate limit" in norm_msg
-            or "moltset" in extended_error_context
+            "429" in extended_error_context
+            or "rate limit" in extended_error_context
             or meta.get("status") == "RATE_LIMITED"
         ):
             async with db_pool.connection() as conn:
@@ -701,7 +697,7 @@ async def analyze_and_orchestrate_log(
                     severity="critical",
                     headline="MoltSet Circuit Broken (Nova 429 Captured)",
                     outcome="Nova hit MoltSet rate limit/429. Set MoltSet is_circuit_broken = TRUE.",
-                    next_action="Nova dispatches halted. Engine will probe getAccess every 30m.",
+                    next_action="Nova dispatches halted. Engine will probe get_account every 30m.",
                 )
             )
 
@@ -992,55 +988,23 @@ async def analyze_and_orchestrate_log(
                             (industry,),
                         )
                         strategy = await cur.fetchone()
-                        if strategy and agent_name in ["nexus", "nova"]:
+                        if strategy and agent_name == "nexus":
                             master_token = os.getenv("HELIX_AUTH_TOKEN", "")
-                            if agent_name == "nexus":
-                                asyncio.create_task(
-                                    async_http_post_proxy(
-                                        f"{os.getenv('NEXUS_NERVOUS_IMPULSE_URL')}/api/v1/nexus/awaken",
-                                        {
-                                            "X-Nexus-Auth-Token": master_token,
-                                            "Content-Type": "application/json",
-                                        },
-                                        {
-                                            "trigger_reason": "helix_auto_rescue_escalation",
-                                            "batch_size": 15,
-                                            "rescue_mode": True,
-                                            **strategy,
-                                        },
-                                    )
+                            asyncio.create_task(
+                                async_http_post_proxy(
+                                    f"{os.getenv('NEXUS_NERVOUS_IMPULSE_URL')}/api/v1/nexus/awaken",
+                                    {
+                                        "X-Nexus-Auth-Token": master_token,
+                                        "Content-Type": "application/json",
+                                    },
+                                    {
+                                        "trigger_reason": "helix_auto_rescue_escalation",
+                                        "batch_size": 15,
+                                        "rescue_mode": True,
+                                        **strategy,
+                                    },
                                 )
-                            elif agent_name == "nova":
-                                asyncio.create_task(
-                                    async_http_post_proxy(
-                                        f"{os.getenv('NOVA_API_URL')}/api/v1/nova/ignite",
-                                        {
-                                            "Authorization": f"Bearer {master_token}",
-                                            "Content-Type": "application/json",
-                                        },
-                                        {
-                                            "target_region": strategy["target_region"],
-                                            "daily_quota_limit": 150,
-                                            "target_company_limit": 25,
-                                            "industries": [
-                                                {
-                                                    "industry_id": strategy[
-                                                        "industry_id"
-                                                    ],
-                                                    "industry_name": strategy[
-                                                        "industry_name"
-                                                    ],
-                                                    "moltset_category": strategy[
-                                                        "moltset_category"
-                                                    ],
-                                                    "bottleneck_profile": strategy[
-                                                        "bottleneck_profile"
-                                                    ],
-                                                }
-                                            ],
-                                        },
-                                    )
-                                )
+                            )
             await conn.commit()
     except Exception as exc:
         print(f"Background healer exception: {exc}")

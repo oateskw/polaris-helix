@@ -334,46 +334,35 @@ async def run_agent_performance_audit_loop(db_pool):
     Background loop running inside Helix that audits key agents from helix_agent_manifests
     and automatically triggers Chiron when performance degrades.
     """
-    from config.settings import should_helix_workers_operate
-
     print("🧐 [EXECUTIVE AUDITOR] Performance audit loop initialized.")
     while True:
         try:
-            if should_helix_workers_operate():
-                # 🧹 1. Run maintenance to purge old logs before evaluation
-                await run_routine_log_maintenance(db_pool, retention_days=30)
+            await run_routine_log_maintenance(db_pool, retention_days=30)
 
-                # 2. Fetch all active agents dynamically from helix_agent_manifests
-                async with db_pool.connection() as conn:
-                    async with conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute("""
-                            SELECT LOWER(agent_name) as agent_name 
-                            FROM helix_agent_manifests 
-                            WHERE is_active = TRUE;
-                        """)
-                        manifest_agents = await cur.fetchall()
+            async with db_pool.connection() as conn:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute("""
+                        SELECT LOWER(agent_name) as agent_name
+                        FROM helix_agent_manifests
+                        WHERE is_active = TRUE;
+                    """)
+                    manifest_agents = await cur.fetchall()
 
-                active_agent_names = [row["agent_name"] for row in manifest_agents]
+            active_agent_names = [row["agent_name"] for row in manifest_agents]
+            if not active_agent_names:
+                active_agent_names = ["beacon", "vanguard", "nova"]
 
-                # Fallback defaults if table is empty
-                if not active_agent_names:
-                    active_agent_names = ["beacon", "vanguard", "nova"]
-
-                # 3. Iterate through and audit every active agent
-                for agent_name in active_agent_names:
-                    audit = await evaluate_agent_performance(db_pool, agent_name)
-                    if audit.get("status") == "UNDERPERFORMING":
-                        print(
-                            f"⚠️ [AUDITOR] Agent '{agent_name}' is UNDERPERFORMING. Triggering Chiron..."
-                        )
-                        await dispatch_chiron_optimization(db_pool, agent_name, audit)
-            else:
-                print("⏸️ [AUDITOR] Standby mode - unassigned day. Audit skipped.")
+            for agent_name in active_agent_names:
+                audit = await evaluate_agent_performance(db_pool, agent_name)
+                if audit.get("status") == "UNDERPERFORMING":
+                    print(
+                        f"⚠️ [AUDITOR] Agent '{agent_name}' is UNDERPERFORMING. Triggering Chiron..."
+                    )
+                    await dispatch_chiron_optimization(db_pool, agent_name, audit)
         except Exception as e:
             print(f"⚠️ [AUDITOR] Loop iteration anomaly: {e}")
 
-        # 🚀 Hourly audit check
-        await asyncio.sleep(3600)
+        await asyncio.sleep(1800)
 
 
 async def run_routine_log_maintenance(db_pool, retention_days: int = 30) -> None:

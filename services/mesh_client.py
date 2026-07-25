@@ -8,12 +8,33 @@ from psycopg.types.json import Jsonb
 # Assumes app or db_pool is accessible, or pass db_pool directly into functions.
 
 VENDOR_ANTHROPIC = "Anthropic"
-VENDOR_MOLTSET = "Moltset"
+VENDOR_MOLTSET = "MoltSet"
 VENDOR_PHANTOMBUSTERS = "PhantomBusters"
 VENDOR_MYEMAILVERIFIER = "MyEmailVerifier"
 
 # 🧠 STEP 3: Import memory retrieval service
 from helix_memory import query_learned_guidelines
+
+
+def build_nova_ignition_payload(
+    strategy: dict[str, Any], learned_guidelines: list[str]
+) -> dict[str, Any]:
+    return {
+        "target_region": strategy.get("target_region") or "United States",
+        "target_company_limit": 25,
+        "learned_guidelines": learned_guidelines,
+        "industries": [
+            {
+                "industry_id": strategy["industry_id"],
+                "industry_name": strategy.get("industry_name")
+                or "General Operations",
+                "moltset_category": strategy.get("moltset_category")
+                or "Professional Services",
+                "bottleneck_profile": strategy.get("bottleneck_profile")
+                or "Operational inefficiency",
+            }
+        ],
+    }
 
 
 def get_phantombuster_keyword_cap(app_state, industry_name: str | None = None) -> int:
@@ -270,40 +291,35 @@ async def trigger_downstream_mesh_with_payload(
                 target_industry,
             )
 
-            nova_payload = {
-                "target_region": strategy["target_region"],
-                "daily_quota_limit": 500,
-                "target_company_limit": 25,
-                "learned_guidelines": nova_guidelines,  # 🚀 Memory Injection
-                "industries": [
-                    {
-                        "industry_id": strategy["industry_id"],
-                        "industry_name": strategy["industry_name"],
-                        "moltset_category": strategy["moltset_category"],
-                        "bottleneck_profile": strategy["bottleneck_profile"],
-                    }
-                ],
-            }
-            asyncio.create_task(
-                async_http_post_proxy(
-                    f"{url}/api/v1/nova/ignite",
-                    {
-                        "Authorization": f"Bearer {master_token}",
-                        "Content-Type": "application/json",
-                    },
-                    nova_payload,
-                )
+            nova_payload = build_nova_ignition_payload(strategy, nova_guidelines)
+            nova_accepted = await async_http_post_proxy(
+                f"{url}/api/v1/nova/ignite",
+                {
+                    "Authorization": f"Bearer {master_token}",
+                    "Content-Type": "application/json",
+                },
+                nova_payload,
             )
-            emit_executive_notification(
-                ExecutiveNotificationEvent(
-                    source_agent="nova",
-                    event_type="pipeline_milestone",
-                    severity="success",
-                    headline="Nova Dispatch Started",
-                    outcome=f"Nova execution initiated for {target_industry}.",
-                    next_action="Monitor lead-harvest completion signal.",
+
+            if nova_accepted:
+                emit_executive_notification(
+                    ExecutiveNotificationEvent(
+                        source_agent="nova",
+                        event_type="pipeline_milestone",
+                        severity="success",
+                        headline="Nova Dispatch Started",
+                        outcome=f"Nova execution initiated for {target_industry}.",
+                        next_action="Monitor lead-harvest completion signal.",
+                    )
                 )
-            )
+            else:
+                await write_helix_command_center_log(
+                    db_pool,
+                    "ERROR",
+                    "Nova ignition endpoint did not accept the dispatch.",
+                    "DISPATCH_NOVA_REJECTED",
+                    target_industry,
+                )
 
     # 3. BEACON TASK DISPATCH
     if "beacon" in agent_list:

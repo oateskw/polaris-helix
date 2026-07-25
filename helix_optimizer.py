@@ -162,17 +162,10 @@ async def run_daily_prompt_optimization(db_pool, force=False):
 
 async def reactive_optimizer_loop(db_pool):
     """Continuous background loop monitoring system metrics natively."""
-    from config.settings import should_helix_workers_operate
-
     print("🧠 [INTELLIGENT OPTIMIZER] Event-driven loop initialized.")
     while True:
         try:
-            if should_helix_workers_operate():
-                await run_daily_prompt_optimization(db_pool, force=False)
-            else:
-                print(
-                    "⏸️ [INTELLIGENT OPTIMIZER] Standby mode - unassigned day. Skipping optimization."
-                )
+            await run_daily_prompt_optimization(db_pool, force=False)
         except Exception as e:
             print(f"⚠️ [INTELLIGENT OPTIMIZER] Loop iteration error: {e}")
         await asyncio.sleep(3600)  # Check every hour

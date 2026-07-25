@@ -55,6 +55,16 @@ app = FastAPI(title="Helix Strategic Orchestration Core API")
 app.include_router(telegram_router)
 
 
+def report_background_task_exit(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exception = task.exception()
+    if exception is not None:
+        print(f"[WORKER FAILED] {task.get_name()}: {exception}")
+    else:
+        print(f"[WORKER STOPPED] {task.get_name()} exited unexpectedly.")
+
+
 # Modify the lifespan context manager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -69,15 +79,25 @@ async def lifespan(app: FastAPI):
 
     # Background Tasks - Ensure tasks respect operational constraints
     app.state.auditor_task = asyncio.create_task(
-        run_agent_performance_audit_loop(app.state.db_pool)
+        run_agent_performance_audit_loop(app.state.db_pool), name="performance-auditor"
     )
-    app.state.awareness_task = asyncio.create_task(perpetual_awareness_loop(app))
+    app.state.awareness_task = asyncio.create_task(
+        perpetual_awareness_loop(app), name="awareness-dispatcher"
+    )
     app.state.credit_sync_task = asyncio.create_task(
-        credit_sync_scheduler_loop(app.state.db_pool)
+        credit_sync_scheduler_loop(app.state.db_pool), name="vendor-credit-sync"
     )
     app.state.optimizer_task = asyncio.create_task(
-        reactive_optimizer_loop(app.state.db_pool)
+        reactive_optimizer_loop(app.state.db_pool), name="prompt-optimizer"
     )
+
+    for task in (
+        app.state.auditor_task,
+        app.state.awareness_task,
+        app.state.credit_sync_task,
+        app.state.optimizer_task,
+    ):
+        task.add_done_callback(report_background_task_exit)
 
     emit_executive_notification(
         ExecutiveNotificationEvent(
@@ -255,7 +275,31 @@ async def audit_agent_endpoint(
 
 @app.get("/api/v1/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": get_new_york_now().isoformat()}
+    workers = {}
+    for worker_name, state_name in (
+        ("performance_auditor", "auditor_task"),
+        ("awareness_dispatcher", "awareness_task"),
+        ("vendor_credit_sync", "credit_sync_task"),
+        ("prompt_optimizer", "optimizer_task"),
+    ):
+        task = getattr(app.state, state_name, None)
+        if task is None:
+            workers[worker_name] = "not_started"
+        elif task.done():
+            workers[worker_name] = "stopped"
+        else:
+            workers[worker_name] = "running"
+
+    overall_status = (
+        "healthy"
+        if all(status == "running" for status in workers.values())
+        else "degraded"
+    )
+    return {
+        "status": overall_status,
+        "timestamp": get_new_york_now().isoformat(),
+        "workers": workers,
+    }
 
 
 @app.post("/api/v1/ingest")

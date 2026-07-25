@@ -25,6 +25,38 @@ async def test_root_heartbeat_get_and_head(app_client):
     assert head_res.status_code == 200
 
 
+async def test_health_reports_background_worker_states(
+    app_module, app_client, monkeypatch
+):
+    class RunningTask:
+        def done(self):
+            return False
+
+    monkeypatch.setattr(
+        app_module.app.state, "auditor_task", RunningTask(), raising=False
+    )
+    monkeypatch.setattr(
+        app_module.app.state, "awareness_task", RunningTask(), raising=False
+    )
+    monkeypatch.setattr(
+        app_module.app.state, "credit_sync_task", RunningTask(), raising=False
+    )
+    monkeypatch.setattr(
+        app_module.app.state, "optimizer_task", RunningTask(), raising=False
+    )
+
+    response = await app_client.get("/api/v1/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "healthy"
+    assert response.json()["workers"] == {
+        "performance_auditor": "running",
+        "awareness_dispatcher": "running",
+        "vendor_credit_sync": "running",
+        "prompt_optimizer": "running",
+    }
+
+
 async def test_ingest_leads_unauthorized(app_module, app_client, db_pool_factory):
     pool, _, _ = db_pool_factory()
     app_module.app.state.db_pool = pool
