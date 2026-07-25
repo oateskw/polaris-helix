@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import os
 import requests
+import traceback
 from zoneinfo import ZoneInfo
 from psycopg.rows import dict_row
 
@@ -315,7 +316,11 @@ async def dispatch_nova_if_due(app_instance) -> None:
         f"Completed 30-minute Nova dispatch for {strategy['industry_name']}.",
         "DISPATCH_NOVA_30_MINUTE",
         strategy["industry_name"],
-        {"strategy_id": strategy["industry_id"]},
+        {
+            "strategy_id": strategy["industry_id"],
+            "run_id": strategy.get("_nova_run_id"),
+            "lifecycle_event": "DISPATCH_ACCEPTED",
+        },
     )
 
 
@@ -778,6 +783,16 @@ async def perpetual_awareness_loop(app_instance):
                         )
 
         except Exception as loop_crash:
+            loop_traceback = traceback.format_exc()
+            print(loop_traceback)
+            await write_helix_command_center_log(
+                db_pool,
+                "CRITICAL",
+                f"Perpetual awareness loop failed: {loop_crash}",
+                "HELIX_AWARENESS_LOOP_FAILED",
+                "awareness-dispatcher",
+                {"traceback": loop_traceback},
+            )
             emit_executive_notification(
                 ExecutiveNotificationEvent(
                     source_agent="helix",

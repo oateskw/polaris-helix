@@ -102,7 +102,7 @@ def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
     async def _send() -> None:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(
+                response = await client.post(
                     f"https://api.telegram.org/bot{token}/sendMessage",
                     json={
                         "chat_id": chat_id,
@@ -110,6 +110,10 @@ def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
                         "parse_mode": "Markdown",
                     },
                 )
+                if response.status_code != 200:
+                    print(
+                        f"⚠️ Telegram broadcast rejected with HTTP {response.status_code}: {response.text[:300]}"
+                    )
         except Exception as e:
             print(f"⚠️ Telegram broadcast async failed: {e}")
 
@@ -120,7 +124,7 @@ def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
     except RuntimeError:
         # Fallback for non-async calling threads
         try:
-            requests.post(
+            response = requests.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 json={
                     "chat_id": chat_id,
@@ -129,6 +133,10 @@ def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
                 },
                 timeout=5,
             )
+            if response.status_code != 200:
+                print(
+                    f"⚠️ Telegram broadcast rejected with HTTP {response.status_code}: {response.text[:300]}"
+                )
         except Exception as e:
             print(f"⚠️ Telegram broadcast sync fallback failed: {e}")
 
@@ -352,6 +360,13 @@ async def write_helix_command_center_log(
     target_niche: str = "System Core",
     extra_metadata: Optional[dict] = None,
 ) -> None:
+    normalized_level = str(log_level or "INFO").upper()
+    if normalized_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+        print(
+            f"[WARNING] [HELIX] Unsupported log level '{log_level}' normalized to ERROR."
+        )
+        normalized_level = "ERROR"
+    print(f"[{normalized_level}] [HELIX] [{action_taken}] {message}")
     metadata_payload = {
         "command_center_view": {
             "action_taken": action_taken,
@@ -367,7 +382,7 @@ async def write_helix_command_center_log(
             async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO agent_system_logs (agent_name, log_level, message, metadata) VALUES ('helix', %s, %s, %s);",
-                    (log_level, message, Jsonb(metadata_payload)),
+                    (normalized_level, message, Jsonb(metadata_payload)),
                 )
             await conn.commit()
     except Exception as e:
@@ -770,16 +785,17 @@ async def analyze_and_orchestrate_log(
                             await conn.commit()
                             return
                         elif status_flag == "RATE_LIMITED":
-                            emit_executive_notification(
-                                ExecutiveNotificationEvent(
-                                    source_agent="nova",
-                                    event_type="vendor_circuit_breaker",
-                                    severity="critical",
-                                    headline="Nova Rate Limited",
-                                    outcome=f"Sequential queue frozen for {industry}.",
-                                    next_action="Increase quota or delay rerun.",
+                            if meta.get("lifecycle_event") != "RUN_RATE_LIMITED":
+                                emit_executive_notification(
+                                    ExecutiveNotificationEvent(
+                                        source_agent="nova",
+                                        event_type="vendor_circuit_breaker",
+                                        severity="critical",
+                                        headline="Nova Rate Limited",
+                                        outcome=f"Sequential queue frozen for {industry}.",
+                                        next_action="Increase quota or delay rerun.",
+                                    )
                                 )
-                            )
                             await cur.execute(
                                 "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL WHERE industry_name = %s;",
                                 (industry,),

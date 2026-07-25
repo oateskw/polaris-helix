@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS agent_system_logs (
 CREATE INDEX IF NOT EXISTS idx_asl_agent_name  ON agent_system_logs (agent_name);
 CREATE INDEX IF NOT EXISTS idx_asl_timestamp   ON agent_system_logs (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_asl_log_level   ON agent_system_logs (log_level);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_asl_event_id
+    ON agent_system_logs ((metadata->>'event_id'))
+    WHERE metadata->>'event_id' IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS cold_leads (
     email       TEXT         PRIMARY KEY,

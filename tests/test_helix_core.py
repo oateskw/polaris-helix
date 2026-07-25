@@ -199,7 +199,11 @@ async def test_05_log_analyzer_healer_mesh_cascade():
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as ac:
-        res = await ac.post("/api/v1/logs", json=payload)
+        res = await ac.post(
+            "/api/v1/logs",
+            json=payload,
+            headers={"X-Helix-Auth-Token": TEST_AUTH_TOKEN},
+        )
     assert res.status_code == 200
     assert "logged_id" in res.json()
 

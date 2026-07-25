@@ -176,10 +176,61 @@ async def test_ingest_log_missing_inserted_id_returns_500(
     response = await app_client.post(
         "/api/v1/logs",
         json={"agent_name": "nova", "log_level": "INFO", "message": "m"},
+        headers={"X-Helix-Auth-Token": TEST_AUTH_TOKEN},
     )
 
     assert response.status_code == 500
     assert "No ID returned" in response.json()["detail"]
+
+
+async def test_ingest_log_accepts_debug_level(
+    app_module, app_client, db_pool_factory, monkeypatch
+):
+    pool, _, _ = db_pool_factory(fetchone_sequence=[(91,)])
+    app_module.app.state.db_pool = pool
+    monkeypatch.setattr(
+        app_module.asyncio, "create_task", lambda coroutine: coroutine.close()
+    )
+
+    response = await app_client.post(
+        "/api/v1/logs",
+        headers={"X-Helix-Auth-Token": TEST_AUTH_TOKEN},
+        json={"agent_name": "nova", "log_level": "DEBUG", "message": "detail"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["logged_id"] == 91
+
+
+async def test_ingest_log_requires_authentication(app_client):
+    response = await app_client.post(
+        "/api/v1/logs",
+        json={"agent_name": "nova", "log_level": "INFO", "message": "m"},
+    )
+
+    assert response.status_code == 401
+
+
+async def test_ingest_log_deduplicates_event_id(
+    app_module, app_client, db_pool_factory
+):
+    pool, _, cursors = db_pool_factory(fetchone_sequence=[(77,)])
+    app_module.app.state.db_pool = pool
+
+    response = await app_client.post(
+        "/api/v1/logs",
+        headers={"X-Helix-Auth-Token": TEST_AUTH_TOKEN},
+        json={
+            "agent_name": "nova",
+            "log_level": "INFO",
+            "message": "Nova run started.",
+            "metadata": {"event_id": "event-1", "run_id": "run-1"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "duplicate", "logged_id": 77}
+    assert len(cursors[0].executed) == 1
 
 
 async def test_get_latest_log_empty_and_success(

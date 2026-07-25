@@ -1,6 +1,7 @@
 import os
 import asyncio
 import httpx
+import uuid
 from typing import List, Dict, Any
 from psycopg.types.json import Jsonb
 
@@ -17,9 +18,10 @@ from helix_memory import query_learned_guidelines
 
 
 def build_nova_ignition_payload(
-    strategy: dict[str, Any], learned_guidelines: list[str]
+    strategy: dict[str, Any], learned_guidelines: list[str], run_id: str | None = None
 ) -> dict[str, Any]:
     return {
+        "run_id": run_id or str(uuid.uuid4()),
         "target_region": strategy.get("target_region") or "United States",
         "target_company_limit": 25,
         "learned_guidelines": learned_guidelines,
@@ -280,6 +282,8 @@ async def trigger_downstream_mesh_with_payload(
                 target_industry,
             )
         else:
+            nova_run_id = str(uuid.uuid4())
+            strategy["_nova_run_id"] = nova_run_id
             url = os.getenv("NOVA_API_URL", "https://polaris-nova.onrender.com").rstrip(
                 "/"
             )
@@ -295,9 +299,12 @@ async def trigger_downstream_mesh_with_payload(
                 f"Routing lead harvesting instructions to Nova node with {len(nova_guidelines)} learned guidelines.",
                 "DISPATCH_NOVA_REQUEST",
                 target_industry,
+                {"run_id": nova_run_id, "lifecycle_event": "DISPATCH_REQUESTED"},
             )
 
-            nova_payload = build_nova_ignition_payload(strategy, nova_guidelines)
+            nova_payload = build_nova_ignition_payload(
+                strategy, nova_guidelines, nova_run_id
+            )
             nova_accepted = await async_http_post_proxy(
                 f"{url}/api/v1/nova/ignite",
                 {
@@ -317,6 +324,7 @@ async def trigger_downstream_mesh_with_payload(
                         headline="Nova Dispatch Started",
                         outcome=f"Nova execution initiated for {target_industry}.",
                         next_action="Monitor lead-harvest completion signal.",
+                        metadata={"run_id": nova_run_id},
                     )
                 )
             else:
@@ -327,6 +335,7 @@ async def trigger_downstream_mesh_with_payload(
                     "Nova ignition endpoint did not accept the dispatch.",
                     "DISPATCH_NOVA_REJECTED",
                     target_industry,
+                    {"run_id": nova_run_id, "lifecycle_event": "DISPATCH_REJECTED"},
                 )
 
     # 3. BEACON TASK DISPATCH

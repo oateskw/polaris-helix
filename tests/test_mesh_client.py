@@ -19,9 +19,11 @@ def test_build_nova_ignition_payload_matches_nova_schema():
             "target_region": "Texas",
         },
         ["PREFER: regional carriers"],
+        "run-42",
     )
 
     assert payload == {
+        "run_id": "run-42",
         "target_region": "Texas",
         "target_company_limit": 25,
         "learned_guidelines": ["PREFER: regional carriers"],
@@ -47,6 +49,7 @@ def test_build_nova_ignition_payload_defaults_nullable_strategy_text():
             "target_region": None,
         },
         [],
+        "run-42",
     )
 
     assert payload["target_region"] == "United States"

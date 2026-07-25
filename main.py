@@ -4,6 +4,8 @@ import hmac
 import asyncio
 import psycopg
 import json
+import traceback
+import httpx
 from typing import List, Optional, Literal
 from contextlib import asynccontextmanager
 
@@ -36,6 +38,8 @@ from services.telemetry import (
     get_new_york_now,
     log_helix_state,
     is_vendor_circuit_healthy,
+    send_executive_summary_from_logs,
+    write_helix_command_center_log,
 )
 from services.mesh_client import trigger_downstream_mesh_with_payload
 from services.credit_sync import (
@@ -55,14 +59,161 @@ app = FastAPI(title="Helix Strategic Orchestration Core API")
 app.include_router(telegram_router)
 
 
-def report_background_task_exit(task: asyncio.Task) -> None:
+async def record_background_task_exit(task: asyncio.Task, db_pool) -> None:
     if task.cancelled():
         return
     exception = task.exception()
     if exception is not None:
-        print(f"[WORKER FAILED] {task.get_name()}: {exception}")
+        message = f"[WORKER FAILED] {task.get_name()}: {exception}"
+        action = "HELIX_WORKER_FAILED"
+        level = "CRITICAL"
+        trace = "".join(
+            traceback.format_exception(
+                type(exception), exception, exception.__traceback__
+            )
+        )
     else:
-        print(f"[WORKER STOPPED] {task.get_name()} exited unexpectedly.")
+        message = f"[WORKER STOPPED] {task.get_name()} exited unexpectedly."
+        action = "HELIX_WORKER_STOPPED"
+        level = "ERROR"
+        trace = None
+
+    print(message)
+    await write_helix_command_center_log(
+        db_pool,
+        level,
+        message,
+        action,
+        task.get_name(),
+        {"traceback": trace},
+    )
+    emit_executive_notification(
+        ExecutiveNotificationEvent(
+            source_agent="helix",
+            event_type="critical_failure",
+            severity="critical",
+            headline="Helix Background Worker Stopped",
+            outcome=message,
+            next_action="Inspect agent_system_logs and Render traceback output.",
+        )
+    )
+
+
+def report_background_task_exit(task: asyncio.Task, db_pool) -> None:
+    if not task.cancelled():
+        asyncio.create_task(record_background_task_exit(task, db_pool))
+
+
+async def executive_digest_loop(app: FastAPI) -> None:
+    interval_seconds = int(os.getenv("HELIX_EXECUTIVE_DIGEST_SECONDS", "10800"))
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await send_executive_summary_from_logs(
+            app.state.db_pool,
+            lookback_minutes=max(1, interval_seconds // 60),
+            ai_client=app.state.ai_client,
+        )
+
+
+async def ensure_observability_schema(db_pool) -> None:
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_asl_event_id
+                ON agent_system_logs ((metadata->>'event_id'))
+                WHERE metadata->>'event_id' IS NOT NULL;
+            """)
+        await conn.commit()
+
+
+async def observability_watchdog_loop(app: FastAPI) -> None:
+    interval_seconds = int(os.getenv("HELIX_WATCHDOG_INTERVAL_SECONDS", "300"))
+    stale_minutes = int(os.getenv("NOVA_STALE_RUN_MINUTES", "120"))
+    nova_url = os.getenv("NOVA_API_URL", "https://polaris-nova.onrender.com").rstrip(
+        "/"
+    )
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await write_helix_command_center_log(
+            app.state.db_pool,
+            "INFO",
+            "Helix observability heartbeat confirmed.",
+            "HELIX_HEARTBEAT",
+            "observability-watchdog",
+        )
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(nova_url)
+                response.raise_for_status()
+        except Exception as exc:
+            await write_helix_command_center_log(
+                app.state.db_pool,
+                "CRITICAL",
+                f"Nova health probe failed: {exc}",
+                "NOVA_HEALTH_PROBE_FAILED",
+                "nova",
+            )
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="nova",
+                    event_type="critical_failure",
+                    severity="critical",
+                    headline="Nova Health Probe Failed",
+                    outcome="Helix could not reach Nova's health endpoint.",
+                    impact=str(exc),
+                    next_action="Inspect Nova Render service health and logs.",
+                )
+            )
+
+        async with app.state.db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT started.metadata->>'run_id'
+                    FROM agent_system_logs AS started
+                    WHERE started.agent_name = 'nova'
+                      AND started.metadata->>'lifecycle_event' = 'RUN_STARTED'
+                      AND started.timestamp < NOW() - (%s || ' minutes')::INTERVAL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM agent_system_logs AS terminal
+                          WHERE terminal.metadata->>'run_id' = started.metadata->>'run_id'
+                            AND terminal.metadata->>'lifecycle_event' IN (
+                                'RUN_COMPLETED', 'RUN_RATE_LIMITED', 'RUN_FAILED'
+                            )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM agent_system_logs AS alerted
+                          WHERE alerted.metadata->>'run_id' = started.metadata->>'run_id'
+                            AND alerted.metadata->'command_center_view'->>'action_taken' = 'NOVA_STALE_RUN_ALERT'
+                      )
+                    ORDER BY started.timestamp ASC
+                    LIMIT 1;
+                    """,
+                    (stale_minutes,),
+                )
+                stale_row = await cur.fetchone()
+
+        if stale_row:
+            stale_run_id = stale_row[0]
+            await write_helix_command_center_log(
+                app.state.db_pool,
+                "CRITICAL",
+                f"Nova run {stale_run_id} has no terminal lifecycle event.",
+                "NOVA_STALE_RUN_ALERT",
+                "nova",
+                {"run_id": stale_run_id},
+            )
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="nova",
+                    event_type="critical_failure",
+                    severity="critical",
+                    headline="Nova Run Stalled",
+                    outcome=f"Run {stale_run_id} exceeded {stale_minutes} minutes without a terminal event.",
+                    next_action="Inspect Nova server logs using the run ID.",
+                )
+            )
 
 
 # Modify the lifespan context manager
@@ -75,6 +226,7 @@ async def lifespan(app: FastAPI):
     app.state.last_optimization_date = None
 
     await app.state.db_pool.open(wait=True)
+    await ensure_observability_schema(app.state.db_pool)
     await sync_external_vendor_credits(app.state.db_pool)
 
     # Background Tasks - Ensure tasks respect operational constraints
@@ -90,14 +242,26 @@ async def lifespan(app: FastAPI):
     app.state.optimizer_task = asyncio.create_task(
         reactive_optimizer_loop(app.state.db_pool), name="prompt-optimizer"
     )
+    app.state.digest_task = asyncio.create_task(
+        executive_digest_loop(app), name="executive-digest"
+    )
+    app.state.watchdog_task = asyncio.create_task(
+        observability_watchdog_loop(app), name="observability-watchdog"
+    )
 
     for task in (
         app.state.auditor_task,
         app.state.awareness_task,
         app.state.credit_sync_task,
         app.state.optimizer_task,
+        app.state.digest_task,
+        app.state.watchdog_task,
     ):
-        task.add_done_callback(report_background_task_exit)
+        task.add_done_callback(
+            lambda completed_task, pool=app.state.db_pool: report_background_task_exit(
+                completed_task, pool
+            )
+        )
 
     emit_executive_notification(
         ExecutiveNotificationEvent(
@@ -117,6 +281,8 @@ async def lifespan(app: FastAPI):
         app.state.awareness_task,
         app.state.credit_sync_task,
         app.state.optimizer_task,
+        app.state.digest_task,
+        app.state.watchdog_task,
     ]
 
     for task in tasks_to_cancel:
@@ -132,6 +298,9 @@ app.router.lifespan_context = lifespan
 
 # --- API MODELS ---
 class LogMetadataSchema(BaseModel):
+    event_id: Optional[str] = None
+    run_id: Optional[str] = None
+    lifecycle_event: Optional[str] = None
     industry_name: Optional[str] = "General Operations"
     target_region: Optional[str] = "Global"
     records_found: Optional[int] = 0
@@ -156,7 +325,7 @@ class LogIngestSchema(BaseModel):
         "nova",
         "chiron",
     ]
-    log_level: Literal["INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     message: str
     metadata: Optional[LogMetadataSchema] = None
 
@@ -420,7 +589,15 @@ async def update_lead_status(
 
 
 @app.post("/api/v1/logs")
-async def ingest_log(payload: LogIngestSchema):
+async def ingest_log(
+    payload: LogIngestSchema,
+    x_helix_auth_token: str | None = Header(default=None),
+):
+    expected = os.getenv("HELIX_AUTH_TOKEN")
+    if not expected or not (
+        x_helix_auth_token and hmac.compare_digest(x_helix_auth_token, expected)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
     try:
         clean_metadata = None
         if payload.metadata:
@@ -440,6 +617,15 @@ async def ingest_log(payload: LogIngestSchema):
 
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
+                event_id = clean_metadata.get("event_id") if clean_metadata else None
+                if event_id:
+                    await cur.execute(
+                        "SELECT id FROM agent_system_logs WHERE metadata->>'event_id' = %s LIMIT 1;",
+                        (event_id,),
+                    )
+                    existing_row = await cur.fetchone()
+                    if existing_row:
+                        return {"status": "duplicate", "logged_id": existing_row[0]}
                 await cur.execute(
                     "INSERT INTO agent_system_logs (agent_name, log_level, message, metadata) VALUES (%s, %s, %s, %s) RETURNING id;",
                     (
