@@ -20,6 +20,7 @@ VENDOR_PHANTOMBUSTERS = "PhantomBusters"
 VENDOR_MOLTSET = "MoltSet"
 VENDOR_ANTHROPIC = "Anthropic"
 NEXUS_MORNING_HOUR = int(os.getenv("NEXUS_MORNING_HOUR", "6"))
+MOLTSET_RECOVERY_COOLDOWN = datetime.timedelta(minutes=30)
 
 
 def parse_moltset_search_capacity(data: dict) -> float | None:
@@ -41,6 +42,18 @@ def parse_moltset_search_capacity(data: dict) -> float | None:
     return float(remaining)
 
 
+def is_moltset_probe_due(
+    last_updated_at: datetime.datetime | None,
+    now_utc: datetime.datetime | None = None,
+) -> bool:
+    if last_updated_at is None:
+        return False
+    if last_updated_at.tzinfo is None:
+        last_updated_at = last_updated_at.replace(tzinfo=datetime.timezone.utc)
+    check_time = now_utc or datetime.datetime.now(datetime.timezone.utc)
+    return check_time - last_updated_at >= MOLTSET_RECOVERY_COOLDOWN
+
+
 async def check_and_heal_moltset_circuit(app_instance):
     """
     Checks MoltSet circuit status every 30 minutes.
@@ -52,19 +65,14 @@ async def check_and_heal_moltset_circuit(app_instance):
     if not hasattr(app_instance.state, "disabled_circuits"):
         app_instance.state.disabled_circuits = set()
 
-    # 1. Enforce 30-Minute Probe Cooldown
     now_utc = datetime.datetime.now(datetime.timezone.utc)
-    last_probe = getattr(app_instance.state, "last_moltset_probe_time", None)
-
-    if last_probe and (now_utc - last_probe) < datetime.timedelta(minutes=30):
-        return  # Stand down until the 30-minute window elapses
 
     # 2. Check if circuit is currently broken in DB
     try:
         async with db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute("""
-                    SELECT is_circuit_broken, credits_remaining 
+                    SELECT is_circuit_broken, credits_remaining, last_updated_at
                     FROM helix_infrastructure_oracle_ledger 
                     WHERE LOWER(vendor_name) = 'moltset';
                 """)
@@ -82,6 +90,10 @@ async def check_and_heal_moltset_circuit(app_instance):
         app_instance.state.disabled_circuits.discard("moltset")
         return
 
+    app_instance.state.disabled_circuits.add("moltset")
+    if not is_moltset_probe_due(ledger_record.get("last_updated_at"), now_utc):
+        return
+
     # 3. Circuit IS broken — Probe MoltSet get_account endpoint
     moltset_key = os.getenv("MOLTSET_API_KEY")
     api_endpoint = os.getenv(
@@ -91,8 +103,31 @@ async def check_and_heal_moltset_circuit(app_instance):
     if not moltset_key:
         return
 
-    # Update last probe attempt timestamp
-    app_instance.state.last_moltset_probe_time = now_utc
+    # Atomically claim this recovery probe. This persists the next cooldown and
+    # prevents multiple Render instances from probing or healing concurrently.
+    async with db_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("""
+                UPDATE helix_infrastructure_oracle_ledger
+                SET last_updated_at = NOW()
+                WHERE LOWER(vendor_name) = 'moltset'
+                  AND is_circuit_broken = TRUE
+                  AND last_updated_at <= NOW() - INTERVAL '30 minutes'
+                RETURNING vendor_name;
+            """)
+            claimed_probe = await cur.fetchone()
+        await conn.commit()
+
+    if not claimed_probe:
+        return
+
+    await write_helix_command_center_log(
+        db_pool,
+        "INFO",
+        "Probing MoltSet account capacity after the 30-minute circuit cooldown.",
+        "MOLTSET_RECOVERY_PROBE",
+        "MoltSet",
+    )
 
     url = f"{api_endpoint.rstrip('/')}/get_account"
     headers = {
@@ -144,17 +179,48 @@ async def check_and_heal_moltset_circuit(app_instance):
                         next_action="Nova dispatches resumed.",
                     )
                 )
+                await write_helix_command_center_log(
+                    db_pool,
+                    "INFO",
+                    f"MoltSet circuit healed with {requests_remaining} five-hour search requests available.",
+                    "MOLTSET_CIRCUIT_HEALED",
+                    "MoltSet",
+                    {"requests_remaining": requests_remaining},
+                )
             else:
                 print(
                     "⏳ [MOLTSET PROBE] get_account did not report positive active-account search capacity. Circuit remains broken."
+                )
+                await write_helix_command_center_log(
+                    db_pool,
+                    "WARNING",
+                    "MoltSet recovery probe found no positive active-account search capacity.",
+                    "MOLTSET_RECOVERY_DEFERRED",
+                    "MoltSet",
                 )
         else:
             print(
                 f"⏳ [MOLTSET PROBE] get_account probe failed with status {res.status_code}. Circuit remains broken."
             )
+            await write_helix_command_center_log(
+                db_pool,
+                "WARNING",
+                f"MoltSet recovery probe returned HTTP {res.status_code}; circuit remains broken.",
+                "MOLTSET_RECOVERY_FAILED",
+                "MoltSet",
+                {"http_status": res.status_code},
+            )
 
     except Exception as e:
         print(f"⚠️ Circuit healing probe failed against MoltSet portal: {e}")
+        await write_helix_command_center_log(
+            db_pool,
+            "ERROR",
+            f"MoltSet recovery probe raised {type(e).__name__}; circuit remains broken.",
+            "MOLTSET_RECOVERY_FAILED",
+            "MoltSet",
+            {"error_type": type(e).__name__},
+        )
 
 
 async def load_vendor_isolation_matrix(db_pool) -> dict:
