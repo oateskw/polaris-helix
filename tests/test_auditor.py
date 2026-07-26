@@ -46,7 +46,9 @@ async def test_beacon_without_engagement_metrics_is_insufficient_data(db_pool_fa
 
     audit = await evaluate_agent_performance(pool, "beacon")
 
-    assert audit["status"] == "INSUFFICIENT_DATA"
+    assert audit["status"] == "INSUFFICIENT_DATA_WITH_GAPS"
+    assert audit["performance_signals"]["info_logs_analyzed"] == 17
+    assert audit["performance_signals"]["kpi_rows_analyzed"] == 0
     assert audit["performance_signals"]["posts_analyzed"] == 0
 
 
@@ -66,6 +68,36 @@ async def test_beacon_with_real_low_engagement_is_underperforming(db_pool_factor
 
     assert audit["status"] == "UNDERPERFORMING"
     assert audit["performance_signals"]["avg_impressions"] == 60
+
+
+@pytest.mark.anyio
+async def test_beacon_with_lifecycle_publish_metrics_is_measurable(db_pool_factory):
+    pool, _, _ = db_pool_factory(
+        fetchall_sequence=[
+            [{"log_level": "INFO", "count": 2}],
+            [
+                {
+                    "metadata": {
+                        "posts_published": 1,
+                        "lifecycle_event": "RUN_COMPLETED",
+                    }
+                },
+                {
+                    "metadata": {
+                        "posts_published": 1,
+                        "lifecycle_event": "RUN_COMPLETED",
+                    }
+                },
+            ],
+        ]
+    )
+
+    audit = await evaluate_agent_performance(pool, "beacon")
+
+    assert audit["status"] == "HEALTHY"
+    assert audit["performance_signals"]["posts_analyzed"] == 0
+    assert audit["performance_signals"]["posts_published"] == 2
+    assert audit["performance_signals"]["kpi_rows_analyzed"] == 2
 
 
 @pytest.mark.anyio
@@ -138,6 +170,29 @@ async def test_non_beacon_agents_can_be_targeted_from_emitted_kpis(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "agent_name",
+    ["vanguard", "radar", "pulsar", "nexus"],
+)
+async def test_agents_with_info_logs_but_no_kpi_rows_are_marked_as_data_gaps(
+    db_pool_factory, agent_name
+):
+    pool, _, _ = db_pool_factory(
+        fetchall_sequence=[
+            [{"log_level": "INFO", "count": 4}],
+            [{"metadata": {"records_found": 2}} for _ in range(4)],
+        ]
+    )
+
+    audit = await evaluate_agent_performance(pool, agent_name)
+
+    assert audit["status"] == "INSUFFICIENT_DATA_WITH_GAPS"
+    assert audit["performance_signals"]["info_logs_analyzed"] == 4
+    assert audit["performance_signals"]["kpi_rows_analyzed"] == 0
+    assert any("KPI schema drift detected" in issue for issue in audit["issues"])
+
+
+@pytest.mark.anyio
 async def test_candidates_are_distinct_and_cooldown_filtered_by_query(
     db_pool_factory, monkeypatch
 ):
@@ -174,6 +229,40 @@ async def test_audit_pass_dispatches_only_first_underperformer(monkeypatch):
     assert dispatch.await_args is not None
     assert dispatch.await_args.args[1] == "pulsar"
     assert result["target_agent"] == "pulsar"
+
+
+@pytest.mark.anyio
+async def test_audit_pass_emits_warning_for_kpi_data_gap_and_skips_dispatch(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "core.auditor.get_chiron_audit_candidates",
+        AsyncMock(return_value=["beacon"]),
+    )
+    monkeypatch.setattr(
+        "core.auditor.evaluate_agent_performance",
+        AsyncMock(
+            return_value={
+                "status": "INSUFFICIENT_DATA_WITH_GAPS",
+                "issues": ["KPI schema drift detected: missing impressions/clicks"],
+                "performance_signals": {
+                    "info_logs_analyzed": 7,
+                    "kpi_rows_analyzed": 0,
+                },
+            }
+        ),
+    )
+    dispatch = AsyncMock(return_value=True)
+    notify = MagicMock()
+    monkeypatch.setattr("core.auditor.dispatch_chiron_optimization", dispatch)
+    monkeypatch.setattr("core.auditor.emit_executive_notification", notify)
+
+    result = await run_agent_performance_audit_pass(object())
+
+    dispatch.assert_not_awaited()
+    notify.assert_called_once()
+    assert result["target_agent"] is None
+    assert result["audit_status"] == "NO_ELIGIBLE_UNDERPERFORMER"
 
 
 @pytest.mark.anyio

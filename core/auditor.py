@@ -16,6 +16,7 @@ AGENT_PERFORMANCE_THRESHOLDS = {
     "beacon": {
         "min_avg_impressions": 150,
         "min_link_clicks": 5,
+        "min_posts_published": 1,
         "lookback_days": 7,
     },
     "vanguard": {
@@ -33,6 +34,28 @@ AGENT_PERFORMANCE_THRESHOLDS = {
 }
 
 DEFAULT_CHIRON_COOLDOWN_HOURS = 7 * 24
+INSUFFICIENT_DATA_WITH_GAPS = "INSUFFICIENT_DATA_WITH_GAPS"
+
+
+def _flag_kpi_coverage_gap(
+    metrics: Dict[str, Any],
+    kpi_rows_analyzed: int,
+    expected_signals: str,
+) -> None:
+    """Mark a data-contract gap when INFO logs exist but no KPI-compatible rows were found."""
+    performance_signals = metrics.setdefault("performance_signals", {})
+    performance_signals["info_logs_analyzed"] = metrics.get("info_logs", 0)
+    performance_signals["kpi_rows_analyzed"] = kpi_rows_analyzed
+
+    if metrics.get("info_logs", 0) <= 0 or kpi_rows_analyzed > 0:
+        return
+
+    metrics["status"] = INSUFFICIENT_DATA_WITH_GAPS
+    metrics["issues"].append(
+        "KPI schema drift detected: "
+        f"observed {metrics['info_logs']} INFO logs but 0 KPI-compatible rows. "
+        f"Expected signals: {expected_signals}."
+    )
 
 
 async def get_chiron_audit_candidates(db_pool) -> list[str]:
@@ -82,6 +105,7 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
         "agent": normalized_agent,
         "status": "INSUFFICIENT_DATA",
         "total_runs": 0,
+        "info_logs": 0,
         "error_count": 0,
         "performance_signals": {},
         "issues": [],
@@ -105,6 +129,8 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                 for row in log_counts:
                     if row["log_level"] == "ERROR":
                         metrics["error_count"] = row["count"]
+                    if row["log_level"] == "INFO":
+                        metrics["info_logs"] = row["count"]
                     metrics["total_runs"] += row["count"]
 
                 # 2. Agent-Specific KPI Evaluation
@@ -121,9 +147,12 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                     total_impressions = 0
                     total_clicks = 0
                     post_count = 0
+                    published_posts_total = 0
 
                     for log in beacon_logs:
                         meta = log.get("metadata") or {}
+                        if isinstance(meta, dict):
+                            published_posts_total += int(meta.get("posts_published", 0))
                         if isinstance(meta, dict) and (
                             "impressions" in meta or "clicks" in meta
                         ):
@@ -134,10 +163,16 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                     avg_impressions = total_impressions / max(post_count, 1)
                     metrics["performance_signals"] = {
                         "posts_analyzed": post_count,
+                        "posts_published": published_posts_total,
                         "total_impressions": total_impressions,
                         "avg_impressions": avg_impressions,
                         "total_clicks": total_clicks,
                     }
+                    _flag_kpi_coverage_gap(
+                        metrics,
+                        max(post_count, published_posts_total),
+                        "impressions/clicks or posts_published lifecycle summary",
+                    )
 
                     if post_count > 0:
                         metrics["status"] = "HEALTHY"
@@ -152,6 +187,14 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                             metrics["status"] = "UNDERPERFORMING"
                             metrics["issues"].append(
                                 f"Total referral traffic clicks ({total_clicks}) in the last 7 days is too low. CTA / hook alignment is failing."
+                            )
+                    elif published_posts_total > 0:
+                        metrics["status"] = "HEALTHY"
+                        min_posts = thresholds.get("min_posts_published", 1)
+                        if published_posts_total < min_posts:
+                            metrics["status"] = "UNDERPERFORMING"
+                            metrics["issues"].append(
+                                "Beacon published too few campaigns in the current lookback window."
                             )
 
                 elif normalized_agent == "vanguard":
@@ -182,6 +225,11 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                             else 0
                         ),
                     }
+                    _flag_kpi_coverage_gap(
+                        metrics,
+                        len(snapshots),
+                        "processed_leads_total and cold_leads_total snapshots",
+                    )
                     if snapshots:
                         metrics["status"] = "HEALTHY"
                         latest = snapshots[0]
@@ -226,6 +274,11 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                         "total_harvested": harvested_leads,
                         "avg_harvest_per_run": avg_harvest,
                     }
+                    _flag_kpi_coverage_gap(
+                        metrics,
+                        nova_runs,
+                        "harvested_count or lifecycle_event=RUN_COMPLETED",
+                    )
 
                     if nova_runs > 0:
                         metrics["status"] = "HEALTHY"
@@ -275,6 +328,11 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                             "processed_leads": processed,
                             "processed_rate": processed_rate,
                         }
+                        _flag_kpi_coverage_gap(
+                            metrics,
+                            len(completed),
+                            "stage=batch_complete with requested_leads and processed_leads",
+                        )
                         if completed:
                             metrics["status"] = "HEALTHY"
                             if (
@@ -298,6 +356,11 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                             "batches_analyzed": len(completed),
                             "dms_sent": sent,
                         }
+                        _flag_kpi_coverage_gap(
+                            metrics,
+                            len(completed),
+                            "dms_skipped marker with records_found",
+                        )
                         if completed:
                             metrics["status"] = "HEALTHY"
                             if len(completed) >= 2 and sent < thresholds.get(
@@ -321,6 +384,11 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                             "runs_analyzed": len(completed),
                             "records_found": records,
                         }
+                        _flag_kpi_coverage_gap(
+                            metrics,
+                            len(completed),
+                            "status in {SUCCESS, RESCUE_RUN} with records_found",
+                        )
                         if completed:
                             metrics["status"] = "HEALTHY"
                             if len(completed) >= 2 and records < thresholds.get(
@@ -483,6 +551,30 @@ async def run_agent_performance_audit_pass(db_pool) -> dict[str, Any]:
     candidates = await get_chiron_audit_candidates(db_pool)
     for agent_name in candidates:
         audit = await evaluate_agent_performance(db_pool, agent_name)
+        if audit.get("status") == INSUFFICIENT_DATA_WITH_GAPS:
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="telemetry_gap",
+                    severity="warning",
+                    headline=f"{agent_name.capitalize()} KPI Telemetry Gap Detected",
+                    outcome=(
+                        "Audit could not evaluate underperformance because KPI-compatible "
+                        "payloads were missing from recent INFO logs."
+                    ),
+                    impact="; ".join(audit.get("issues", [])) or None,
+                    next_action=(
+                        "Align agent log metadata to Helix KPI contracts so Chiron can make "
+                        "optimization decisions with complete evidence."
+                    ),
+                    metadata={
+                        "agent": agent_name,
+                        "performance_signals": audit.get("performance_signals", {}),
+                    },
+                )
+            )
+            continue
+
         if audit.get("status") != "UNDERPERFORMING":
             continue
 
