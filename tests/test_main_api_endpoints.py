@@ -415,6 +415,42 @@ async def test_oracle_vendor_health_success(app_module, app_client, db_pool_fact
     }
 
 
+async def test_single_vendor_health_delegates_to_canonical_helper(
+    app_module, app_client, db_pool_factory, monkeypatch
+):
+    pool, _, cursors = db_pool_factory()
+    app_module.app.state.db_pool = pool
+    circuit_check = AsyncMock(return_value=False)
+    monkeypatch.setattr(app_module, "is_vendor_circuit_healthy", circuit_check)
+
+    response = await app_client.get(
+        "/api/v1/oracle/vendor-health/Anthropic",
+        headers={"X-Inbound-Key": TEST_AUTH_TOKEN},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"vendor_name": "Anthropic", "healthy": False}
+    circuit_check.assert_awaited_once_with(pool, "Anthropic")
+    assert cursors[0].executed == []
+
+
+async def test_single_vendor_health_rejects_invalid_auth(
+    app_module, app_client, db_pool_factory, monkeypatch
+):
+    pool, _, _ = db_pool_factory()
+    app_module.app.state.db_pool = pool
+    circuit_check = AsyncMock(return_value=True)
+    monkeypatch.setattr(app_module, "is_vendor_circuit_healthy", circuit_check)
+
+    response = await app_client.get(
+        "/api/v1/oracle/vendor-health/Anthropic",
+        headers={"X-Inbound-Key": "wrong"},
+    )
+
+    assert response.status_code == 401
+    circuit_check.assert_not_awaited()
+
+
 async def test_optimize_now_success_and_failure(
     app_module, app_client, db_pool_factory, monkeypatch
 ):

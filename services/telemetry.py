@@ -57,6 +57,11 @@ def get_new_york_now() -> datetime.datetime:
 
 async def is_vendor_circuit_healthy(db_pool, vendor_name: str) -> bool:
     """Checks the infrastructure ledger to see if a vendor's circuit is broken."""
+    normalized_vendor_name = str(vendor_name or "").strip()
+    if not normalized_vendor_name:
+        print("Circuit ledger lookup blocked because vendor_name is empty.")
+        return False
+
     try:
         async with db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -64,18 +69,27 @@ async def is_vendor_circuit_healthy(db_pool, vendor_name: str) -> bool:
                     """
                     SELECT is_circuit_broken 
                     FROM helix_infrastructure_oracle_ledger 
-                    WHERE vendor_name = %s LIMIT 1;
+                    WHERE LOWER(vendor_name) = LOWER(%s) LIMIT 1;
                     """,
-                    (vendor_name,),
+                    (normalized_vendor_name,),
                 )
                 record = await cur.fetchone()
-                # If no record exists, assume safe; if it exists, return the inverse of the trip flag
-                if record:
-                    return not record.get("is_circuit_broken", False)
-                return True
+                if not record or not isinstance(record, dict):
+                    print(
+                        f"Circuit ledger lookup blocked for {normalized_vendor_name}: no valid ledger state."
+                    )
+                    return False
+
+                is_circuit_broken = record.get("is_circuit_broken")
+                if not isinstance(is_circuit_broken, bool):
+                    print(
+                        f"Circuit ledger lookup blocked for {normalized_vendor_name}: invalid circuit state."
+                    )
+                    return False
+                return not is_circuit_broken
     except Exception as e:
-        print(f"⚠️ Circuit ledger lookup failed for {vendor_name}: {e}")
-        return True  # Fallback to true so a DB hiccup doesn't paralyze the system
+        print(f"Circuit ledger lookup failed closed for {normalized_vendor_name}: {e}")
+        return False
 
 
 # Telegram and Command Logging

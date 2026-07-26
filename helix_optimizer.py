@@ -3,32 +3,7 @@ import os
 import json
 import re
 from anthropic import AsyncAnthropic
-
-
-async def is_vendor_circuit_healthy(db_pool, vendor_name: str) -> bool:
-    """
-    🆕 Checks the infrastructure ledger to see if a vendor's circuit is broken.
-    Prevents hitting external APIs when they are flagged out of funds.
-    """
-    try:
-        async with db_pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    SELECT is_circuit_broken 
-                    FROM helix_infrastructure_oracle_ledger 
-                    WHERE vendor_name = %s LIMIT 1;
-                    """,
-                    (vendor_name,),
-                )
-                row = await cur.fetchone()
-                if row:
-                    # row[0] is the boolean `is_circuit_broken`
-                    return not row[0]
-                return True
-    except Exception as e:
-        print(f"⚠️ Circuit ledger lookup failed for {vendor_name}: {e}")
-        return True
+from services.telemetry import is_vendor_circuit_healthy
 
 
 async def check_anomaly_threshold(db_pool, threshold=5) -> bool:
@@ -116,6 +91,12 @@ async def run_daily_prompt_optimization(db_pool, force=False):
 
     for agent_name, prompt_key, current_prompt in raw_prompts:
         try:
+            if not await is_vendor_circuit_healthy(db_pool, "Anthropic"):
+                print(
+                    "🛑 [OPTIMIZER] Anthropic circuit changed to blocked. Stopping remaining prompt optimizations."
+                )
+                break
+
             response = await ai_client.messages.create(
                 model=target_model,
                 max_tokens=2000,

@@ -854,6 +854,23 @@ async def get_vendor_health(x_inbound_key: str | None = Header(default=None)):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/api/v1/oracle/vendor-health/{vendor_name}")
+async def get_single_vendor_health(
+    vendor_name: str,
+    x_inbound_key: str | None = Header(default=None),
+):
+    expected = os.getenv("HELIX_AUTH_TOKEN")
+    if expected and not (
+        x_inbound_key and hmac.compare_digest(x_inbound_key, expected)
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    return {
+        "vendor_name": vendor_name,
+        "healthy": await is_vendor_circuit_healthy(app.state.db_pool, vendor_name),
+    }
+
+
 @app.post("/api/v1/orchestrator/optimize-now")
 async def force_prompt_optimization(
     x_helix_auth_token: Optional[str] = Header(default=None),
