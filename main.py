@@ -120,6 +120,15 @@ async def ensure_observability_schema(db_pool) -> None:
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("""
+                CREATE TABLE IF NOT EXISTS telegram_processed_updates (
+                    update_id BIGINT PRIMARY KEY,
+                    command TEXT NOT NULL,
+                    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_tpu_processed_at
+                ON telegram_processed_updates (processed_at DESC);
+
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_asl_event_id
                 ON agent_system_logs ((metadata->>'event_id'))
                 WHERE metadata->>'event_id' IS NOT NULL;

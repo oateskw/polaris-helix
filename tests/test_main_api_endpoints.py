@@ -16,6 +16,20 @@ class HybridMockRow(dict):
 pytestmark = pytest.mark.anyio
 
 
+async def test_startup_schema_provisions_telegram_update_deduplication(
+    app_module, db_pool_factory
+):
+    pool, connection, cursors = db_pool_factory()
+
+    await app_module.ensure_observability_schema(pool)
+
+    startup_sql, params = cursors[0].executed[0]
+    assert params is None
+    assert "CREATE TABLE IF NOT EXISTS telegram_processed_updates" in startup_sql
+    assert "CREATE INDEX IF NOT EXISTS idx_tpu_processed_at" in startup_sql
+    assert connection.commit_calls == 1
+
+
 async def test_root_heartbeat_get_and_head(app_client):
     get_res = await app_client.get("/")
     head_res = await app_client.head("/")
