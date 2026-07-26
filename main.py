@@ -22,7 +22,7 @@ from fastapi import (
     Header,
     BackgroundTasks,
 )
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from anthropic import Anthropic
@@ -316,6 +316,8 @@ app.router.lifespan_context = lifespan
 
 # --- API MODELS ---
 class LogMetadataSchema(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     event_id: Optional[str] = None
     run_id: Optional[str] = None
     lifecycle_event: Optional[str] = None

@@ -202,6 +202,42 @@ async def test_ingest_log_accepts_debug_level(
     assert response.json()["logged_id"] == 91
 
 
+async def test_ingest_log_preserves_extra_metadata_keys(
+    app_module, app_client, db_pool_factory, monkeypatch
+):
+    pool, _, cursors = db_pool_factory(fetchone_sequence=[(93,)])
+    app_module.app.state.db_pool = pool
+    monkeypatch.setattr(
+        app_module.asyncio, "create_task", lambda coroutine: coroutine.close()
+    )
+
+    response = await app_client.post(
+        "/api/v1/logs",
+        headers={"X-Helix-Auth-Token": TEST_AUTH_TOKEN},
+        json={
+            "agent_name": "pulsar",
+            "log_level": "INFO",
+            "message": "Webhook batch completed.",
+            "metadata": {
+                "run_id": "pulsar-123",
+                "lifecycle_event": "RUN_COMPLETED",
+                "stage": "batch_complete",
+                "dms_sent": 1,
+                "dms_skipped": 0,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["logged_id"] == 93
+
+    _, params = cursors[0].executed[0]
+    inserted_metadata = params[3].obj
+    assert inserted_metadata["stage"] == "batch_complete"
+    assert inserted_metadata["dms_sent"] == 1
+    assert inserted_metadata["dms_skipped"] == 0
+
+
 @pytest.mark.parametrize(
     "metadata",
     [None, {}, {"traceback": ""}, {"traceback": "ValueError: malformed"}],
