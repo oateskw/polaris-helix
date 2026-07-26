@@ -11,12 +11,20 @@ from core.engine import (
 )
 
 
-def test_parse_moltset_search_capacity_reads_five_hour_remaining():
+def test_parse_moltset_search_capacity_uses_tightest_required_bucket():
     payload = {
         "status": "ok",
         "results": {
             "status": "active",
-            "fair_use": {"search": {"requests": {"5h": {"remaining": 37}}}},
+            "fair_use": {
+                "search": {
+                    "requests": {"5h": {"remaining": 37}},
+                    "records": {
+                        "5h": {"remaining": 1200},
+                        "1w": {"remaining": 4800},
+                    },
+                }
+            },
         },
     }
 
@@ -32,14 +40,57 @@ def test_parse_moltset_search_capacity_reads_five_hour_remaining():
             "status": "error",
             "results": {
                 "status": "active",
-                "fair_use": {"search": {"requests": {"5h": {"remaining": 10}}}},
+                "fair_use": {
+                    "search": {
+                        "requests": {"5h": {"remaining": 10}},
+                        "records": {
+                            "5h": {"remaining": 1000},
+                            "1w": {"remaining": 5000},
+                        },
+                    }
+                },
             },
         },
         {
             "status": "ok",
             "results": {
                 "status": "active",
-                "fair_use": {"search": {"requests": {"5h": {"remaining": "10"}}}},
+                "fair_use": {
+                    "search": {
+                        "requests": {"5h": {"remaining": "10"}},
+                        "records": {
+                            "5h": {"remaining": 1000},
+                            "1w": {"remaining": 5000},
+                        },
+                    }
+                },
+            },
+        },
+        {
+            "status": "ok",
+            "results": {
+                "status": "active",
+                "fair_use": {
+                    "search": {
+                        "requests": {"5h": {"remaining": 10}},
+                        "records": {
+                            "5h": {"remaining": "1000"},
+                            "1w": {"remaining": 5000},
+                        },
+                    }
+                },
+            },
+        },
+        {
+            "status": "ok",
+            "results": {
+                "status": "active",
+                "fair_use": {
+                    "search": {
+                        "requests": {"5h": {"remaining": 10}},
+                        "records": {"5h": {"remaining": 1000}},
+                    }
+                },
             },
         },
     ],
@@ -48,13 +99,59 @@ def test_parse_moltset_search_capacity_fails_closed(payload):
     assert parse_moltset_search_capacity(payload) is None
 
 
-def test_parse_moltset_search_capacity_preserves_zero():
-    payload = {
-        "status": "ok",
-        "results": {
-            "status": "active",
-            "fair_use": {"search": {"requests": {"5h": {"remaining": 0}}}},
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "status": "ok",
+            "results": {
+                "status": "active",
+                "fair_use": {
+                    "search": {
+                        "requests": {"5h": {"remaining": 0}},
+                        "records": {
+                            "5h": {"remaining": 1000},
+                            "1w": {"remaining": 5000},
+                        },
+                    }
+                },
+            },
         },
+        {
+            "status": "ok",
+            "results": {
+                "status": "active",
+                "fair_use": {
+                    "search": {
+                        "requests": {"5h": {"remaining": 100}},
+                        "records": {
+                            "5h": {"remaining": 0},
+                            "1w": {"remaining": 5000},
+                        },
+                    }
+                },
+            },
+        },
+        {
+            "status": "ok",
+            "results": {
+                "status": "active",
+                "fair_use": {
+                    "search": {
+                        "requests": {"5h": {"remaining": 100}},
+                        "records": {
+                            "5h": {"remaining": 1000},
+                            "1w": {"remaining": 0},
+                        },
+                    }
+                },
+            },
+        },
+    ],
+)
+def test_parse_moltset_search_capacity_preserves_zero(payload):
+    payload = {
+        **payload,
     }
 
     assert parse_moltset_search_capacity(payload) == 0.0
@@ -125,7 +222,15 @@ async def test_due_moltset_probe_claims_window_heals_and_logs(
         "status": "ok",
         "results": {
             "status": "active",
-            "fair_use": {"search": {"requests": {"5h": {"remaining": 2382}}}},
+            "fair_use": {
+                "search": {
+                    "requests": {"5h": {"remaining": 2382}},
+                    "records": {
+                        "5h": {"remaining": 9000},
+                        "1w": {"remaining": 24000},
+                    },
+                }
+            },
         },
     }
     post = MagicMock(return_value=account_response)

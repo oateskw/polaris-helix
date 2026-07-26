@@ -26,21 +26,44 @@ MOLTSET_RECOVERY_COOLDOWN = datetime.timedelta(minutes=30)
 
 def parse_moltset_search_capacity(data: dict) -> float | None:
     account = data.get("results") or {}
-    remaining = (
+    requests_remaining = (
         account.get("fair_use", {})
         .get("search", {})
         .get("requests", {})
         .get("5h", {})
         .get("remaining")
     )
+    records_remaining_5h = (
+        account.get("fair_use", {})
+        .get("search", {})
+        .get("records", {})
+        .get("5h", {})
+        .get("remaining")
+    )
+    records_remaining_1w = (
+        account.get("fair_use", {})
+        .get("search", {})
+        .get("records", {})
+        .get("1w", {})
+        .get("remaining")
+    )
+
+    remaining_values = [
+        requests_remaining,
+        records_remaining_5h,
+        records_remaining_1w,
+    ]
+
     if (
         data.get("status") != "ok"
         or account.get("status") != "active"
-        or isinstance(remaining, bool)
-        or not isinstance(remaining, (int, float))
+        or any(isinstance(v, bool) for v in remaining_values)
+        or not all(isinstance(v, (int, float)) for v in remaining_values)
     ):
         return None
-    return float(remaining)
+
+    # Return the tightest search fair-use ceiling so callers can fail closed.
+    return float(min(remaining_values))
 
 
 def is_moltset_probe_due(
@@ -141,7 +164,7 @@ async def check_and_heal_moltset_circuit(app_instance) -> bool:
             None, lambda: requests.post(url, headers=headers, json={}, timeout=12)
         )
 
-        # 4. Process HTTP Response & Parse Available Search Requests
+        # 4. Process HTTP response and parse strict search fair-use capacity.
         if res.status_code == 200:
             data = res.json() or {}
             requests_remaining = parse_moltset_search_capacity(data)
@@ -165,7 +188,7 @@ async def check_and_heal_moltset_circuit(app_instance) -> bool:
                 app_instance.state.disabled_circuits.discard("moltset")
 
                 print(
-                    f"🟢 [CIRCUIT HEALED] MoltSet get_account reported {requests_remaining} search requests. Circuit restored."
+                    f"🟢 [CIRCUIT HEALED] MoltSet get_account reported positive search fair-use capacity ({requests_remaining} minimum remaining). Circuit restored."
                 )
 
                 emit_executive_notification(
@@ -174,14 +197,14 @@ async def check_and_heal_moltset_circuit(app_instance) -> bool:
                         event_type="pipeline_milestone",
                         severity="success",
                         headline="MoltSet Circuit Healed",
-                        outcome=f"MoltSet get_account reported {requests_remaining} five-hour search requests. Restored automated dispatches.",
+                        outcome=f"MoltSet get_account reported positive search fair-use capacity ({requests_remaining} minimum remaining across requests/records windows). Restored automated dispatches.",
                         next_action="Nova dispatches resumed.",
                     )
                 )
                 await write_helix_command_center_log(
                     db_pool,
                     "INFO",
-                    f"MoltSet circuit healed from quota-free account capacity verification ({requests_remaining} requests available).",
+                    f"MoltSet circuit healed from quota-free account capacity verification ({requests_remaining} minimum remaining across required search fair-use windows).",
                     "MOLTSET_CIRCUIT_HEALED",
                     "MoltSet",
                     {"requests_remaining": requests_remaining},
@@ -189,12 +212,12 @@ async def check_and_heal_moltset_circuit(app_instance) -> bool:
                 return True
             else:
                 print(
-                    "⏳ [MOLTSET PROBE] get_account did not report positive active-account search capacity. Circuit remains broken."
+                    "⏳ [MOLTSET PROBE] get_account did not report positive capacity across required search fair-use windows. Circuit remains broken."
                 )
                 await write_helix_command_center_log(
                     db_pool,
                     "WARNING",
-                    "MoltSet recovery probe found no positive active-account search capacity.",
+                    "MoltSet recovery probe found no positive capacity across required search fair-use windows.",
                     "MOLTSET_RECOVERY_DEFERRED",
                     "MoltSet",
                 )
