@@ -554,7 +554,7 @@ async def run_agent_performance_audit_pass(db_pool) -> dict[str, Any]:
         if audit.get("status") == INSUFFICIENT_DATA_WITH_GAPS:
             emit_executive_notification(
                 ExecutiveNotificationEvent(
-                    source_agent="helix",
+                    source_agent=agent_name,
                     event_type="telemetry_gap",
                     severity="warning",
                     headline=f"{agent_name.capitalize()} KPI Telemetry Gap Detected",

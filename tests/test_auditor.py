@@ -261,6 +261,9 @@ async def test_audit_pass_emits_warning_for_kpi_data_gap_and_skips_dispatch(
 
     dispatch.assert_not_awaited()
     notify.assert_called_once()
+    notification = notify.call_args.args[0]
+    assert notification.source_agent == "beacon"
+    assert notification.metadata["agent"] == "beacon"
     assert result["target_agent"] is None
     assert result["audit_status"] == "NO_ELIGIBLE_UNDERPERFORMER"
 
