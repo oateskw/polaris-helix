@@ -211,6 +211,7 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
                         for row in await cur.fetchall()
                         if isinstance(row.get("metadata"), dict)
                         and "processed_leads_total" in row.get("metadata", {})
+                        and "cold_leads_total" in row.get("metadata", {})
                     ]
                     metrics["performance_signals"] = {
                         "snapshots_analyzed": len(snapshots),

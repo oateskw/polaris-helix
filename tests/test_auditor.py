@@ -193,6 +193,21 @@ async def test_agents_with_info_logs_but_no_kpi_rows_are_marked_as_data_gaps(
 
 
 @pytest.mark.anyio
+async def test_vanguard_partial_snapshot_is_marked_as_data_gap(db_pool_factory):
+    pool, _, _ = db_pool_factory(
+        fetchall_sequence=[
+            [{"log_level": "INFO", "count": 1}],
+            [{"metadata": {"processed_leads_total": 4}}],
+        ]
+    )
+
+    audit = await evaluate_agent_performance(pool, "vanguard")
+
+    assert audit["status"] == "INSUFFICIENT_DATA_WITH_GAPS"
+    assert audit["performance_signals"]["kpi_rows_analyzed"] == 0
+
+
+@pytest.mark.anyio
 async def test_candidates_are_distinct_and_cooldown_filtered_by_query(
     db_pool_factory, monkeypatch
 ):
