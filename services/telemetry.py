@@ -313,14 +313,17 @@ async def send_executive_summary_from_logs(
         if ai_client and anthropic_healthy:
             prompt = (
                 f"You are the Helix Executive Analytics Engine. Analyze the following recent system logs "
-                f"from the last {lookback_minutes} minutes and provide an executive summary scorecard. "
-                f"Group findings by agent actions. Use markdown lists and specific emojis. Keep it brief, "
-                f"highly professional, scannable, and omit mundane technical details.\n\n"
+                f"from the last {lookback_minutes} minutes and provide an executive summary scorecard.\n\n"
+                f"CRITICAL FORMATTING RULES FOR TELEGRAM HTML:\n"
+                f"1. DO NOT use Markdown syntax (NO '#', '##', '**', or '|' tables).\n"
+                f"2. Use Telegram HTML tags ONLY: <b>bold</b>, <i>italic</i>, and <code>code</code>.\n"
+                f"3. Do NOT draw tables. Use structured bullet lists with bold keys for tabular data.\n"
+                f"4. Keep it brief, highly professional, scannable, and omit mundane technical details.\n\n"
                 f"LOGS:\n{json.dumps(compact_logs, indent=2)}"
             )
 
             response = ai_client.messages.create(
-                model="claude-haiku-4-5",  # <-- Downgraded from 'claude-3-5-sonnet-20241022' to protect your budget
+                model="claude-haiku-4-5",
                 max_tokens=1000,
                 temperature=0.3,
                 messages=[{"role": "user", "content": prompt}],
