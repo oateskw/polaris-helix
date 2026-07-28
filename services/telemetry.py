@@ -100,17 +100,25 @@ def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
         return
 
     prefixes = {
-        "critical": "🚨 [CRITICAL INFRASTRUCTURE]",
-        "success": "✅ [PIPELINE SUCCESS]",
-        "orchestration": "🧠 [HELIX ORCHESTRATOR]",
-        "verbose": "📡 [TELEMETRY]",
+        "critical": "🚨 <b>[CRITICAL INFRASTRUCTURE]</b>",
+        "success": "✅ <b>[PIPELINE SUCCESS]</b>",
+        "orchestration": "🧠 <b>[HELIX ORCHESTRATOR]</b>",
+        "verbose": "📡 <b>[TELEMETRY]</b>",
     }
     prefix = prefixes.get(notification_type, "📡")
     extra_details = ""
+
     if notification_type == "critical":
         tb_str = traceback.format_exc()
         if tb_str and "NoneType: None" not in tb_str:
-            extra_details = f"\n\n**🔍 Traceback:**\n```python\n{tb_str[-1500:]}\n```"
+            # Escape HTML characters in raw tracebacks
+            clean_tb = (
+                tb_str[-1500:]
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            extra_details = f'\n\n<b>🔍 Traceback:</b>\n<pre><code class="language-python">{clean_tb}</code></pre>'
 
     formatted_message = f"{prefix}\n{message}{extra_details}"
 
@@ -122,7 +130,7 @@ def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
                     json={
                         "chat_id": chat_id,
                         "text": formatted_message,
-                        "parse_mode": "Markdown",
+                        "parse_mode": "HTML",  # Switch to HTML parse mode
                     },
                 )
                 if response.status_code != 200:
@@ -132,19 +140,17 @@ def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
         except Exception as e:
             print(f"⚠️ Telegram broadcast async failed: {e}")
 
-    # FIX 1: Explicitly run or schedule the async routine
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_send())
     except RuntimeError:
-        # Fallback for non-async calling threads
         try:
             response = requests.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 json={
                     "chat_id": chat_id,
                     "text": formatted_message,
-                    "parse_mode": "Markdown",
+                    "parse_mode": "HTML",  # Switch to HTML parse mode
                 },
                 timeout=5,
             )

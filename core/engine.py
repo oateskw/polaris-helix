@@ -631,12 +631,35 @@ async def perpetual_awareness_loop(app_instance):
                         pending_agents_for_today.append(agent)
 
                 if not pending_agents_for_today:
+                    # Build a readable quota summary (e.g. "nexus: 3/3, vanguard: 5/5, nova: 2/2")
+                    quota_summary_str = ", ".join(
+                        f"{row['agent_name'].lower()}: {run_counts_today.get(row['agent_name'].lower(), 0)}/{row['max_daily_runs']}"
+                        for row in db_scheduled_agents
+                    )
+
+                    quota_telemetry_meta = {
+                        "weekday_int": current_weekday,
+                        "date_est": current_date_str,
+                        "agent_quota_breakdown": {
+                            row["agent_name"].lower(): {
+                                "completed": run_counts_today.get(
+                                    row["agent_name"].lower(), 0
+                                ),
+                                "max_allowed": row["max_daily_runs"],
+                            }
+                            for row in db_scheduled_agents
+                        },
+                    }
+
                     await write_helix_command_center_log(
                         db_pool,
                         "INFO",
-                        f"All dynamic queue items for weekday {current_weekday} maximized quota allocations. Standing down.",
+                        f"All dynamic queue items for weekday {current_weekday} ({est_now.strftime('%A')}) have reached maximum daily quota allocations [{quota_summary_str}]. Standing down standard loop.",
                         "ORCHESTRATOR_COMPLETE",
+                        "System Core",
+                        quota_telemetry_meta,
                     )
+                    last_standard_drip_at = now_utc
                     await asyncio.sleep(60)
                     continue
 
