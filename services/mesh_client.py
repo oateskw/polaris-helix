@@ -591,8 +591,9 @@ async def trigger_downstream_mesh_with_payload(
         }
 
         dispatch_results["aura"] = await async_http_post_proxy(
-            f"{url}/api/v1/aura",
+            f"{url}/api/v1/aura/execute",
             {
+                "Authorization": f"Bearer {master_token}",
                 "x-aura-secret": master_token,
                 "Content-Type": "application/json",
             },
