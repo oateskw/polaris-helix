@@ -231,3 +231,46 @@ async def test_nexus_mesh_skips_dispatch_without_helix_auth_token(
     post_proxy.assert_not_awaited()
     assert command_log.await_args.args[3] == "SKIP_NEXUS_AUTH_UNAVAILABLE"
     assert result == {"nexus": False}
+
+
+@pytest.mark.anyio
+async def test_aura_mesh_uses_execute_endpoint_and_bearer_auth(
+    db_pool_factory, monkeypatch
+):
+    pool, _, _ = db_pool_factory()
+    post_proxy = AsyncMock(return_value=True)
+    command_log = AsyncMock()
+    monkeypatch.setenv("HELIX_AUTH_TOKEN", "shared-token")
+    monkeypatch.setattr(
+        "services.mesh_client.query_learned_guidelines",
+        AsyncMock(return_value=["PREFER: Keep hooks numeric and concise."]),
+    )
+    monkeypatch.setattr("services.mesh_client.async_http_post_proxy", post_proxy)
+    monkeypatch.setattr(
+        "services.telemetry.write_helix_command_center_log", command_log
+    )
+    monkeypatch.setattr("services.telemetry.emit_executive_notification", MagicMock())
+
+    result = await trigger_downstream_mesh_with_payload(
+        pool,
+        SimpleNamespace(),
+        {
+            "industry_id": 42,
+            "industry_name": "Logistics",
+            "target_region": "Texas",
+            "bottleneck_profile": "Manual dispatching",
+            "notification_type": "DM",
+            "nexus_directive": "[STRATEGY: LIVE_AUDIT] Focus on payroll loss math.",
+        },
+        ["aura"],
+        {},
+    )
+
+    post_proxy.assert_awaited_once()
+    aura_url, aura_headers, aura_payload = post_proxy.await_args.args
+    assert aura_url.endswith("/api/v1/aura/execute")
+    assert aura_headers["Authorization"] == "Bearer shared-token"
+    assert aura_payload["learned_guidelines"] == [
+        "PREFER: Keep hooks numeric and concise."
+    ]
+    assert result == {"aura": True}
