@@ -28,6 +28,35 @@ CREATE TABLE IF NOT EXISTS telegram_processed_updates (
 CREATE INDEX IF NOT EXISTS idx_tpu_processed_at
     ON telegram_processed_updates (processed_at DESC);
 
+CREATE EXTENSION IF NOT EXISTS vector;
+
+DO $$
+BEGIN
+    IF to_regclass('helix_semantic_memory') IS NOT NULL THEN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = 'helix_semantic_memory'
+          AND column_name = 'embedding'
+          AND udt_name = 'vector'
+    ) THEN
+        EXECUTE 'CREATE INDEX IF NOT EXISTS idx_hsm_embedding_ivfflat '
+            'ON helix_semantic_memory USING ivfflat '
+            '(embedding vector_cosine_ops) WITH (lists = 100)';
+    END IF;
+
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_hsm_agent_created '
+        'ON helix_semantic_memory (LOWER(agent_name), created_at DESC)';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_hsm_industry_created '
+        'ON helix_semantic_memory (LOWER(industry), created_at DESC)';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_hsm_outcome_type '
+        'ON helix_semantic_memory (LOWER(outcome_type))';
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_hsm_source_event_id '
+        'ON helix_semantic_memory ((metadata->>''source_event_id'')) '
+        'WHERE metadata->>''source_event_id'' IS NOT NULL';
+    END IF;
+END $$;
+
 DO $$
 BEGIN
     IF to_regclass('helix_agent_manifests') IS NOT NULL THEN

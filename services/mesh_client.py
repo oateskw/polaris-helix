@@ -27,6 +27,20 @@ def normalize_auth_token(value: str | None) -> str:
     return token
 
 
+async def resolve_guidelines_for_agent(
+    target_industry: str, agent_name: str, top_k: int = 3
+) -> tuple[list[str], dict[str, Any]]:
+    guidelines = await query_learned_guidelines(
+        target_industry=target_industry, agent_name=agent_name, top_k=top_k
+    )
+    return guidelines, {
+        "memory_hit": bool(guidelines),
+        "guideline_count": len(guidelines),
+        "guideline_source": "agent_or_global",
+        "memory_agent": agent_name,
+    }
+
+
 def build_nova_ignition_payload(
     strategy: dict[str, Any], learned_guidelines: list[str], run_id: str | None = None
 ) -> dict[str, Any]:
@@ -243,7 +257,7 @@ async def trigger_downstream_mesh_with_payload(
             ).rstrip("/")
 
             # 🧠 Dynamic Memory Query for Nexus
-            nexus_guidelines = await query_learned_guidelines(
+            nexus_guidelines, nexus_memory_meta = await resolve_guidelines_for_agent(
                 target_industry=target_industry, agent_name="nexus", top_k=3
             )
 
@@ -253,6 +267,7 @@ async def trigger_downstream_mesh_with_payload(
                 f"Dispatching tactical orchestration impulse to Nexus node with {len(nexus_guidelines)} learned guidelines.",
                 "DISPATCH_NEXUS_REQUEST",
                 target_industry,
+                nexus_memory_meta,
             )
 
             nexus_success = await async_http_post_proxy(
@@ -339,7 +354,7 @@ async def trigger_downstream_mesh_with_payload(
             )
 
             # 🧠 Dynamic Memory Query for Nova
-            nova_guidelines = await query_learned_guidelines(
+            nova_guidelines, nova_memory_meta = await resolve_guidelines_for_agent(
                 target_industry=target_industry, agent_name="nova", top_k=3
             )
 
@@ -349,7 +364,11 @@ async def trigger_downstream_mesh_with_payload(
                 f"Routing lead harvesting instructions to Nova node with {len(nova_guidelines)} learned guidelines.",
                 "DISPATCH_NOVA_REQUEST",
                 target_industry,
-                {"run_id": nova_run_id, "lifecycle_event": "DISPATCH_REQUESTED"},
+                {
+                    "run_id": nova_run_id,
+                    "lifecycle_event": "DISPATCH_REQUESTED",
+                    **nova_memory_meta,
+                },
             )
 
             nova_payload = build_nova_ignition_payload(
@@ -395,7 +414,7 @@ async def trigger_downstream_mesh_with_payload(
         ).rstrip("/")
 
         # 🧠 Dynamic Memory Query for Beacon
-        beacon_guidelines = await query_learned_guidelines(
+        beacon_guidelines, beacon_memory_meta = await resolve_guidelines_for_agent(
             target_industry=target_industry, agent_name="beacon", top_k=3
         )
 
@@ -405,6 +424,7 @@ async def trigger_downstream_mesh_with_payload(
             f"Dispatching structural framework synthesis orders to Beacon with {len(beacon_guidelines)} learned guidelines.",
             "DISPATCH_BEACON_REQUEST",
             target_industry,
+            beacon_memory_meta,
         )
 
         dispatch_results["beacon"] = await async_http_post_proxy(
@@ -437,7 +457,7 @@ async def trigger_downstream_mesh_with_payload(
                 app_state, strategy.get("industry_name")
             )
 
-            radar_guidelines = await query_learned_guidelines(
+            radar_guidelines, radar_memory_meta = await resolve_guidelines_for_agent(
                 target_industry=target_industry, agent_name="radar", top_k=3
             )
 
@@ -447,6 +467,7 @@ async def trigger_downstream_mesh_with_payload(
                 f"Deploying Radar scraping profiles with bounded keyword threshold {keyword_cap}.",
                 "DISPATCH_RADAR_REQUEST",
                 target_industry,
+                radar_memory_meta,
             )
 
             dispatch_results["radar"] = await async_http_post_proxy(
@@ -476,7 +497,7 @@ async def trigger_downstream_mesh_with_payload(
             "/"
         )
 
-        pulsar_guidelines = await query_learned_guidelines(
+        pulsar_guidelines, pulsar_memory_meta = await resolve_guidelines_for_agent(
             target_industry=target_industry, agent_name="pulsar", top_k=3
         )
 
@@ -486,6 +507,7 @@ async def trigger_downstream_mesh_with_payload(
             f"Triggering inbound comment monitoring sweep on Pulsar node with {len(pulsar_guidelines)} learned guidelines.",
             "DISPATCH_PULSAR_REQUEST",
             target_industry,
+            pulsar_memory_meta,
         )
         dispatch_results["pulsar"] = await async_http_post_proxy(
             f"{url}/api/v1/pulsar/sweep",
@@ -514,8 +536,10 @@ async def trigger_downstream_mesh_with_payload(
             ).rstrip("/")
 
             # 🧠 Dynamic Memory Query for Vanguard
-            vanguard_guidelines = await query_learned_guidelines(
-                target_industry=target_industry, agent_name="vanguard", top_k=3
+            vanguard_guidelines, vanguard_memory_meta = (
+                await resolve_guidelines_for_agent(
+                    target_industry=target_industry, agent_name="vanguard", top_k=3
+                )
             )
 
             await write_helix_command_center_log(
@@ -524,6 +548,7 @@ async def trigger_downstream_mesh_with_payload(
                 f"Initiating outbound email tracking sweeps via Vanguard with {len(vanguard_guidelines)} learned guidelines.",
                 "DISPATCH_VANGUARD_REQUEST",
                 target_industry,
+                vanguard_memory_meta,
             )
             dispatch_results["vanguard"] = await async_http_post_proxy(
                 f"{url}/api/v1/dispatch/sweep",
@@ -546,7 +571,7 @@ async def trigger_downstream_mesh_with_payload(
     if "aura" in agent_list:
         url = os.getenv("AURA_API_URL", "https://polaris-aura.onrender.com").rstrip("/")
 
-        aura_guidelines = await query_learned_guidelines(
+        aura_guidelines, aura_memory_meta = await resolve_guidelines_for_agent(
             target_industry=target_industry, agent_name="aura", top_k=3
         )
 
@@ -556,6 +581,7 @@ async def trigger_downstream_mesh_with_payload(
             "Dispatching strategic campaign parameters down-mesh to Aura video engine.",
             "DISPATCH_AURA_REQUEST",
             target_industry,
+            aura_memory_meta,
         )
 
         aura_payload = {

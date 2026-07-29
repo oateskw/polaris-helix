@@ -539,15 +539,25 @@ async def process_roi_attribution_boost(email: str, status: str, db_pool):
                     await conn.commit()
 
                     if updated_row:
-                        # 🧠 Automatically record high-converting campaign lesson to pgvector
-                        asyncio.create_task(
-                            record_experience(
-                                agent_name="vanguard",
-                                outcome_type=outcome_type,
-                                narrative_summary=f"Lead ({email}) hit status '{status}' in {target_industry}. Campaign messaging verified high-converting.",
-                                industry=target_industry,
-                            )
+                        # Persist learning synchronously so attribution signals are not silently dropped.
+                        memory_saved = await record_experience(
+                            agent_name="vanguard",
+                            outcome_type=outcome_type,
+                            narrative_summary=(
+                                f"Lead ({email}) hit status '{status}' in {target_industry}. "
+                                "Campaign messaging verified high-converting."
+                            ),
+                            industry=target_industry,
+                            metadata={
+                                "source_event_id": f"roi:{email.lower()}:{normalized_status}",
+                                "email": email.lower(),
+                                "status": normalized_status,
+                            },
                         )
+                        if not memory_saved:
+                            print(
+                                f"⚠️ [Helix Memory] ROI memory capture failed for {email} ({normalized_status})."
+                            )
 
                         emit_executive_notification(
                             ExecutiveNotificationEvent(
@@ -711,14 +721,18 @@ async def analyze_and_orchestrate_log(
     metadata: dict | None,
 ) -> None:
     norm_msg = message.lower()
+    normalized_agent = str(agent_name or "").lower().strip()
     normalized_log_level = str(log_level or "INFO").upper()
     meta = metadata if isinstance(metadata, dict) else {}
     industry = meta.get("industry_name") or meta.get("industry")
+    lifecycle_event = str(meta.get("lifecycle_event") or "").upper().strip()
+    status_flag = str(meta.get("status") or "").upper().strip()
+    records_found = int(meta.get("records_found", 0) or 0)
     meta_string_dump = json.dumps(meta).lower()
     extended_error_context = f"{norm_msg} {meta_string_dump}"
 
     try:
-        if agent_name.lower() == "nova" and (
+        if normalized_agent == "nova" and (
             "429" in extended_error_context
             or "rate limit" in extended_error_context
             or meta.get("status") == "RATE_LIMITED"
@@ -751,6 +765,53 @@ async def analyze_and_orchestrate_log(
         async with db_pool.connection() as conn:
             async with conn.cursor() as cur:
                 if normalized_log_level == "INFO":
+                    if normalized_agent == "nova" and lifecycle_event in {
+                        "RUN_COMPLETED",
+                        "RUN_FAILED",
+                        "RUN_RATE_LIMITED",
+                    }:
+                        memory_outcome = None
+                        memory_summary = None
+
+                        if lifecycle_event == "RUN_COMPLETED" and records_found > 0:
+                            memory_outcome = "successful_harvest"
+                            memory_summary = f"Nova successfully mined {records_found} high-value leads for {industry or 'General Operations'}."
+                        elif lifecycle_event == "RUN_COMPLETED" and records_found == 0:
+                            memory_outcome = "unresponsive"
+                            memory_summary = (
+                                f"MoltSet profile harvesting for {industry or 'General Operations'} returned 0 records. "
+                                "Target criteria may be exhausted or too narrow."
+                            )
+                        elif lifecycle_event == "RUN_RATE_LIMITED":
+                            memory_outcome = "failure"
+                            memory_summary = f"Nova run for {industry or 'General Operations'} was rate-limited by provider constraints."
+                        elif lifecycle_event == "RUN_FAILED" or status_flag == "FAILED":
+                            memory_outcome = "failure"
+                            memory_summary = f"Nova run for {industry or 'General Operations'} failed and required remediation."
+
+                        if memory_outcome and memory_summary:
+                            saved = await record_experience(
+                                agent_name="nova",
+                                outcome_type=memory_outcome,
+                                narrative_summary=memory_summary,
+                                industry=industry,
+                                campaign_id=str(meta.get("run_id") or "") or None,
+                                metadata={
+                                    "source_event_id": (
+                                        str(meta.get("event_id") or "")
+                                        or f"log:{log_id}:nova:{lifecycle_event or status_flag or 'INFO'}"
+                                    ),
+                                    "log_id": log_id,
+                                    "status": status_flag,
+                                    "lifecycle_event": lifecycle_event,
+                                    "records_found": records_found,
+                                },
+                            )
+                            if not saved:
+                                print(
+                                    f"⚠️ [Helix Memory] Structured Nova learning capture failed for log_id={log_id}."
+                                )
+
                     # Hook zero-yield remediation directly into telemetry processing
                     if isinstance(meta, dict) and industry:
                         asyncio.create_task(
@@ -792,7 +853,7 @@ async def analyze_and_orchestrate_log(
                             )
 
                     # nova feed loops
-                    if agent_name == "nova" and (
+                    if normalized_agent == "nova" and (
                         "finished batch run" in norm_msg
                         or "successfully processed batch" in norm_msg
                     ):
@@ -847,14 +908,24 @@ async def analyze_and_orchestrate_log(
                                     next_action="Rotate strategy target before rerun.",
                                 )
                             )
-                            # 🧠 Record failure/exhaustion memory
-                            asyncio.create_task(
-                                record_experience(
-                                    agent_name="nova",
-                                    outcome_type="unresponsive",
-                                    narrative_summary=f"MoltSet profile harvesting for {industry} returned 0 records. Target criteria exhausted or too narrow.",
-                                    industry=industry,
-                                )
+                            # Capture exhaustion memory with source metadata for dedupe safety.
+                            await record_experience(
+                                agent_name="nova",
+                                outcome_type="unresponsive",
+                                narrative_summary=f"MoltSet profile harvesting for {industry} returned 0 records. Target criteria exhausted or too narrow.",
+                                industry=industry,
+                                campaign_id=str(meta.get("run_id") or "") or None,
+                                metadata={
+                                    "source_event_id": (
+                                        str(meta.get("event_id") or "")
+                                        or f"log:{log_id}:nova:exhausted"
+                                    ),
+                                    "log_id": log_id,
+                                    "status": status_flag,
+                                    "lifecycle_event": str(
+                                        meta.get("lifecycle_event") or ""
+                                    ),
+                                },
                             )
                             await cur.execute(
                                 "UPDATE helix_brain_scheduler SET is_active = FALSE WHERE industry_name = %s;",
@@ -874,14 +945,23 @@ async def analyze_and_orchestrate_log(
                                 )
                             )
 
-                            # 🧠 Record successful harvest memory
-                            asyncio.create_task(
-                                record_experience(
-                                    agent_name="nova",
-                                    outcome_type="successful_harvest",
-                                    narrative_summary=f"Nova successfully mined {records_found} high-value leads for {industry}.",
-                                    industry=industry,
-                                )
+                            await record_experience(
+                                agent_name="nova",
+                                outcome_type="successful_harvest",
+                                narrative_summary=f"Nova successfully mined {records_found} high-value leads for {industry}.",
+                                industry=industry,
+                                campaign_id=str(meta.get("run_id") or "") or None,
+                                metadata={
+                                    "source_event_id": (
+                                        str(meta.get("event_id") or "")
+                                        or f"log:{log_id}:nova:completed"
+                                    ),
+                                    "log_id": log_id,
+                                    "status": status_flag,
+                                    "lifecycle_event": str(
+                                        meta.get("lifecycle_event") or ""
+                                    ),
+                                },
                             )
 
                             from core.engine import load_vendor_isolation_matrix
@@ -914,7 +994,7 @@ async def analyze_and_orchestrate_log(
 
                     # Vanguard
                     if (
-                        agent_name == "vanguard"
+                        normalized_agent == "vanguard"
                         and "campaign sweep completed" in norm_msg
                     ):
                         leads_processed = int(
@@ -949,7 +1029,7 @@ async def analyze_and_orchestrate_log(
 
                     # Vector
                     if (
-                        agent_name == "vector"
+                        normalized_agent == "vector"
                         and "vector batch validation successful" in norm_msg
                     ):
                         from core.engine import load_vendor_isolation_matrix

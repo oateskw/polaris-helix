@@ -117,8 +117,9 @@ async def executive_digest_loop(app: FastAPI) -> None:
 
 
 async def ensure_observability_schema(db_pool) -> None:
+    memory_schema_status = None
     async with db_pool.connection() as conn:
-        async with conn.cursor() as cur:
+        async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute("""
                 CREATE TABLE IF NOT EXISTS telegram_processed_updates (
                     update_id BIGINT PRIMARY KEY,
@@ -128,6 +129,8 @@ async def ensure_observability_schema(db_pool) -> None:
 
                 CREATE INDEX IF NOT EXISTS idx_tpu_processed_at
                 ON telegram_processed_updates (processed_at DESC);
+
+                CREATE EXTENSION IF NOT EXISTS vector;
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_asl_event_id
                 ON agent_system_logs ((metadata->>'event_id'))
@@ -150,7 +153,54 @@ async def ensure_observability_schema(db_pool) -> None:
                     END IF;
                 END $$;
             """)
+
+            await cur.execute("""
+                SELECT
+                    to_regclass('helix_semantic_memory') IS NOT NULL AS table_exists,
+                    EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_name = 'helix_semantic_memory'
+                          AND column_name = 'metadata'
+                          AND data_type = 'jsonb'
+                    ) AS metadata_jsonb_ok,
+                    EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_name = 'helix_semantic_memory'
+                          AND column_name = 'embedding'
+                          AND udt_name = 'vector'
+                    ) AS embedding_vector_ok;
+                """)
+            memory_schema_status = await cur.fetchone()
         await conn.commit()
+
+    if not os.getenv("OPENAI_API_KEY"):
+        await write_helix_command_center_log(
+            db_pool,
+            "WARNING",
+            "OPENAI_API_KEY is not configured. Learned-guideline embeddings are disabled.",
+            "HELIX_MEMORY_EMBEDDING_KEY_MISSING",
+            "helix_memory",
+        )
+
+    if memory_schema_status:
+        compatibility_ok = all(
+            [
+                memory_schema_status.get("table_exists"),
+                memory_schema_status.get("metadata_jsonb_ok"),
+                memory_schema_status.get("embedding_vector_ok"),
+            ]
+        )
+        if not compatibility_ok:
+            await write_helix_command_center_log(
+                db_pool,
+                "WARNING",
+                "helix_semantic_memory schema compatibility check failed. Learned guideline reads or writes may be degraded.",
+                "HELIX_MEMORY_SCHEMA_COMPATIBILITY_WARNING",
+                "helix_memory",
+                memory_schema_status,
+            )
 
 
 async def observability_watchdog_loop(app: FastAPI) -> None:
@@ -657,6 +707,24 @@ async def ingest_log(
                     )
                 except Exception:
                     clean_metadata = {"raw_fallback": str(payload.metadata)}
+
+        if clean_metadata is not None:
+            normalized_level = str(payload.log_level or "INFO").upper()
+            if not clean_metadata.get("status"):
+                clean_metadata["status"] = (
+                    "FAILED"
+                    if normalized_level in {"ERROR", "CRITICAL"}
+                    else "COMPLETED"
+                )
+
+            if clean_metadata.get("run_id") and not clean_metadata.get(
+                "lifecycle_event"
+            ):
+                clean_metadata["lifecycle_event"] = (
+                    "RUN_FAILED"
+                    if normalized_level in {"ERROR", "CRITICAL"}
+                    else "RUN_COMPLETED"
+                )
 
         async with app.state.db_pool.connection() as conn:
             async with conn.cursor() as cur:
