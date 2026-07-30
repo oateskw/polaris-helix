@@ -44,7 +44,7 @@ async def resolve_guidelines_for_agent(
 def build_nova_ignition_payload(
     strategy: dict[str, Any], learned_guidelines: list[str], run_id: str | None = None
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "run_id": run_id or str(uuid.uuid4()),
         "target_region": strategy.get("target_region") or "United States",
         "target_company_limit": 25,
@@ -60,6 +60,18 @@ def build_nova_ignition_payload(
             }
         ],
     }
+
+    # Optional quota controls are attached by Helix's dynamic budget allocator.
+    if strategy.get("daily_record_budget") is not None:
+        payload["daily_record_budget"] = int(strategy["daily_record_budget"])
+    if strategy.get("max_people_queries_for_run") is not None:
+        payload["max_people_queries_for_run"] = int(
+            strategy["max_people_queries_for_run"]
+        )
+    if strategy.get("budget_day_key"):
+        payload["budget_day_key"] = str(strategy["budget_day_key"])
+
+    return payload
 
 
 def build_beacon_execution_payload(

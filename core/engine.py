@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import math
 import os
 import requests
 import traceback
@@ -22,6 +23,160 @@ VENDOR_MOLTSET = "MoltSet"
 VENDOR_ANTHROPIC = "Anthropic"
 NEXUS_MORNING_HOUR = int(os.getenv("NEXUS_MORNING_HOUR", "6"))
 MOLTSET_RECOVERY_COOLDOWN = datetime.timedelta(minutes=30)
+NOVA_DAILY_RESERVE_RATIO = float(os.getenv("NOVA_DAILY_RESERVE_RATIO", "0.10"))
+NOVA_EXPECTED_RECORDS_PER_DOMAIN = int(
+    os.getenv("NOVA_EXPECTED_RECORDS_PER_DOMAIN", "25")
+)
+NOVA_THRESHOLD_ALERT_DEBOUNCE_HOURS = int(
+    os.getenv("NOVA_THRESHOLD_ALERT_DEBOUNCE_HOURS", "6")
+)
+
+
+def parse_iso_datetime(value: str | None) -> datetime.datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def parse_moltset_records_1w_window(data: dict) -> dict[str, float | str] | None:
+    account = data.get("results") or {}
+    if data.get("status") != "ok" or account.get("status") != "active":
+        return None
+
+    records_1w = (
+        account.get("fair_use", {}).get("search", {}).get("records", {}).get("1w", {})
+    )
+    limit = records_1w.get("limit")
+    used = records_1w.get("used")
+    remaining = records_1w.get("remaining")
+    values = [limit, used, remaining]
+    if any(isinstance(v, bool) for v in values) or not all(
+        isinstance(v, (int, float)) for v in values
+    ):
+        return None
+
+    return {
+        "limit": float(limit),
+        "used": float(used),
+        "remaining": float(remaining),
+        "resets_at": str(records_1w.get("resets_at") or ""),
+    }
+
+
+def compute_daily_record_budget(
+    records_remaining_1w: float,
+    resets_at_iso: str,
+    now_utc: datetime.datetime,
+    expected_records_per_domain: int,
+    reserve_ratio: float,
+) -> tuple[int, int, int]:
+    if records_remaining_1w <= 0:
+        return 0, 0, 1
+
+    reset_dt = parse_iso_datetime(resets_at_iso)
+    if reset_dt is None:
+        remaining_days = 1
+    else:
+        delta_seconds = max(0.0, (reset_dt - now_utc).total_seconds())
+        remaining_days = max(1, int(math.ceil(delta_seconds / 86400.0)))
+
+    expected_floor = max(1, int(expected_records_per_domain))
+    reserve = max(expected_floor, int(records_remaining_1w * max(0.0, reserve_ratio)))
+    usable = max(0, int(records_remaining_1w) - reserve)
+    if usable <= 0:
+        return min(int(records_remaining_1w), expected_floor), reserve, remaining_days
+
+    daily_budget = max(expected_floor, usable // remaining_days)
+    daily_budget = min(daily_budget, int(records_remaining_1w))
+    return daily_budget, reserve, remaining_days
+
+
+async def fetch_moltset_records_1w_window() -> dict[str, float | str] | None:
+    moltset_key = os.getenv("MOLTSET_API_KEY")
+    api_endpoint = os.getenv(
+        "MOLTSET_API_ENDPOINT", "https://api.moltsets.com/api/v1/tools/"
+    ).strip()
+    if not moltset_key:
+        return None
+
+    url = f"{api_endpoint.rstrip('/')}/get_account"
+    headers = {
+        "Authorization": f"Bearer {moltset_key}",
+        "Content-Type": "application/json",
+    }
+    loop = asyncio.get_event_loop()
+    try:
+        res = await loop.run_in_executor(
+            None, lambda: requests.post(url, headers=headers, json={}, timeout=12)
+        )
+        if res.status_code != 200:
+            return None
+        return parse_moltset_records_1w_window(res.json() or {})
+    except Exception:
+        return None
+
+
+async def get_nova_consumed_records_today(db_pool) -> int:
+    async with db_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT metadata
+                FROM agent_system_logs
+                WHERE LOWER(agent_name) = 'nova'
+                  AND timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date
+                  AND metadata->>'lifecycle_event' IN ('RUN_COMPLETED', 'RUN_RATE_LIMITED');
+                """)
+            rows = await cur.fetchall()
+
+    total = 0
+    for row in rows:
+        meta = row.get("metadata") if isinstance(row, dict) else None
+        if not isinstance(meta, dict):
+            continue
+        extra = (
+            meta.get("extra_context")
+            if isinstance(meta.get("extra_context"), dict)
+            else {}
+        )
+        consumed = extra.get("records_consumed_1w")
+        if consumed is None:
+            consumed = meta.get("records_found")
+        try:
+            total += max(0, int(consumed or 0))
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def should_emit_threshold_change_alert(
+    app_state, old_limit: float, new_limit: float
+) -> bool:
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    state = getattr(app_state, "nova_threshold_alert_state", None)
+    if not isinstance(state, dict):
+        state = {}
+    last_transition = state.get("last_transition")
+    last_sent_at = state.get("last_sent_at")
+    if isinstance(last_sent_at, str):
+        last_sent_at = parse_iso_datetime(last_sent_at)
+
+    transition = (int(old_limit), int(new_limit))
+    if (
+        last_transition == transition
+        and isinstance(last_sent_at, datetime.datetime)
+        and (now_utc - last_sent_at)
+        < datetime.timedelta(hours=NOVA_THRESHOLD_ALERT_DEBOUNCE_HOURS)
+    ):
+        return False
+
+    app_state.nova_threshold_alert_state = {
+        "last_transition": transition,
+        "last_sent_at": now_utc.isoformat(),
+    }
+    return True
 
 
 def parse_moltset_search_capacity(data: dict) -> float | None:
@@ -277,8 +432,11 @@ async def load_vendor_isolation_matrix(db_pool) -> dict:
 
 
 async def dispatch_nova_if_due(app_instance) -> None:
-    """Dispatch Nova every 30 minutes while the MoltSet circuit is healthy."""
+    """Dispatch Nova every 30 minutes with daily record budget leveling."""
     db_pool = app_instance.state.db_pool
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_et = datetime.datetime.now(NEW_YORK_TZ)
+    today_et_key = now_et.strftime("%Y-%m-%d")
     async with db_pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("""
@@ -288,6 +446,8 @@ async def dispatch_nova_if_due(app_instance) -> None:
                   AND timestamp >= NOW() - INTERVAL '30 minutes'
                   AND metadata->'command_center_view'->>'action_taken' IN (
                       'DISPATCH_NOVA_30_MINUTE',
+                      'NOVA_DAILY_BUDGET_DISPATCHED',
+                      'NOVA_DAILY_BUDGET_DEFERRED',
                       'DISPATCH_NOVA_REJECTED',
                       'SKIP_NOVA_ISOLATION'
                   );
@@ -300,6 +460,163 @@ async def dispatch_nova_if_due(app_instance) -> None:
     vendor_isolation_matrix = await load_vendor_isolation_matrix(db_pool)
     if vendor_isolation_matrix.get(VENDOR_MOLTSET, False):
         return
+
+    threshold_window = await fetch_moltset_records_1w_window()
+    if not threshold_window:
+        threshold_failures = (
+            int(getattr(app_instance.state, "nova_threshold_unavailable_count", 0)) + 1
+        )
+        app_instance.state.nova_threshold_unavailable_count = threshold_failures
+        await write_helix_command_center_log(
+            db_pool,
+            "WARNING",
+            "MoltSet threshold metadata unavailable; Nova dispatch deferred until threshold telemetry recovers.",
+            "NOVA_DAILY_BUDGET_DEFERRED",
+            "nova",
+            {"reason": "THRESHOLD_UNAVAILABLE", "failure_count": threshold_failures},
+        )
+        if threshold_failures >= 2:
+            send_telegram_broadcast(
+                "⚠️ MoltSet Threshold Metadata Unavailable: Nova is running in conservative pacing mode until threshold telemetry recovers.",
+                "critical",
+            )
+        return
+
+    app_instance.state.nova_threshold_unavailable_count = 0
+    weekly_limit = float(threshold_window["limit"])
+    weekly_used = float(threshold_window["used"])
+    weekly_remaining = float(threshold_window["remaining"])
+    weekly_resets_at = str(threshold_window.get("resets_at") or "")
+
+    last_weekly_resets_at = getattr(
+        app_instance.state, "nova_last_weekly_resets_at", None
+    )
+    if (
+        last_weekly_resets_at
+        and weekly_resets_at
+        and weekly_resets_at != last_weekly_resets_at
+    ):
+        await write_helix_command_center_log(
+            db_pool,
+            "INFO",
+            "Detected new MoltSet weekly window. Resetting Nova pacing state.",
+            "NOVA_WEEKLY_WINDOW_RESET_DETECTED",
+            "nova",
+            {
+                "previous_resets_at": last_weekly_resets_at,
+                "current_resets_at": weekly_resets_at,
+            },
+        )
+    app_instance.state.nova_last_weekly_resets_at = weekly_resets_at
+
+    last_weekly_limit = getattr(app_instance.state, "nova_last_weekly_limit", None)
+    if (
+        isinstance(last_weekly_limit, (int, float))
+        and float(last_weekly_limit) != weekly_limit
+        and should_emit_threshold_change_alert(
+            app_instance.state, float(last_weekly_limit), weekly_limit
+        )
+    ):
+        change_delta = (
+            "increased" if weekly_limit > float(last_weekly_limit) else "decreased"
+        )
+        severity = "INFO" if weekly_limit > float(last_weekly_limit) else "WARNING"
+        daily_budget_preview, reserve_preview, days_preview = (
+            compute_daily_record_budget(
+                weekly_remaining,
+                weekly_resets_at,
+                now_utc,
+                NOVA_EXPECTED_RECORDS_PER_DOMAIN,
+                NOVA_DAILY_RESERVE_RATIO,
+            )
+        )
+        await write_helix_command_center_log(
+            db_pool,
+            severity,
+            f"MoltSet weekly records limit {change_delta} from {int(last_weekly_limit)} to {int(weekly_limit)}.",
+            "NOVA_THRESHOLD_LIMIT_CHANGED",
+            "nova",
+            {
+                "old_limit": int(last_weekly_limit),
+                "new_limit": int(weekly_limit),
+                "daily_budget_preview": daily_budget_preview,
+                "reserve_preview": reserve_preview,
+                "remaining_days_preview": days_preview,
+                "resets_at": weekly_resets_at,
+            },
+        )
+        if weekly_limit > float(last_weekly_limit):
+            send_telegram_broadcast(
+                (
+                    f"📈 MoltSet Plan Change Detected: Weekly records limit increased from `{int(last_weekly_limit)}` "
+                    f"to `{int(weekly_limit)}`. Nova daily pacing recalibrated to `{daily_budget_preview}` "
+                    f"records/day until `{weekly_resets_at}`."
+                ),
+                "verbose",
+            )
+        else:
+            send_telegram_broadcast(
+                (
+                    f"📉 MoltSet Plan Change Detected: Weekly records limit decreased from `{int(last_weekly_limit)}` "
+                    f"to `{int(weekly_limit)}`. Nova daily pacing tightened to `{daily_budget_preview}` "
+                    f"records/day until `{weekly_resets_at}` to avoid weekly exhaustion."
+                ),
+                "critical",
+            )
+
+    app_instance.state.nova_last_weekly_limit = weekly_limit
+    app_instance.state.nova_last_weekly_used = weekly_used
+
+    daily_budget_records, dynamic_reserve, remaining_run_days = (
+        compute_daily_record_budget(
+            weekly_remaining,
+            weekly_resets_at,
+            now_utc,
+            NOVA_EXPECTED_RECORDS_PER_DOMAIN,
+            NOVA_DAILY_RESERVE_RATIO,
+        )
+    )
+    consumed_today = await get_nova_consumed_records_today(db_pool)
+
+    await write_helix_command_center_log(
+        db_pool,
+        "INFO",
+        "Computed Nova daily budget allocation from live MoltSet weekly thresholds.",
+        "NOVA_DAILY_BUDGET_COMPUTED",
+        "nova",
+        {
+            "date_et": today_et_key,
+            "records_1w_limit": int(weekly_limit),
+            "records_1w_used": int(weekly_used),
+            "records_1w_remaining": int(weekly_remaining),
+            "records_1w_resets_at": weekly_resets_at,
+            "remaining_run_days": remaining_run_days,
+            "dynamic_reserve_records": dynamic_reserve,
+            "daily_budget_records": daily_budget_records,
+            "consumed_today_records": consumed_today,
+        },
+    )
+
+    if consumed_today >= daily_budget_records:
+        await write_helix_command_center_log(
+            db_pool,
+            "INFO",
+            "Nova daily budget reached. Deferring additional dispatches until next ET day.",
+            "NOVA_DAILY_BUDGET_DEFERRED",
+            "nova",
+            {
+                "date_et": today_et_key,
+                "daily_budget_records": daily_budget_records,
+                "consumed_today_records": consumed_today,
+                "reason": "DAILY_BUDGET_REACHED",
+            },
+        )
+        return
+
+    remaining_budget_today = max(0, daily_budget_records - consumed_today)
+    max_people_queries_for_run = max(
+        1, int(remaining_budget_today // max(1, NOVA_EXPECTED_RECORDS_PER_DOMAIN))
+    )
 
     async with db_pool.connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -314,6 +631,11 @@ async def dispatch_nova_if_due(app_instance) -> None:
             """)
             strategy = await cur.fetchone()
             if strategy:
+                strategy["daily_record_budget"] = int(remaining_budget_today)
+                strategy["max_people_queries_for_run"] = int(max_people_queries_for_run)
+                strategy["budget_day_key"] = today_et_key
+                strategy["records_1w_limit_current"] = int(weekly_limit)
+                strategy["records_1w_resets_at"] = weekly_resets_at
                 await cur.execute(
                     "UPDATE helix_brain_scheduler SET last_targeted_at = NOW() WHERE industry_id = %s;",
                     (strategy["industry_id"],),
@@ -336,13 +658,21 @@ async def dispatch_nova_if_due(app_instance) -> None:
     await write_helix_command_center_log(
         db_pool,
         "INFO",
-        f"Completed 30-minute Nova dispatch for {strategy['industry_name']}.",
-        "DISPATCH_NOVA_30_MINUTE",
+        f"Completed quota-aware Nova dispatch for {strategy['industry_name']}.",
+        "NOVA_DAILY_BUDGET_DISPATCHED",
         strategy["industry_name"],
         {
             "strategy_id": strategy["industry_id"],
             "run_id": strategy.get("_nova_run_id"),
             "lifecycle_event": "DISPATCH_ACCEPTED",
+            "budget_day_key": today_et_key,
+            "daily_budget_records": daily_budget_records,
+            "consumed_today_records": consumed_today,
+            "remaining_budget_today": remaining_budget_today,
+            "max_people_queries_for_run": max_people_queries_for_run,
+            "records_1w_limit": int(weekly_limit),
+            "records_1w_remaining": int(weekly_remaining),
+            "records_1w_resets_at": weekly_resets_at,
         },
     )
 
