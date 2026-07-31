@@ -30,6 +30,9 @@ NOVA_EXPECTED_RECORDS_PER_DOMAIN = int(
 NOVA_THRESHOLD_ALERT_DEBOUNCE_HOURS = int(
     os.getenv("NOVA_THRESHOLD_ALERT_DEBOUNCE_HOURS", "6")
 )
+NOVA_DEFAULT_RECORDS_PER_PEOPLE_QUERY = int(
+    os.getenv("NOVA_DEFAULT_RECORDS_PER_PEOPLE_QUERY", "150")
+)
 
 
 def parse_iso_datetime(value: str | None) -> datetime.datetime | None:
@@ -119,7 +122,41 @@ async def fetch_moltset_records_1w_window() -> dict[str, float | str] | None:
         return None
 
 
-async def get_nova_consumed_records_today(db_pool) -> int:
+async def estimate_nova_records_per_people_query(db_pool) -> int:
+    async with db_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT
+                    COALESCE(NULLIF(metadata->'extra_context'->>'records_consumed_1w', '')::numeric, 0) AS records_consumed,
+                    COALESCE(NULLIF(metadata->'extra_context'->>'api_calls_charged', '')::numeric, 0) AS api_calls_charged
+                FROM agent_system_logs
+                WHERE LOWER(agent_name) = 'nova'
+                  AND timestamp >= (NOW() AT TIME ZONE 'America/New_York')::date
+                  AND metadata->>'lifecycle_event' IN ('RUN_COMPLETED', 'RUN_RATE_LIMITED')
+                ORDER BY timestamp DESC
+                LIMIT 5;
+                """)
+            rows = await cur.fetchall()
+
+    ratios: list[float] = []
+    for row in rows:
+        consumed = row.get("records_consumed") if isinstance(row, dict) else None
+        calls = row.get("api_calls_charged") if isinstance(row, dict) else None
+        try:
+            consumed_value = float(consumed or 0)
+            calls_value = float(calls or 0)
+        except (TypeError, ValueError):
+            continue
+        if consumed_value > 0 and calls_value > 0:
+            ratios.append(consumed_value / calls_value)
+
+    if not ratios:
+        return NOVA_DEFAULT_RECORDS_PER_PEOPLE_QUERY
+
+    return max(1, int(math.ceil(max(ratios))))
+
+
+async def get_nova_consumed_records_today(db_pool, estimated_per_request: int) -> int:
     async with db_pool.connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute("""
@@ -136,16 +173,16 @@ async def get_nova_consumed_records_today(db_pool) -> int:
         meta = row.get("metadata") if isinstance(row, dict) else None
         if not isinstance(meta, dict):
             continue
-        extra = (
-            meta.get("extra_context")
-            if isinstance(meta.get("extra_context"), dict)
-            else {}
-        )
+        extra = meta.get("extra_context")
+        if not isinstance(extra, dict):
+            extra = {}
         consumed = extra.get("records_consumed_1w")
-        if consumed is None:
-            consumed = meta.get("records_found")
         try:
-            total += max(0, int(consumed or 0))
+            if consumed is None:
+                calls = extra.get("api_calls_charged") or 0
+                total += max(0, int(calls)) * max(1, int(estimated_per_request))
+            else:
+                total += max(0, int(consumed or 0))
         except (TypeError, ValueError):
             continue
     return total
@@ -177,6 +214,33 @@ def should_emit_threshold_change_alert(
         "last_sent_at": now_utc.isoformat(),
     }
     return True
+
+
+def notify_nova_budget_deferral(
+    *,
+    daily_budget_records: int,
+    consumed_today: int,
+    estimated_records_per_people_query: int,
+    weekly_remaining: int,
+    weekly_limit: int,
+    weekly_resets_at: str,
+    reason: str,
+) -> None:
+    if reason == "DAILY_BUDGET_REACHED":
+        message = (
+            "Nova was held back to level out the weekly allotment. "
+            f"Today's Nova budget is exhausted (`{consumed_today}/{daily_budget_records}` records). "
+            f"Weekly remaining: `{weekly_remaining}` of `{weekly_limit}` until `{weekly_resets_at}`."
+        )
+    else:
+        message = (
+            "Nova was held back to level out the weekly allotment. "
+            f"The remaining daily budget (`{daily_budget_records - consumed_today}` records) "
+            f"is below the safe floor for one projected Nova request (`~{estimated_records_per_people_query}` records/request). "
+            f"Weekly remaining: `{weekly_remaining}` of `{weekly_limit}` until `{weekly_resets_at}`."
+        )
+
+    send_telegram_broadcast(message, "orchestration")
 
 
 def parse_moltset_search_capacity(data: dict) -> float | None:
@@ -567,6 +631,9 @@ async def dispatch_nova_if_due(app_instance) -> None:
     app_instance.state.nova_last_weekly_limit = weekly_limit
     app_instance.state.nova_last_weekly_used = weekly_used
 
+    estimated_records_per_people_query = await estimate_nova_records_per_people_query(
+        db_pool
+    )
     daily_budget_records, dynamic_reserve, remaining_run_days = (
         compute_daily_record_budget(
             weekly_remaining,
@@ -576,7 +643,9 @@ async def dispatch_nova_if_due(app_instance) -> None:
             NOVA_DAILY_RESERVE_RATIO,
         )
     )
-    consumed_today = await get_nova_consumed_records_today(db_pool)
+    consumed_today = await get_nova_consumed_records_today(
+        db_pool, estimated_records_per_people_query
+    )
 
     await write_helix_command_center_log(
         db_pool,
@@ -593,6 +662,7 @@ async def dispatch_nova_if_due(app_instance) -> None:
             "remaining_run_days": remaining_run_days,
             "dynamic_reserve_records": dynamic_reserve,
             "daily_budget_records": daily_budget_records,
+            "estimated_records_per_people_query": estimated_records_per_people_query,
             "consumed_today_records": consumed_today,
         },
     )
@@ -611,11 +681,46 @@ async def dispatch_nova_if_due(app_instance) -> None:
                 "reason": "DAILY_BUDGET_REACHED",
             },
         )
+        notify_nova_budget_deferral(
+            daily_budget_records=daily_budget_records,
+            consumed_today=consumed_today,
+            estimated_records_per_people_query=estimated_records_per_people_query,
+            weekly_remaining=int(weekly_remaining),
+            weekly_limit=int(weekly_limit),
+            weekly_resets_at=weekly_resets_at,
+            reason="DAILY_BUDGET_REACHED",
+        )
         return
 
     remaining_budget_today = max(0, daily_budget_records - consumed_today)
+    if remaining_budget_today < estimated_records_per_people_query:
+        await write_helix_command_center_log(
+            db_pool,
+            "INFO",
+            "Nova deferred because remaining daily budget cannot safely fund one projected people query.",
+            "NOVA_DAILY_BUDGET_DEFERRED",
+            "nova",
+            {
+                "date_et": today_et_key,
+                "daily_budget_records": daily_budget_records,
+                "consumed_today_records": consumed_today,
+                "estimated_records_per_people_query": estimated_records_per_people_query,
+                "reason": "INSUFFICIENT_BUDGET_FOR_SINGLE_QUERY",
+            },
+        )
+        notify_nova_budget_deferral(
+            daily_budget_records=daily_budget_records,
+            consumed_today=consumed_today,
+            estimated_records_per_people_query=estimated_records_per_people_query,
+            weekly_remaining=int(weekly_remaining),
+            weekly_limit=int(weekly_limit),
+            weekly_resets_at=weekly_resets_at,
+            reason="INSUFFICIENT_BUDGET_FOR_SINGLE_QUERY",
+        )
+        return
+
     max_people_queries_for_run = max(
-        1, int(remaining_budget_today // max(1, NOVA_EXPECTED_RECORDS_PER_DOMAIN))
+        1, int(remaining_budget_today // estimated_records_per_people_query)
     )
 
     async with db_pool.connection() as conn:
@@ -633,6 +738,9 @@ async def dispatch_nova_if_due(app_instance) -> None:
             if strategy:
                 strategy["daily_record_budget"] = int(remaining_budget_today)
                 strategy["max_people_queries_for_run"] = int(max_people_queries_for_run)
+                strategy["estimated_records_per_people_query"] = int(
+                    estimated_records_per_people_query
+                )
                 strategy["budget_day_key"] = today_et_key
                 strategy["records_1w_limit_current"] = int(weekly_limit)
                 strategy["records_1w_resets_at"] = weekly_resets_at
@@ -670,6 +778,7 @@ async def dispatch_nova_if_due(app_instance) -> None:
             "consumed_today_records": consumed_today,
             "remaining_budget_today": remaining_budget_today,
             "max_people_queries_for_run": max_people_queries_for_run,
+            "estimated_records_per_people_query": estimated_records_per_people_query,
             "records_1w_limit": int(weekly_limit),
             "records_1w_remaining": int(weekly_remaining),
             "records_1w_resets_at": weekly_resets_at,
