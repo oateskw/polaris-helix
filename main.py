@@ -4,11 +4,13 @@ import hmac
 import asyncio
 import psycopg
 import json
+import datetime
 import re
 import traceback
 import httpx
 from typing import List, Optional, Literal
 from contextlib import asynccontextmanager
+from zoneinfo import ZoneInfo
 
 from config.settings import MOLTSET_ALLOWED_CATEGORIES
 from database.connection import create_async_db_pool
@@ -58,6 +60,7 @@ load_dotenv()
 
 app = FastAPI(title="Helix Strategic Orchestration Core API")
 app.include_router(telegram_router)
+EASTERN_TZ = ZoneInfo("America/New_York")
 
 
 async def record_background_task_exit(task: asyncio.Task, db_pool) -> None:
@@ -105,14 +108,81 @@ def report_background_task_exit(task: asyncio.Task, db_pool) -> None:
         asyncio.create_task(record_background_task_exit(task, db_pool))
 
 
-async def executive_digest_loop(app: FastAPI) -> None:
-    interval_seconds = int(os.getenv("HELIX_EXECUTIVE_DIGEST_SECONDS", "10800"))
+def _resolve_summary_windows(
+    summary_hour: int, now_et: datetime.datetime
+) -> tuple[datetime.datetime, datetime.datetime, str]:
+    summary_day = now_et.date()
+    if summary_hour == 6:
+        end_et = datetime.datetime.combine(
+            summary_day, datetime.time(6, 0), tzinfo=EASTERN_TZ
+        )
+        start_et = end_et - datetime.timedelta(hours=11)
+        return start_et, end_et, "Overnight Summary"
+
+    end_et = datetime.datetime.combine(
+        summary_day, datetime.time(19, 0), tzinfo=EASTERN_TZ
+    )
+    start_et = datetime.datetime.combine(
+        summary_day, datetime.time(6, 0), tzinfo=EASTERN_TZ
+    )
+    return start_et, end_et, "Daytime Summary"
+
+
+async def scheduled_summary_loop(app: FastAPI) -> None:
+    catchup_on_start = (
+        os.getenv("HELIX_SUMMARY_CATCHUP_ON_STARTUP", "false").strip().lower() == "true"
+    )
+
     while True:
-        await asyncio.sleep(interval_seconds)
+        now_et = datetime.datetime.now(EASTERN_TZ)
+        next_six = now_et.replace(hour=6, minute=0, second=0, microsecond=0)
+        next_nineteen = now_et.replace(hour=19, minute=0, second=0, microsecond=0)
+
+        if now_et >= next_nineteen:
+            next_run = next_six + datetime.timedelta(days=1)
+            run_hour = 6
+        elif now_et >= next_six:
+            next_run = next_nineteen
+            run_hour = 19
+        else:
+            next_run = next_six
+            run_hour = 6
+
+        sleep_seconds = max(1.0, (next_run - now_et).total_seconds())
+
+        if catchup_on_start:
+            if run_hour == 19:
+                catchup_hour = 6
+            else:
+                catchup_hour = 19
+            window_start_et, window_end_et, label = _resolve_summary_windows(
+                catchup_hour,
+                now_et,
+            )
+            if window_end_et < now_et:
+                await send_executive_summary_from_logs(
+                    app.state.db_pool,
+                    ai_client=app.state.ai_client,
+                    window_start=window_start_et.astimezone(datetime.timezone.utc),
+                    window_end=window_end_et.astimezone(datetime.timezone.utc),
+                    summary_label=f"{label} (Catch-up)",
+                )
+            catchup_on_start = False
+
+        await asyncio.sleep(sleep_seconds)
+
+        run_now_et = datetime.datetime.now(EASTERN_TZ)
+        summary_hour = 6 if run_now_et.hour < 12 else 19
+        window_start_et, window_end_et, label = _resolve_summary_windows(
+            summary_hour,
+            run_now_et,
+        )
         await send_executive_summary_from_logs(
             app.state.db_pool,
-            lookback_minutes=max(1, interval_seconds // 60),
             ai_client=app.state.ai_client,
+            window_start=window_start_et.astimezone(datetime.timezone.utc),
+            window_end=window_end_et.astimezone(datetime.timezone.utc),
+            summary_label=label,
         )
 
 
@@ -319,8 +389,8 @@ async def lifespan(app: FastAPI):
     app.state.optimizer_task = asyncio.create_task(
         reactive_optimizer_loop(app.state.db_pool), name="prompt-optimizer"
     )
-    app.state.digest_task = asyncio.create_task(
-        executive_digest_loop(app), name="executive-digest"
+    app.state.summary_task = asyncio.create_task(
+        scheduled_summary_loop(app), name="executive-summary-scheduler"
     )
     app.state.watchdog_task = asyncio.create_task(
         observability_watchdog_loop(app), name="observability-watchdog"
@@ -331,7 +401,7 @@ async def lifespan(app: FastAPI):
         app.state.awareness_task,
         app.state.credit_sync_task,
         app.state.optimizer_task,
-        app.state.digest_task,
+        app.state.summary_task,
         app.state.watchdog_task,
     ):
         task.add_done_callback(
@@ -358,7 +428,7 @@ async def lifespan(app: FastAPI):
         app.state.awareness_task,
         app.state.credit_sync_task,
         app.state.optimizer_task,
-        app.state.digest_task,
+        app.state.summary_task,
         app.state.watchdog_task,
     ]
 

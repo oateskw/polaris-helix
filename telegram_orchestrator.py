@@ -25,6 +25,43 @@ DISPATCHABLE_AGENTS = frozenset(
 SCHEDULABLE_AGENTS = DISPATCHABLE_AGENTS | {"helix"}
 
 
+def _summary_window_from_argument(
+    argument: str | None,
+) -> tuple[datetime.datetime, datetime.datetime, str]:
+    now_et = datetime.datetime.now(EASTERN_TZ)
+    today = now_et.date()
+
+    if argument == "daytime":
+        start = datetime.datetime.combine(today, datetime.time(6, 0), tzinfo=EASTERN_TZ)
+        end = datetime.datetime.combine(today, datetime.time(19, 0), tzinfo=EASTERN_TZ)
+        return start, end, "Daytime Summary"
+
+    if argument == "overnight":
+        end = datetime.datetime.combine(today, datetime.time(6, 0), tzinfo=EASTERN_TZ)
+        start = end - datetime.timedelta(hours=11)
+        return start, end, "Overnight Summary"
+
+    # /summary now -> latest completed window
+    if now_et.hour >= 19:
+        start = datetime.datetime.combine(today, datetime.time(6, 0), tzinfo=EASTERN_TZ)
+        end = datetime.datetime.combine(today, datetime.time(19, 0), tzinfo=EASTERN_TZ)
+        return start, end, "Daytime Summary"
+
+    if now_et.hour >= 6:
+        end = datetime.datetime.combine(today, datetime.time(6, 0), tzinfo=EASTERN_TZ)
+        start = end - datetime.timedelta(hours=11)
+        return start, end, "Overnight Summary"
+
+    previous_day = today - datetime.timedelta(days=1)
+    start = datetime.datetime.combine(
+        previous_day, datetime.time(6, 0), tzinfo=EASTERN_TZ
+    )
+    end = datetime.datetime.combine(
+        previous_day, datetime.time(19, 0), tzinfo=EASTERN_TZ
+    )
+    return start, end, "Daytime Summary"
+
+
 async def _send_command_notification(event: ExecutiveNotificationEvent) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -232,7 +269,7 @@ async def telegram_webhook_handler(request: Request):
                     ("awareness", "awareness_task"),
                     ("credit sync", "credit_sync_task"),
                     ("optimizer", "optimizer_task"),
-                    ("digest", "digest_task"),
+                    ("summary", "summary_task"),
                     ("watchdog", "watchdog_task"),
                 )
             }
@@ -301,6 +338,37 @@ async def telegram_webhook_handler(request: Request):
                     outcome="Could not generate executive history summary.",
                     impact=str(err),
                     next_action="Inspect log query path and DB health.",
+                )
+            )
+
+    elif command == "/summary":
+        try:
+            requested_window = (
+                argument if argument in {"now", "daytime", "overnight"} else "now"
+            )
+            db_pool = request.app.state.db_pool
+            ai_client = request.app.state.ai_client
+            start_et, end_et, summary_label = _summary_window_from_argument(
+                None if requested_window == "now" else requested_window
+            )
+            await send_executive_summary_from_logs(
+                db_pool,
+                ai_client=ai_client,
+                window_start=start_et.astimezone(datetime.timezone.utc),
+                window_end=end_et.astimezone(datetime.timezone.utc),
+                summary_label=f"{summary_label} (On-demand)",
+            )
+
+        except Exception as err:
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="critical_failure",
+                    severity="critical",
+                    headline="Summary Command Failed",
+                    outcome="Could not generate the requested summary window.",
+                    impact=str(err),
+                    next_action="Inspect summary query path and DB health.",
                 )
             )
 
@@ -669,7 +737,7 @@ async def telegram_webhook_handler(request: Request):
                 severity="info",
                 headline="Helix Command Reference",
                 outcome=(
-                    "/status, /today, /history, /optimize, /execute [agent], "
+                    "/status, /today, /history, /summary [now|daytime|overnight], /optimize, /execute [agent], "
                     "/enable <agent>, /disable <agent>"
                 ),
                 next_action="Choose a command from the available control surface.",

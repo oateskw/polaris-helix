@@ -25,6 +25,14 @@ _GLOBAL_NOTIFICATION_HISTORY = deque()
 _MAX_NOTIFICATIONS_PER_MINUTE = (
     6  # Caps output strictly to roughly 1 alert per 10 seconds
 )
+_NOTIFICATION_COUNTERS: dict[str, int] = {
+    "immediate_sent": 0,
+    "summary_sent": 0,
+    "dedupe_suppressed": 0,
+    "cooldown_suppressed": 0,
+    "rate_suppressed": 0,
+    "policy_suppressed": 0,
+}
 
 
 @dataclass
@@ -43,12 +51,12 @@ _NOTIFICATION_FINGERPRINT_LAST_SENT: dict[str, datetime.datetime] = {}
 _NOTIFICATION_DEDUPE_WINDOW_SECONDS = int(
     os.getenv("HELIX_NOTIFICATION_DEDUPE_SECONDS", "300")
 )
-_IMMEDIATE_ALERT_EVENT_TYPES = {
-    "critical_failure",
-    "vendor_circuit_breaker",
-    "pipeline_milestone",
-    "manual_command_ack",
-}
+_CRITICAL_REPEAT_COOLDOWN_SECONDS = int(
+    os.getenv("HELIX_CRITICAL_REPEAT_COOLDOWN_SECONDS", "900")
+)
+_NOTIFICATION_POLICY_MODE = (
+    os.getenv("HELIX_NOTIFICATION_POLICY_MODE", "strict").strip().lower() or "strict"
+)
 
 
 def get_new_york_now() -> datetime.datetime:
@@ -93,9 +101,23 @@ async def is_vendor_circuit_healthy(db_pool, vendor_name: str) -> bool:
 
 
 # Telegram and Command Logging
-def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
+def _resolve_telegram_destination(notification_type: str) -> tuple[str, str]:
+    if notification_type == "critical":
+        token = os.getenv("TELEGRAM_CRITICAL_BOT_TOKEN") or os.getenv(
+            "TELEGRAM_BOT_TOKEN"
+        )
+        chat_id = os.getenv("TELEGRAM_CRITICAL_CHAT_ID") or os.getenv(
+            "TELEGRAM_CHAT_ID"
+        )
+        return token or "", chat_id or ""
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    chat_id = os.getenv("TELEGRAM_SUMMARY_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+    return token or "", chat_id or ""
+
+
+def send_telegram_broadcast(message: str, notification_type: str = "verbose"):
+    token, chat_id = _resolve_telegram_destination(notification_type)
     if not token or not chat_id:
         return
 
@@ -194,7 +216,7 @@ def _event_fingerprint(event: ExecutiveNotificationEvent) -> str:
     return hashlib.sha256(digest_src.encode("utf-8")).hexdigest()
 
 
-def _should_emit_event(fingerprint: str) -> bool:
+def _should_emit_event(fingerprint: str, immediate: bool) -> bool:
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     current_timestamp = time.time()
 
@@ -208,6 +230,7 @@ def _should_emit_event(fingerprint: str) -> bool:
     # 2. Strict Rate Guard Capacity check
     if len(_GLOBAL_NOTIFICATION_HISTORY) >= _MAX_NOTIFICATIONS_PER_MINUTE:
         print(f"⚠️ [RATE LIMIT ENGAGED] Coalescing alert drop to prevent channel spam.")
+        _NOTIFICATION_COUNTERS["rate_suppressed"] += 1
         return False
 
     # 3. Text String Standard Fingerprint Deduplication check
@@ -215,6 +238,13 @@ def _should_emit_event(fingerprint: str) -> bool:
     if last_sent is not None:
         elapsed = (now_utc - last_sent).total_seconds()
         if elapsed < _NOTIFICATION_DEDUPE_WINDOW_SECONDS:
+            _NOTIFICATION_COUNTERS["dedupe_suppressed"] += 1
+            return False
+
+    if immediate and last_sent is not None:
+        elapsed = (now_utc - last_sent).total_seconds()
+        if elapsed < _CRITICAL_REPEAT_COOLDOWN_SECONDS:
+            _NOTIFICATION_COUNTERS["cooldown_suppressed"] += 1
             return False
 
     # Append confirmation tracking flags
@@ -240,58 +270,82 @@ def _format_executive_summary_card(event: ExecutiveNotificationEvent) -> str:
 
 def _is_immediate_alert(event: ExecutiveNotificationEvent) -> bool:
     severity = (event.severity or "info").lower()
-    if severity in {"critical", "error"}:
-        return True
-    return event.event_type in _IMMEDIATE_ALERT_EVENT_TYPES
+    return severity in {"critical", "error"}
+
+
+def _is_command_event(event: ExecutiveNotificationEvent) -> bool:
+    return (event.event_type or "").lower() == "manual_command_ack"
+
+
+def get_notification_quiet_score() -> dict[str, int]:
+    return dict(_NOTIFICATION_COUNTERS)
 
 
 def emit_executive_notification(event: ExecutiveNotificationEvent) -> None:
     fingerprint = _event_fingerprint(event)
-    if not _should_emit_event(fingerprint):
+    immediate = _is_immediate_alert(event)
+    if not _should_emit_event(fingerprint, immediate=immediate):
         return
 
-    notification_channel = _event_severity_to_channel(event.severity)
-    if not _is_immediate_alert(event):
-        # Event-driven executive summaries still route through orchestration channel
-        notification_channel = "orchestration"
+    if not immediate:
+        # Strict mode suppresses system-level non-critical events; only command replies are sent immediately.
+        if _NOTIFICATION_POLICY_MODE != "legacy" and not _is_command_event(event):
+            _NOTIFICATION_COUNTERS["policy_suppressed"] += 1
+            return
+        send_telegram_broadcast(_format_executive_summary_card(event), "orchestration")
+        _NOTIFICATION_COUNTERS["summary_sent"] += 1
+        return
 
     send_telegram_broadcast(
         _format_executive_summary_card(event),
-        notification_channel,
+        _event_severity_to_channel(event.severity),
     )
+    _NOTIFICATION_COUNTERS["immediate_sent"] += 1
 
 
 async def send_executive_summary_from_logs(
     db_pool,
     lookback_minutes: int = 180,
     ai_client=None,  # Pass the app.state.ai_client here
+    window_start: datetime.datetime | None = None,
+    window_end: datetime.datetime | None = None,
+    summary_label: str = "Helix Executive Summary",
 ) -> None:
     """Builds an AI-powered executive summary directly from Helix log telemetry."""
     try:
         async with db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT agent_name, log_level, message, metadata, timestamp
-                    FROM agent_system_logs
-                    WHERE timestamp >= NOW() - (%s || ' minutes')::INTERVAL
-                    ORDER BY timestamp DESC;
-                    """,
-                    (lookback_minutes,),
-                )
+                if window_start and window_end:
+                    await cur.execute(
+                        """
+                        SELECT agent_name, log_level, message, metadata, timestamp
+                        FROM agent_system_logs
+                        WHERE timestamp >= %s AND timestamp < %s
+                        ORDER BY timestamp DESC;
+                        """,
+                        (window_start, window_end),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        SELECT agent_name, log_level, message, metadata, timestamp
+                        FROM agent_system_logs
+                        WHERE timestamp >= NOW() - (%s || ' minutes')::INTERVAL
+                        ORDER BY timestamp DESC;
+                        """,
+                        (lookback_minutes,),
+                    )
                 rows = await cur.fetchall()
 
         if not rows:
-            emit_executive_notification(
-                ExecutiveNotificationEvent(
-                    source_agent="helix",
-                    event_type="manual_command_ack",
-                    severity="info",
-                    headline="Helix Executive Summary",
-                    outcome="No agent activity detected in the selected window.",
-                    next_action="No immediate action required.",
-                )
+            send_telegram_broadcast(
+                (
+                    f"🧾 <b>{summary_label}</b>\n"
+                    "No agent activity detected in the selected window."
+                ),
+                "orchestration",
             )
+            _NOTIFICATION_COUNTERS["summary_sent"] += 1
             return
 
         # Prepare clear data for Claude to digest
@@ -330,8 +384,22 @@ async def send_executive_summary_from_logs(
             )
             ai_summary = response.content[0].text
 
+            quiet_score = get_notification_quiet_score()
+            ai_summary = (
+                f"<b>{summary_label}</b>\n\n"
+                f"{ai_summary}\n\n"
+                f"<b>Quiet Score</b>\n"
+                f"immediate_sent={quiet_score['immediate_sent']}, "
+                f"summary_sent={quiet_score['summary_sent']}, "
+                f"dedupe_suppressed={quiet_score['dedupe_suppressed']}, "
+                f"cooldown_suppressed={quiet_score['cooldown_suppressed']}, "
+                f"rate_suppressed={quiet_score['rate_suppressed']}, "
+                f"policy_suppressed={quiet_score['policy_suppressed']}"
+            )
+
             # Send via our broadcast engine directly
             send_telegram_broadcast(ai_summary, "orchestration")
+            _NOTIFICATION_COUNTERS["summary_sent"] += 1
         else:  # Fallback to structural metrics block if AI client isn't available or circuit is broken
             if not anthropic_healthy:
                 print(
@@ -352,16 +420,20 @@ async def send_executive_summary_from_logs(
                     f"{marker} `{agent}`: {total} events ({errors} errors)"
                 )
 
-            emit_executive_notification(
-                ExecutiveNotificationEvent(
-                    source_agent="helix",
-                    event_type="manual_command_ack",
-                    severity="info",
-                    headline="Helix Executive Metrics (Fallback)",
-                    outcome="; ".join(summary_lines),
-                    next_action="Review log database directly.",
-                )
+            quiet_score = get_notification_quiet_score()
+            summary_text = (
+                f"🧾 <b>{summary_label} (Fallback)</b>\n"
+                f"{'; '.join(summary_lines)}\n\n"
+                f"<b>Quiet Score</b>\n"
+                f"immediate_sent={quiet_score['immediate_sent']}, "
+                f"summary_sent={quiet_score['summary_sent']}, "
+                f"dedupe_suppressed={quiet_score['dedupe_suppressed']}, "
+                f"cooldown_suppressed={quiet_score['cooldown_suppressed']}, "
+                f"rate_suppressed={quiet_score['rate_suppressed']}, "
+                f"policy_suppressed={quiet_score['policy_suppressed']}"
             )
+            send_telegram_broadcast(summary_text, "orchestration")
+            _NOTIFICATION_COUNTERS["summary_sent"] += 1
     except Exception as exc:
         emit_executive_notification(
             ExecutiveNotificationEvent(
