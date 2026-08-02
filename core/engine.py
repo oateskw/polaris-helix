@@ -33,6 +33,9 @@ NOVA_THRESHOLD_ALERT_DEBOUNCE_HOURS = int(
 NOVA_DEFAULT_RECORDS_PER_PEOPLE_QUERY = int(
     os.getenv("NOVA_DEFAULT_RECORDS_PER_PEOPLE_QUERY", "150")
 )
+NOVA_BUDGET_DEFERRAL_ALERT_COOLDOWN_MINUTES = int(
+    os.getenv("NOVA_BUDGET_DEFERRAL_ALERT_COOLDOWN_MINUTES", "720")
+)
 
 
 def parse_iso_datetime(value: str | None) -> datetime.datetime | None:
@@ -217,7 +220,9 @@ def should_emit_threshold_change_alert(
 
 
 def notify_nova_budget_deferral(
+    app_state,
     *,
+    today_et_key: str,
     daily_budget_records: int,
     consumed_today: int,
     estimated_records_per_people_query: int,
@@ -226,21 +231,54 @@ def notify_nova_budget_deferral(
     weekly_resets_at: str,
     reason: str,
 ) -> None:
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    state = getattr(app_state, "nova_budget_deferral_alert_state", None)
+    if not isinstance(state, dict):
+        state = {}
+    last_sent_at = parse_iso_datetime(state.get("last_sent_at"))
+    last_reason = state.get("last_reason")
+    last_day = state.get("last_day")
+
+    if (
+        last_reason == reason
+        and last_day == today_et_key
+        and isinstance(last_sent_at, datetime.datetime)
+        and (now_utc - last_sent_at)
+        < datetime.timedelta(minutes=NOVA_BUDGET_DEFERRAL_ALERT_COOLDOWN_MINUTES)
+    ):
+        return
+
     if reason == "DAILY_BUDGET_REACHED":
-        message = (
+        outcome = (
             "Nova was held back to level out the weekly allotment. "
-            f"Today's Nova budget is exhausted (`{consumed_today}/{daily_budget_records}` records). "
-            f"Weekly remaining: `{weekly_remaining}` of `{weekly_limit}` until `{weekly_resets_at}`."
+            f"Today's Nova budget is exhausted ({consumed_today}/{daily_budget_records} records)."
         )
     else:
-        message = (
+        outcome = (
             "Nova was held back to level out the weekly allotment. "
-            f"The remaining daily budget (`{daily_budget_records - consumed_today}` records) "
-            f"is below the safe floor for one projected Nova request (`~{estimated_records_per_people_query}` records/request). "
-            f"Weekly remaining: `{weekly_remaining}` of `{weekly_limit}` until `{weekly_resets_at}`."
+            f"The remaining daily budget ({daily_budget_records - consumed_today} records) "
+            "is below the safe floor for one projected Nova request "
+            f"(~{estimated_records_per_people_query} records/request)."
         )
 
-    send_telegram_broadcast(message, "orchestration")
+    emit_executive_notification(
+        ExecutiveNotificationEvent(
+            source_agent="nova",
+            event_type="budget_deferral",
+            severity="warning",
+            headline="Nova Budget Deferral",
+            outcome=outcome,
+            impact=(
+                f"Weekly remaining: {weekly_remaining} of {weekly_limit} until {weekly_resets_at}."
+            ),
+            next_action="No action required unless Nova budget constraints persist unexpectedly.",
+        )
+    )
+    app_state.nova_budget_deferral_alert_state = {
+        "last_reason": reason,
+        "last_day": today_et_key,
+        "last_sent_at": now_utc.isoformat(),
+    }
 
 
 def parse_moltset_search_capacity(data: dict) -> float | None:
@@ -682,6 +720,8 @@ async def dispatch_nova_if_due(app_instance) -> None:
             },
         )
         notify_nova_budget_deferral(
+            app_state=app_instance.state,
+            today_et_key=today_et_key,
             daily_budget_records=daily_budget_records,
             consumed_today=consumed_today,
             estimated_records_per_people_query=estimated_records_per_people_query,
@@ -709,6 +749,8 @@ async def dispatch_nova_if_due(app_instance) -> None:
             },
         )
         notify_nova_budget_deferral(
+            app_state=app_instance.state,
+            today_et_key=today_et_key,
             daily_budget_records=daily_budget_records,
             consumed_today=consumed_today,
             estimated_records_per_people_query=estimated_records_per_people_query,

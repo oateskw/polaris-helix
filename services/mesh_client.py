@@ -448,9 +448,12 @@ async def trigger_downstream_mesh_with_payload(
             build_beacon_execution_payload(strategy, beacon_guidelines),
         )
         if dispatch_results["beacon"]:
-            send_telegram_broadcast(
+            await write_helix_command_center_log(
+                db_pool,
+                "INFO",
                 "Beacon task instructions successfully dispatched down-mesh.",
-                "verbose",
+                "DISPATCH_BEACON_SUCCESS",
+                target_industry,
             )
 
     # 4. RADAR
@@ -498,9 +501,12 @@ async def trigger_downstream_mesh_with_payload(
                 },
             )
             if dispatch_results["radar"]:
-                send_telegram_broadcast(
+                await write_helix_command_center_log(
+                    db_pool,
+                    "INFO",
                     "Radar lead scraping cycle successfully deployed down-mesh.",
-                    "verbose",
+                    "DISPATCH_RADAR_SUCCESS",
+                    target_industry,
                 )
 
     # 5. PULSAR
@@ -530,8 +536,12 @@ async def trigger_downstream_mesh_with_payload(
             {"learned_guidelines": pulsar_guidelines},
         )
         if dispatch_results["pulsar"]:
-            send_telegram_broadcast(
-                "Pulsar sweep trigger successfully deployed down-mesh.", "verbose"
+            await write_helix_command_center_log(
+                db_pool,
+                "INFO",
+                "Pulsar sweep trigger successfully deployed down-mesh.",
+                "DISPATCH_PULSAR_SUCCESS",
+                target_industry,
             )
 
     # 6. VANGUARD OUTBOUND SWEEP
@@ -574,9 +584,12 @@ async def trigger_downstream_mesh_with_payload(
                 },
             )
             if dispatch_results["vanguard"]:
-                send_telegram_broadcast(
+                await write_helix_command_center_log(
+                    db_pool,
+                    "INFO",
                     "Vanguard outbound campaign sweep initiated successfully.",
-                    "verbose",
+                    "DISPATCH_VANGUARD_SUCCESS",
+                    target_industry,
                 )
 
     # 7. AURA AUTOMATED MEDIA ENGINE
