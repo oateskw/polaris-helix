@@ -281,6 +281,225 @@ def get_notification_quiet_score() -> dict[str, int]:
     return dict(_NOTIFICATION_COUNTERS)
 
 
+def _escape_html(value: str) -> str:
+    return (
+        str(value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+
+
+def _is_material_log(level: str, message: str) -> bool:
+    normalized_level = (level or "").upper()
+    normalized_message = (message or "").lower()
+    if normalized_level in {"CRITICAL", "ERROR", "WARNING"}:
+        return True
+    material_markers = (
+        "circuit",
+        "defer",
+        "budget",
+        "quota",
+        "failed",
+        "stalled",
+        "recovered",
+        "tripped",
+        "exhaust",
+        "isolation",
+    )
+    return any(marker in normalized_message for marker in material_markers)
+
+
+def _looks_resolved(message: str) -> bool:
+    normalized = (message or "").lower()
+    return any(
+        marker in normalized
+        for marker in ("recovered", "restored", "cleared", "resolved", "healthy")
+    )
+
+
+def _looks_constraint(message: str) -> bool:
+    normalized = (message or "").lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "circuit",
+            "defer",
+            "budget",
+            "quota",
+            "isolation",
+            "tripped",
+            "exhaust",
+        )
+    )
+
+
+def _shorten_message(message: str, max_len: int = 120) -> str:
+    raw = " ".join(str(message or "").split())
+    if len(raw) <= max_len:
+        return raw
+    return raw[: max_len - 3].rstrip() + "..."
+
+
+def _render_executive_delta_summary(
+    *,
+    summary_label: str,
+    window_start: datetime.datetime,
+    window_end: datetime.datetime,
+    previous_summary_at: datetime.datetime | None,
+    rows: list[dict],
+) -> str:
+    quiet_score = get_notification_quiet_score()
+    comparison_start = previous_summary_at or window_start
+    delta_rows = [
+        row
+        for row in rows
+        if isinstance(row.get("timestamp"), datetime.datetime)
+        and row["timestamp"] >= comparison_start
+    ]
+
+    material_delta = [
+        row
+        for row in delta_rows
+        if _is_material_log(row.get("log_level", ""), row.get("message", ""))
+    ]
+    resolved_delta = [
+        row for row in material_delta if _looks_resolved(str(row.get("message") or ""))
+    ]
+
+    unique_changes: list[dict] = []
+    seen = set()
+    for row in material_delta:
+        key = (
+            str(row.get("agent_name") or "").lower(),
+            str(row.get("log_level") or "").upper(),
+            _shorten_message(str(row.get("message") or ""), 90).lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_changes.append(row)
+
+    unique_resolved: list[dict] = []
+    seen_resolved = set()
+    for row in resolved_delta:
+        key = (
+            str(row.get("agent_name") or "").lower(),
+            _shorten_message(str(row.get("message") or ""), 90).lower(),
+        )
+        if key in seen_resolved:
+            continue
+        seen_resolved.add(key)
+        unique_resolved.append(row)
+
+    active_constraints = []
+    seen_constraints = set()
+    for row in rows:
+        message = str(row.get("message") or "")
+        if not _looks_constraint(message):
+            continue
+        constraint_key = (
+            str(row.get("agent_name") or "").lower(),
+            _shorten_message(message, 100).lower(),
+        )
+        if constraint_key in seen_constraints:
+            continue
+        seen_constraints.add(constraint_key)
+        active_constraints.append(row)
+        if len(active_constraints) >= 2:
+            break
+
+    critical_count = sum(
+        1 for row in rows if str(row.get("log_level") or "").upper() == "CRITICAL"
+    )
+    error_count = sum(
+        1 for row in rows if str(row.get("log_level") or "").upper() == "ERROR"
+    )
+    unique_agents = len(
+        {
+            str(row.get("agent_name") or "").lower()
+            for row in rows
+            if str(row.get("agent_name") or "").strip()
+        }
+    )
+
+    health = (
+        "CRITICAL"
+        if critical_count > 0
+        else "DEGRADED" if error_count > 0 else "HEALTHY"
+    )
+    if active_constraints:
+        primary_driver = _shorten_message(
+            str(active_constraints[0].get("message") or "Constraint active"),
+            70,
+        )
+    else:
+        primary_driver = "No active constraints detected"
+
+    lines = [
+        f"🧾 <b>HELIX EXECUTIVE DELTA</b> - <b>{_escape_html(summary_label)}</b>",
+        (
+            f"Window: {_escape_html(window_start.astimezone(NEW_YORK_TZ).strftime('%H:%M'))}"
+            f" -> {_escape_html(window_end.astimezone(NEW_YORK_TZ).strftime('%H:%M'))} ET"
+        ),
+        (
+            f"Since Last Summary: {len(unique_changes)} new | "
+            f"{len(unique_resolved)} resolved | "
+            f"{quiet_score['policy_suppressed']} unchanged suppressed"
+        ),
+        "",
+        "<b>1) Status</b>",
+        f"System: <b>{health}</b> | Primary Driver: {_escape_html(primary_driver)}",
+        "",
+        "<b>2) New Since Last Summary</b>",
+    ]
+
+    if unique_changes:
+        for row in unique_changes[:3]:
+            sev = str(row.get("log_level") or "INFO").upper()
+            agent = _escape_html(str(row.get("agent_name") or "helix"))
+            message = _escape_html(_shorten_message(str(row.get("message") or ""), 110))
+            lines.append(f"- {sev} {agent}: {message}")
+    else:
+        lines.append("- No new material changes in this window.")
+
+    lines.extend(["", "<b>3) Resolved Since Last Summary</b>"])
+    if unique_resolved:
+        for row in unique_resolved[:2]:
+            agent = _escape_html(str(row.get("agent_name") or "helix"))
+            message = _escape_html(_shorten_message(str(row.get("message") or ""), 90))
+            lines.append(f"- {agent}: {message}")
+    else:
+        lines.append("- None")
+
+    lines.extend(["", "<b>4) Active Constraints</b>"])
+    if active_constraints:
+        for row in active_constraints:
+            agent = _escape_html(str(row.get("agent_name") or "helix"))
+            message = _escape_html(_shorten_message(str(row.get("message") or ""), 100))
+            lines.append(f"- {agent}: {message}")
+    else:
+        lines.append("- None")
+
+    lines.extend(
+        [
+            "",
+            "<b>5) Business Impact</b>",
+            f"- Throughput signal: {len(rows)} logged events across {unique_agents} agents",
+            f"- Reliability signal: CRITICAL={critical_count}, ERROR={error_count}",
+            "",
+            "<b>6) Noise Control Snapshot</b>",
+            (
+                f"Immediate: {quiet_score['immediate_sent']} | "
+                f"Summaries: {quiet_score['summary_sent']} | "
+                f"Suppressed: {quiet_score['policy_suppressed']} "
+                f"(dedupe={quiet_score['dedupe_suppressed']}, "
+                f"cooldown={quiet_score['cooldown_suppressed']}, "
+                f"rate={quiet_score['rate_suppressed']})"
+            ),
+        ]
+    )
+
+    return "\n".join(lines)
+
+
 def emit_executive_notification(event: ExecutiveNotificationEvent) -> None:
     fingerprint = _event_fingerprint(event)
     immediate = _is_immediate_alert(event)
@@ -311,36 +530,46 @@ async def send_executive_summary_from_logs(
     window_end: datetime.datetime | None = None,
     summary_label: str = "Helix Executive Summary",
 ) -> None:
-    """Builds an AI-powered executive summary directly from Helix log telemetry."""
+    """Build and send a concise executive delta summary from Helix log telemetry."""
     try:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        resolved_window_end = window_end or now_utc
+        resolved_window_start = window_start or (
+            resolved_window_end - datetime.timedelta(minutes=max(1, lookback_minutes))
+        )
+
         async with db_pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                if window_start and window_end:
-                    await cur.execute(
-                        """
-                        SELECT agent_name, log_level, message, metadata, timestamp
-                        FROM agent_system_logs
-                        WHERE timestamp >= %s AND timestamp < %s
-                        ORDER BY timestamp DESC;
-                        """,
-                        (window_start, window_end),
-                    )
-                else:
-                    await cur.execute(
-                        """
-                        SELECT agent_name, log_level, message, metadata, timestamp
-                        FROM agent_system_logs
-                        WHERE timestamp >= NOW() - (%s || ' minutes')::INTERVAL
-                        ORDER BY timestamp DESC;
-                        """,
-                        (lookback_minutes,),
-                    )
+                await cur.execute(
+                    """
+                    SELECT MAX(timestamp) AS last_summary_at
+                    FROM agent_system_logs
+                    WHERE agent_name = 'helix'
+                      AND metadata->'command_center_view'->>'action_taken' = 'HELIX_EXEC_SUMMARY_SENT'
+                      AND timestamp < %s;
+                    """,
+                    (resolved_window_end,),
+                )
+                marker_row = await cur.fetchone()
+                previous_summary_at = (
+                    marker_row.get("last_summary_at") if marker_row else None
+                )
+
+                await cur.execute(
+                    """
+                    SELECT agent_name, log_level, message, metadata, timestamp
+                    FROM agent_system_logs
+                    WHERE timestamp >= %s AND timestamp < %s
+                    ORDER BY timestamp DESC;
+                    """,
+                    (resolved_window_start, resolved_window_end),
+                )
                 rows = await cur.fetchall()
 
         if not rows:
             send_telegram_broadcast(
                 (
-                    f"🧾 <b>{summary_label}</b>\n"
+                    f"🧾 <b>HELIX EXECUTIVE DELTA</b> - <b>{summary_label}</b>\n"
                     "No agent activity detected in the selected window."
                 ),
                 "orchestration",
@@ -348,92 +577,32 @@ async def send_executive_summary_from_logs(
             _NOTIFICATION_COUNTERS["summary_sent"] += 1
             return
 
-        # Prepare clear data for Claude to digest
-        compact_logs = [
+        summary_text = _render_executive_delta_summary(
+            summary_label=summary_label,
+            window_start=resolved_window_start,
+            window_end=resolved_window_end,
+            previous_summary_at=previous_summary_at,
+            rows=rows,
+        )
+        send_telegram_broadcast(summary_text, "orchestration")
+        _NOTIFICATION_COUNTERS["summary_sent"] += 1
+        await write_helix_command_center_log(
+            db_pool,
+            "INFO",
+            f"Executive delta summary sent for {summary_label}.",
+            "HELIX_EXEC_SUMMARY_SENT",
+            "helix-summary",
             {
-                "time": r["timestamp"].strftime("%H:%M:%S"),
-                "agent": r["agent_name"],
-                "level": r["log_level"],
-                "msg": r["message"],
-                "meta": r["metadata"],
-            }
-            for r in rows[:40]  # Analyze the 40 most recent log milestones
-        ]
-
-        # Check the global safety gate before proceeding with Claude
-        anthropic_healthy = await is_vendor_circuit_healthy(db_pool, "Anthropic")
-
-        # FIX 2: Check for AI Client availability AND circuit health
-        if ai_client and anthropic_healthy:
-            prompt = (
-                f"You are the Helix Executive Analytics Engine. Analyze the following recent system logs "
-                f"from the last {lookback_minutes} minutes and provide an executive summary scorecard.\n\n"
-                f"CRITICAL FORMATTING RULES FOR TELEGRAM HTML:\n"
-                f"1. DO NOT use Markdown syntax (NO '#', '##', '**', or '|' tables).\n"
-                f"2. Use Telegram HTML tags ONLY: <b>bold</b>, <i>italic</i>, and <code>code</code>.\n"
-                f"3. Do NOT draw tables. Use structured bullet lists with bold keys for tabular data.\n"
-                f"4. Keep it brief, highly professional, scannable, and omit mundane technical details.\n\n"
-                f"LOGS:\n{json.dumps(compact_logs, indent=2)}"
-            )
-
-            response = ai_client.messages.create(
-                model="claude-haiku-4-5",
-                max_tokens=1000,
-                temperature=0.3,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            ai_summary = response.content[0].text
-
-            quiet_score = get_notification_quiet_score()
-            ai_summary = (
-                f"<b>{summary_label}</b>\n\n"
-                f"{ai_summary}\n\n"
-                f"<b>Quiet Score</b>\n"
-                f"immediate_sent={quiet_score['immediate_sent']}, "
-                f"summary_sent={quiet_score['summary_sent']}, "
-                f"dedupe_suppressed={quiet_score['dedupe_suppressed']}, "
-                f"cooldown_suppressed={quiet_score['cooldown_suppressed']}, "
-                f"rate_suppressed={quiet_score['rate_suppressed']}, "
-                f"policy_suppressed={quiet_score['policy_suppressed']}"
-            )
-
-            # Send via our broadcast engine directly
-            send_telegram_broadcast(ai_summary, "orchestration")
-            _NOTIFICATION_COUNTERS["summary_sent"] += 1
-        else:  # Fallback to structural metrics block if AI client isn't available or circuit is broken
-            if not anthropic_healthy:
-                print(
-                    "🛑 [CIRCUIT BREAKER] Anthropic is currently tripped in ledger. Routing to local metrics."
-                )
-
-            # Fallback to structural metrics block if AI client isn't available
-            summary_lines = []
-            for agent in set(r["agent_name"] for r in rows):
-                total = sum(1 for r in rows if r["agent_name"] == agent)
-                errors = sum(
-                    1
-                    for r in rows
-                    if r["agent_name"] == agent and r["log_level"] == "ERROR"
-                )
-                marker = "🚨" if errors > 0 else "✅"
-                summary_lines.append(
-                    f"{marker} `{agent}`: {total} events ({errors} errors)"
-                )
-
-            quiet_score = get_notification_quiet_score()
-            summary_text = (
-                f"🧾 <b>{summary_label} (Fallback)</b>\n"
-                f"{'; '.join(summary_lines)}\n\n"
-                f"<b>Quiet Score</b>\n"
-                f"immediate_sent={quiet_score['immediate_sent']}, "
-                f"summary_sent={quiet_score['summary_sent']}, "
-                f"dedupe_suppressed={quiet_score['dedupe_suppressed']}, "
-                f"cooldown_suppressed={quiet_score['cooldown_suppressed']}, "
-                f"rate_suppressed={quiet_score['rate_suppressed']}, "
-                f"policy_suppressed={quiet_score['policy_suppressed']}"
-            )
-            send_telegram_broadcast(summary_text, "orchestration")
-            _NOTIFICATION_COUNTERS["summary_sent"] += 1
+                "summary_label": summary_label,
+                "window_start_utc": resolved_window_start.isoformat(),
+                "window_end_utc": resolved_window_end.isoformat(),
+                "previous_summary_at_utc": (
+                    previous_summary_at.isoformat()
+                    if isinstance(previous_summary_at, datetime.datetime)
+                    else None
+                ),
+            },
+        )
     except Exception as exc:
         emit_executive_notification(
             ExecutiveNotificationEvent(
