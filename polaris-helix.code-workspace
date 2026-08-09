@@ -27,6 +27,9 @@
 		{
 			"name": "polaris_website",
 			"path": "../polaris_website"
+		},
+		{
+			"path": "../polaris-meridian"
 		}
 	]
 }
