@@ -71,6 +71,23 @@ async def test_health_reports_background_worker_states(
     }
 
 
+async def test_endpoints_reject_requests_when_auth_token_unset(
+    app_module, app_client, db_pool_factory, monkeypatch
+):
+    pool, _, _ = db_pool_factory()
+    app_module.app.state.db_pool = pool
+    monkeypatch.delenv("HELIX_AUTH_TOKEN", raising=False)
+
+    response = await app_client.post(
+        "/api/v1/orchestrator/optimize-now",
+        headers={"X-Helix-Auth-Token": ""},
+    )
+    assert response.status_code == 401
+
+    response = await app_client.get("/api/v1/oracle/vendor-health")
+    assert response.status_code == 401
+
+
 async def test_ingest_leads_unauthorized(app_module, app_client, db_pool_factory):
     pool, _, _ = db_pool_factory()
     app_module.app.state.db_pool = pool

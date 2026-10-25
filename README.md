@@ -1,0 +1,365 @@
+# Polaris Helix
+
+Helix is the orchestration and observability core of the Polaris multi-agent service mesh. It is a FastAPI service that decides **what** the other agents work on each day, dispatches them, ingests their telemetry, guards the vendor budgets they spend, audits their performance, tunes their prompts, and reports to operators over Telegram.
+
+> Part of the Polaris workspace. Sibling repos: [polaris-aura](https://github.com/oateskw/polaris-aura), [polaris-beacon](https://github.com/oateskw/polaris-beacon) (Nexus, Beacon, Radar, Pulsar), [polaris-chiron](https://github.com/oateskw/polaris-chiron), [polaris-vanguard](https://github.com/oateskw/polaris-vanguard) (Vanguard Core, Nova), [polaris-vector](https://github.com/oateskw/polaris-vector), [polaris-meridian](https://github.com/oateskw/polaris-meridian), [polaris_website](https://github.com/oateskw/polaris_website). For the cross-service picture, see [docs/Overall Agent Architecture Expanded.md](docs/Overall%20Agent%20Architecture%20Expanded.md).
+
+## Contents
+
+- [What Helix does](#what-helix-does)
+- [Architecture](#architecture)
+- [Repository layout](#repository-layout)
+- [Getting started](#getting-started)
+- [Configuration](#configuration)
+- [Database](#database)
+- [HTTP API](#http-api)
+- [Telegram control surface](#telegram-control-surface)
+- [Background workers](#background-workers)
+- [Vendor circuit breakers](#vendor-circuit-breakers)
+- [Scheduling rules](#scheduling-rules)
+- [Memory and prompt optimization](#memory-and-prompt-optimization)
+- [Testing](#testing)
+- [Deployment notes](#deployment-notes)
+- [Known gaps](#known-gaps)
+
+## What Helix does
+
+| Responsibility | Where it lives |
+| --- | --- |
+| Pick the next industry/region target from the scheduler table and dispatch it to downstream agents | `core/engine.py`, `services/mesh_client.py` |
+| Ingest logs and telemetry from every agent, and react to specific failure patterns | `main.py` (`/api/v1/logs`), `services/telemetry.py` |
+| Track vendor credits and open circuit breakers when a vendor is depleted or unhealthy | `services/credit_sync.py`, `core/engine.py` |
+| Audit agent KPIs and trigger Chiron (the self-healing/optimization agent) on degradation | `core/auditor.py` |
+| Rewrite agent system prompts with Claude based on recent warnings/errors | `helix_optimizer.py` |
+| Store and retrieve "learned guidelines" via pgvector semantic memory | `helix_memory.py` |
+| Send throttled, de-duplicated executive notifications and twice-daily summaries | `services/telemetry.py` |
+| Accept operator commands from Telegram | `telegram_orchestrator.py` |
+
+## Architecture
+
+```
+                         Telegram operator
+                               |  (webhook, secret-token auth)
+                               v
+ +-------------------------------------------------------------+
+ |                          HELIX (FastAPI)                     |
+ |                                                             |
+ |  REST API  ----  Telegram router  ----  Executive notifier  |
+ |                                                             |
+ |  Background workers (started in lifespan)                   |
+ |   - awareness-dispatcher   (core/engine.py)                 |
+ |   - performance-auditor    (core/auditor.py)                |
+ |   - vendor-credit-sync     (services/credit_sync.py)        |
+ |   - prompt-optimizer       (helix_optimizer.py)             |
+ |   - executive-summary-scheduler                             |
+ |   - observability-watchdog                                  |
+ +-----------+-----------------------------+-------------------+
+             | secured HTTP impulses       | psycopg async pool
+             v                             v
+  Nexus, Nova, Beacon, Radar,       Postgres (Neon) + pgvector
+  Pulsar, Vanguard, Aura, Chiron    logs, scheduler, ledger, memory
+             |
+             +--- telemetry posted back to POST /api/v1/logs
+```
+
+Control-plane loop:
+
+1. A worker evaluates the scheduler table and vendor circuit state.
+2. Helix dispatches authenticated requests to downstream agents, with learned guidelines injected per agent and industry.
+3. Agents run asynchronously and post telemetry back to Helix.
+4. Helix logs it, escalates anomalies, updates diagnostics, and notifies operators.
+
+### Downstream agents
+
+Helix dispatches to these services, each authenticated with a per-agent header carrying `HELIX_AUTH_TOKEN`:
+
+| Agent | Role | Auth header sent by Helix | URL env var |
+| --- | --- | --- | --- |
+| Nexus | Strategy compiler | `X-Nexus-Auth-Token` | `NEXUS_NERVOUS_IMPULSE_URL` |
+| Nova | MoltSet company/people harvesting | `Authorization: Bearer` | `NOVA_API_URL` |
+| Beacon | LinkedIn campaign generation | `X-Beacon-Auth-Token` | `BEACON_API_URL` |
+| Radar | Scraper interception | `X-Radar-Auth-Token` (+ `X-Helix-Keyword-Cap`) | `RADAR_API_URL` |
+| Pulsar | Inbound reply/comment handling | `X-Pulsar-Auth-Token` | `PULSAR_API_URL` |
+| Vanguard | Outbound dispatch | `X-Vanguard-Auth-Token` | `VANGUARD_API_URL` |
+| Aura | Marketing/Instagram engine | `Authorization: Bearer` | `AURA_API_URL` |
+| Chiron | Self-healing / optimization | via `core/auditor.py`, `services/telemetry.py` | `CHIRON_API_URL` |
+
+Campaign strategies recognized by the mesh: `LIVE_AUDIT`, `OBJECTION_KILLER`, `BUILD_IN_PUBLIC`, `BEFORE_AFTER`.
+
+## Repository layout
+
+```
+main.py                     FastAPI app, lifespan, REST endpoints, summary + watchdog loops
+telegram_orchestrator.py    /api/v1/telegram/webhook and command handlers
+register_telegram_webhook.py  CLI to register the Telegram webhook
+init_db.py                  Provisions schema and seeds the vendor ledger
+helix_optimizer.py          Claude-driven prompt optimization (daily/reactive)
+helix_memory.py             Embedding + pgvector semantic memory
+config/settings.py          Constants, vendor URLs, schedule helpers, MoltSet categories
+core/
+  engine.py                 Perpetual awareness loop, Nova budget leveling, MoltSet circuit healing
+  auditor.py                Agent KPI audits, Chiron dispatch, log retention
+services/
+  mesh_client.py            Downstream dispatch with isolation matrix and guideline injection
+  telemetry.py              Log writing, notification policy, executive summaries, ROI boost, remediation
+  credit_sync.py            PhantomBuster and MyEmailVerifier credit sync
+database/
+  connection.py             Async pool factory, DATABASE_URL validation
+  schemas.py                PROVISION_SQL and SEED_SQL
+tests/                      pytest suite
+docs/                       Cross-service architecture notes
+```
+
+## Getting started
+
+### Prerequisites
+
+- Python 3.11+ (uses `X | None` type syntax and `zoneinfo`)
+- A Postgres database with the `pgvector` extension (the project targets Neon)
+- Credentials for the vendors you intend to use (see [Configuration](#configuration))
+
+### Install
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt        # runtime
+pip install -r requirements-dev.txt    # runtime + pytest
+```
+
+### Configure
+
+Copy [.env.example](.env.example) to `.env` (git-ignored) and fill it in. Minimum for local boot:
+
+```env
+DATABASE_URL=postgresql://user:pass@host/dbname
+HELIX_AUTH_TOKEN=choose-a-long-random-token
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### Provision the database
+
+```bash
+python init_db.py
+```
+
+This runs `PROVISION_SQL` and `SEED_SQL` in one transaction. It creates every table Helix reads or writes, including `helix_agent_schedule`, `helix_agent_manifests`, `helix_semantic_memory` and `helix_agent_prompts`. All statements are `IF NOT EXISTS`, so it is safe against an existing database. It enforces `sslmode=require` and sets a 10s connect timeout and 30s statement timeout. It is idempotent.
+
+### Run
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+On startup Helix opens the pool, ensures the observability schema, syncs vendor credits, and starts the six background workers. A startup notification, "Helix Orchestrator Online", is sent to Telegram if configured.
+
+### Register the Telegram webhook
+
+```bash
+python register_telegram_webhook.py https://<your-host>/api/v1/telegram/webhook
+```
+
+`HELIX_AUTH_TOKEN` is used as Telegram's `secret_token`, so it may contain only letters, digits, `_` and `-` (max 256 chars).
+
+## Configuration
+
+All settings come from environment variables (loaded from `.env` via python-dotenv).
+
+### Required
+
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | Postgres connection string. Must start with `postgresql://`. `sslmode=require` is enforced. |
+| `HELIX_AUTH_TOKEN` | Shared secret for inbound API auth, Telegram webhook secret, and outbound calls to the mesh. |
+
+### Service integrations
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ANTHROPIC_API_KEY` | none | Executive summaries and prompt optimization. AI features are disabled if unset. |
+| `ANTHROPIC_MODEL` | `claude-haiku-4-5` (optimizer), `claude-3-5-sonnet-latest` (settings.py) | Model for the optimizer. |
+| `OPENAI_API_KEY` | none | Embeddings (`text-embedding-3-small`) for semantic memory. A warning is logged if missing. |
+| `VANGUARD_API_KEY` | none | Auth key for `/api/v1/leads/status-update` (falls back to `HELIX_AUTH_TOKEN`). |
+| `VANGUARD_DATABASE_URL` | none | Optional second DB, read by dashboard diagnostics. |
+| `MOLTSET_API_KEY` | none | MoltSet capacity probes. |
+| `PHANTOMBUSTER_API_KEY` | none | PhantomBuster credit sync. Missing key fails the vendor closed. |
+| `MYEMAILVERIFIER_API_KEY` | none | MyEmailVerifier credit sync. |
+| `TELEGRAM_BOT_TOKEN` | none | Operator bot. |
+| `TELEGRAM_CHAT_ID` | none | Admin chat. Commands from other chats are not served. |
+| `TELEGRAM_SUMMARY_CHAT_ID` | `TELEGRAM_CHAT_ID` | Destination for summaries. |
+| `TELEGRAM_CRITICAL_BOT_TOKEN`, `TELEGRAM_CRITICAL_CHAT_ID` | fall back to the above | Separate channel for critical alerts. |
+
+### Agent URLs
+
+Defaults point at the Render deployments (`config/settings.py`, `services/mesh_client.py`).
+
+`CHIRON_API_URL`, `NEXUS_NERVOUS_IMPULSE_URL`, `NOVA_API_URL`, `BEACON_API_URL`, `RADAR_API_URL`, `PULSAR_API_URL`, `VANGUARD_API_URL`, `AURA_API_URL`
+
+### Tuning
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HELIX_WATCHDOG_INTERVAL_SECONDS` | `300` | Watchdog tick. |
+| `NOVA_STALE_RUN_MINUTES` | `120` | A Nova run with no terminal event after this long is flagged stale. |
+| `HELIX_SUMMARY_CATCHUP_ON_STARTUP` | `false` | Send the most recent missed summary at boot. |
+| `HELIX_NOTIFICATION_DEDUPE_SECONDS` | `300` | Duplicate notification suppression window. |
+| `HELIX_CRITICAL_REPEAT_COOLDOWN_SECONDS` | `900` | Re-alert cooldown for repeated critical events. |
+| `HELIX_NOTIFICATION_POLICY_MODE` | `strict` | Notification throttling mode. |
+| `NEXUS_MORNING_HOUR` | `6` | Hour (ET) of the Nexus morning run. |
+| `NOVA_DAILY_RESERVE_RATIO` | `0.10` | Fraction of weekly MoltSet capacity held back from daily budgets. |
+| `NOVA_EXPECTED_RECORDS_PER_DOMAIN` | `25` | Used when estimating Nova consumption. |
+| `NOVA_DEFAULT_RECORDS_PER_PEOPLE_QUERY` | `150` | Fallback estimate per people query. |
+| `NOVA_THRESHOLD_ALERT_DEBOUNCE_HOURS` | `6` | Debounce for budget-threshold alerts. |
+| `NOVA_BUDGET_DEFERRAL_ALERT_COOLDOWN_MINUTES` | `720` | Cooldown for "Nova deferred for budget" alerts. |
+| `CHIRON_OPTIMIZATION_COOLDOWN_HOURS` | `168` (7 days) | Minimum gap between Chiron optimizations per agent. |
+
+Hard-coded constants in `config/settings.py`: PhantomBuster keyword staircase `[25, 12, 8, 5]`, zero-result threshold `2`, tuning cooldown `60` min, credit sync every 8h with ±10 min jitter.
+
+## Database
+
+`database/schemas.py` provisions the following; other tables are created lazily by the code that uses them.
+
+| Table | Purpose |
+| --- | --- |
+| `agent_system_logs` | Central log store. Constrained agent names and levels, unique `metadata.event_id`, and a check that `ERROR` rows carry a Python traceback in `metadata.traceback`. |
+| `helix_brain_scheduler` | Industry targets: pain tokens, region, priority, cooldown hours, `assigned_days` (0-6). |
+| `helix_infrastructure_oracle_ledger` | Vendor credits and the `is_circuit_broken` flag. Seeded for MyEmailVerifier, PhantomBusters, Moltset, Anthropic. |
+| `helix_inbound_blueprints` | Inbound ROI-calculator submissions. |
+| `cold_leads` | Harvested leads and lifecycle status. |
+| `chiron_healing_sessions` | One row per Chiron heal trigger (unique per triggering log). |
+| `telegram_processed_updates` | Idempotency for Telegram updates (30 day retention). |
+| `helix_semantic_memory` | pgvector-backed learned guidelines (checked at startup, indexed if present). |
+| `helix_agent_manifests` | Per-agent state, including `optimization_status` and `last_optimized_at` (used by the auditor). |
+| `helix_agent_prompts` | Editable agent system prompts (created by the optimizer). |
+| `helix_agent_schedule` | Per-agent weekday/time schedule read by the awareness loop (`weekday_int`, `scheduled_time`, `is_enabled`). |
+
+Log retention: the auditor deletes `agent_system_logs` older than 30 days on every pass.
+
+## HTTP API
+
+Interactive docs are served at `/docs` when the app is running.
+
+If `HELIX_AUTH_TOKEN` is unset, every authenticated endpoint returns 401 (fail closed).
+
+Authentication is a shared-secret header compared in constant time (`hmac.compare_digest`). Header names differ by endpoint, listed below.
+
+| Method | Path | Header | Description |
+| --- | --- | --- | --- |
+| GET, HEAD | `/` | none | Heartbeat. |
+| GET | `/api/v1/health` | none | Health check. |
+| POST | `/api/v1/ingest` | `x-helix-auth-token` | Ingest a list of leads. |
+| POST | `/api/v1/inbound-blueprints` | `x-helix-auth-token` | Store an inbound ROI blueprint. |
+| POST | `/api/v1/leads/status-update?email=` | `x-vanguard-key` | Update lead status, triggers ROI attribution boost. |
+| POST | `/api/v1/logs` | `x-helix-auth-token` | Ingest an agent log or telemetry event. Drives the reactive remediation in `analyze_and_orchestrate_log`. |
+| GET | `/api/v1/logs/latest?agent=` | `x-inbound-key` | Latest log for an agent. |
+| GET | `/api/v1/telemetry/errors-count?agent=` | `x-helix-auth-token` | Count of error/critical logs for one agent in the last 24h. |
+| GET | `/api/v1/scheduler/current` | `x-inbound-key` | Active scheduler target. |
+| POST | `/api/v1/scheduler/rotate` | `x-inbound-key` | Rotate to a new industry/region (`SchedulerTargetUpdateModel`). |
+| GET | `/api/v1/oracle/vendor-health` | `x-inbound-key` | All vendor ledger rows. |
+| GET | `/api/v1/oracle/vendor-health/{vendor_name}` | `x-inbound-key` | One vendor. |
+| POST | `/api/v1/orchestrator/optimize-now` | `x-helix-auth-token` | Force prompt optimization, ignoring the anomaly threshold. |
+| POST | `/api/v1/orchestrator/run-cycle` | `x-helix-auth-token` | Select the next eligible target and dispatch `nexus, beacon, nova, vanguard, pulsar` in the background. |
+| GET | `/api/v1/orchestrator/dashboard-diagnostics` | `x-helix-auth-token` | Aggregated diagnostics for dashboards. |
+| POST | `/api/v1/audit/evaluate-agent?agent_name=` | `x-helix-auth-token` | Run a KPI audit and trigger Chiron if underperforming. |
+| POST | `/api/v1/telegram/webhook` | `X-Telegram-Bot-Api-Secret-Token` | Telegram updates. |
+
+`run-cycle` target selection: the highest `priority_score` active industry whose `last_targeted_at` is older than its `minimum_cooldown_hours`. It stamps `last_targeted_at` when picked. It returns `idle` if nothing is eligible.
+
+Industry names submitted to the scheduler are mapped deterministically onto the allowed MoltSet categories in `config/settings.py` (21 categories, defaulting to "Professional and Business Services").
+
+## Telegram control surface
+
+Commands are accepted only from `TELEGRAM_CHAT_ID`, and each update is claimed in `telegram_processed_updates` so retries do not run twice.
+
+| Command | Action |
+| --- | --- |
+| `/status` | Worker and vendor-circuit status. |
+| `/today` | Per-agent run counts for the current ET day. |
+| `/history` | Recent activity. |
+| `/summary [now\|daytime\|overnight]` | On-demand executive summary for a window. |
+| `/optimize` | Force prompt optimization. |
+| `/execute [agent]` | Run the full mesh, or one of `nexus, nova, beacon, radar, pulsar, vanguard, aura`. |
+| `/enable <agent>`, `/disable <agent>` | Toggle an agent. `helix` can be enabled but not disabled. |
+| `/help` | Command reference. |
+
+### Notifications
+
+`ExecutiveNotificationEvent`s are routed by severity to a summary or critical channel. Delivery is rate-limited per minute, de-duplicated by fingerprint, and critical events have a repeat cooldown. Summaries are generated from logs in two ET windows:
+
+- **Overnight Summary**: 19:00 to 06:00 (sent at 06:00)
+- **Daytime Summary**: 06:00 to 19:00 (sent at 19:00)
+
+## Background workers
+
+Started in `lifespan` in `main.py`. If any exits, Helix writes a `CRITICAL` command-center log and an executive notification. All are cancelled on shutdown.
+
+| Task name | Function | Cadence | Purpose |
+| --- | --- | --- | --- |
+| `awareness-dispatcher` | `perpetual_awareness_loop` | continuous ticks | Heals the MoltSet circuit, dispatches Nova every 30 min within its daily record budget, runs the 04:30 ET preflight audit, and fires time-locked agents from `helix_agent_schedule` (per weekday and `scheduled_time`). |
+| `performance-auditor` | `run_agent_performance_audit_loop` | 30 min | Log retention, then KPI audit and Chiron dispatch. |
+| `vendor-credit-sync` | `credit_sync_scheduler_loop` | 8h ± 10 min | Refresh PhantomBuster and MyEmailVerifier credits. |
+| `prompt-optimizer` | `reactive_optimizer_loop` | hourly | Optimize prompts if 5 or more warnings/errors landed in the last 3 hours. |
+| `executive-summary-scheduler` | `scheduled_summary_loop` | 06:00 and 19:00 ET | Executive summaries. |
+| `observability-watchdog` | `observability_watchdog_loop` | 5 min | Detect stale Nova runs and pipeline stalls. |
+
+### Agent KPI thresholds
+
+`core/auditor.py` evaluates these over each agent's lookback window; a miss triggers Chiron, subject to the cooldown.
+
+| Agent | Thresholds | Lookback |
+| --- | --- | --- |
+| beacon | avg impressions ≥ 150, link clicks ≥ 5, posts ≥ 1 | 7 days |
+| vanguard | open rate ≥ 35%, bounce rate ≤ 3% | 7 days |
+| nova | harvest yield per run ≥ 10 | 3 days |
+| radar | processed rate ≥ 0.10 | 3 days |
+| pulsar | DMs per batch ≥ 1 | 3 days |
+| nexus | records per run ≥ 1 | 3 days |
+
+Agents with missing KPI data are marked `INSUFFICIENT_DATA_WITH_GAPS` rather than failed.
+
+## Vendor circuit breakers
+
+The ledger (`helix_infrastructure_oracle_ledger`) holds credits per vendor and an `is_circuit_broken` flag. `load_vendor_isolation_matrix` turns it into a dict that `trigger_downstream_mesh_with_payload` consults before each dispatch:
+
+- **Anthropic** broken: Nexus dispatch and the prompt optimizer are blocked.
+- **MoltSet**: Nova harvesting is paused. A probe checks weekly capacity and heals the circuit, with a 30 minute recovery cooldown.
+- **PhantomBusters** and **MyEmailVerifier**: synced from vendor APIs. A missing API key or failed sync **fails closed** (circuit broken).
+
+Nova's daily record budget is derived from MoltSet's weekly record allowance minus the reserve ratio, less what was consumed today; when a run would exceed it, it is deferred and a (cooled-down) alert is sent.
+
+PhantomBuster zero-result handling steps the keyword cap down the staircase (25, 12, 8, 5) after repeated empty results, with a 60 minute tuning cooldown.
+
+## Scheduling rules
+
+- All schedule logic uses `America/New_York`.
+- Workers operate Monday to Friday, 06:00 to 22:00 ET (`should_helix_workers_operate`); Saturday and Sunday are standby.
+- Each industry in `helix_brain_scheduler` can be limited to specific `assigned_days`; with no eligible target, dispatch is skipped and logged as a standdown.
+
+## Memory and prompt optimization
+
+- **Semantic memory** (`helix_memory.py`): `record_experience` embeds an outcome with OpenAI and stores it in `helix_semantic_memory`; `query_learned_guidelines` retrieves up to 10 guidelines for the agent (or `global`), ranking exact industry matches first, then by embedding distance (`<=>`). Negative outcomes: `high_bounce`, `opt_out`, `failure`, `unresponsive`. Mesh dispatch injects the top results into each agent's payload.
+- **Prompt optimizer** (`helix_optimizer.py`): reads `helix_agent_prompts` and the last 24h of warnings/errors, asks Claude for a revision wrapped in `<prompt>` tags, and updates the row. It aborts if the Anthropic circuit is broken, and re-checks between prompts.
+
+## Testing
+
+```bash
+pytest
+```
+
+The suite uses stub DB pools and mocked HTTP, so it needs no database or network. Coverage includes API endpoints, auditor logic, config, DB connection validation, core engine, mesh client, MoltSet recovery, Nova dispatch, optimizer, Telegram orchestrator, and telemetry.
+
+## Deployment notes
+
+- Deployed on Render as a web service (the other agents are separate Render services; default URLs are `*.onrender.com`), with Neon Postgres.
+- The pool is sized `min 2 / max 20`, with a 30s checkout timeout, 30 min max lifetime, and 270s max idle, to stay inside cloud connection limits.
+- Run one instance only: the background workers keep in-process state (notification dedupe, PhantomBuster policy, preflight date) and would duplicate dispatches if scaled out.
+- Set the same `HELIX_AUTH_TOKEN` on Helix and every downstream agent.
+
+## Known gaps
+
+1. **Inconsistent auth headers.** Some endpoints use `x-helix-auth-token`, others `x-inbound-key`, and lead status uses `x-vanguard-key`.
+2. **Duplicated `get_validated_database_url`** in `database/connection.py` and `init_db.py`, with slightly different behavior (the latter adds timeouts).
+3. **Default model mismatch.** `config/settings.py` defaults `ANTHROPIC_MODEL` to `claude-3-5-sonnet-latest`, while the optimizer defaults to `claude-haiku-4-5`.
+4. **Aura proxy drift.** Aura forwards logs to `/api/v1/helix/log`, but Helix ingests at `/api/v1/logs` (noted in the architecture doc).
+5. **Reconstructed schema.** The DDL for `helix_agent_schedule`, `helix_agent_manifests`, `helix_semantic_memory` and `helix_agent_prompts` was written from how this repo's queries use them. Other services (for example Chiron) may use additional columns, so compare against the live database before relying on `init_db.py` for a rebuild.
+6. **One failing test.** `tests/test_nova_dispatch.py::test_daily_budget_deferral_emits_explicit_leveling_telegram_notice` was already failing before the recent changes. Its output shows the notification rate limiter dropping the alert (`RATE LIMIT ENGAGED`), so the limiter's module-level state is the likely cause; not yet investigated.

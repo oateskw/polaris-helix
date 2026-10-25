@@ -585,7 +585,7 @@ async def audit_agent_endpoint(
 ):
     """Manually forces a performance audit on an agent and triggers Chiron if underperforming."""
     expected = os.getenv("HELIX_AUTH_TOKEN")
-    if expected and not (
+    if not expected or not (
         x_helix_auth_token and hmac.compare_digest(x_helix_auth_token, expected)
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -641,7 +641,7 @@ async def ingest_leads(
     x_helix_auth_token: str | None = Header(default=None),
 ):
     expected = os.getenv("HELIX_AUTH_TOKEN")
-    if expected and not (
+    if not expected or not (
         x_helix_auth_token and hmac.compare_digest(x_helix_auth_token, expected)
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -684,7 +684,7 @@ async def inbound_blueprints(
     x_helix_auth_token: str | None = Header(default=None),
 ):
     expected = os.getenv("HELIX_AUTH_TOKEN")
-    if expected and not (
+    if not expected or not (
         x_helix_auth_token and hmac.compare_digest(x_helix_auth_token, expected)
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -731,7 +731,7 @@ async def update_lead_status(
     x_vanguard_key: str | None = Header(default=None),
 ):
     expected = os.getenv("VANGUARD_API_KEY") or os.getenv("HELIX_AUTH_TOKEN")
-    if expected and not (
+    if not expected or not (
         x_vanguard_key and hmac.compare_digest(x_vanguard_key, expected)
     ):
         raise HTTPException(status_code=401, detail="Unauthorized Tracking Call")
@@ -841,7 +841,7 @@ async def ingest_log(
 @app.get("/api/v1/logs/latest")
 async def get_latest_log(agent: str, x_inbound_key: str | None = Header(default=None)):
     expected = os.getenv("HELIX_AUTH_TOKEN")
-    if expected and not (
+    if not expected or not (
         x_inbound_key and hmac.compare_digest(x_inbound_key, expected)
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -863,7 +863,7 @@ async def get_agent_errors_count(
 ):
     """Calculates active error/critical logs count for an agent within the last 24 hours."""
     expected = os.getenv("HELIX_AUTH_TOKEN")
-    if expected and not (
+    if not expected or not (
         x_helix_auth_token and hmac.compare_digest(x_helix_auth_token, expected)
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -891,7 +891,7 @@ async def get_current_scheduler_target(
     x_inbound_key: str | None = Header(default=None),
 ):
     expected = os.getenv("HELIX_AUTH_TOKEN")
-    if expected and not (
+    if not expected or not (
         x_inbound_key and hmac.compare_digest(x_inbound_key, expected)
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -919,7 +919,7 @@ async def rotate_scheduler_target(
     x_inbound_key: str | None = Header(default=None),
 ):
     expected = os.getenv("HELIX_AUTH_TOKEN")
-    if expected and not (
+    if not expected or not (
         x_inbound_key and hmac.compare_digest(x_inbound_key, expected)
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -970,7 +970,7 @@ async def rotate_scheduler_target(
 @app.get("/api/v1/oracle/vendor-health")
 async def get_vendor_health(x_inbound_key: str | None = Header(default=None)):
     expected = os.getenv("HELIX_AUTH_TOKEN")
-    if expected and not (
+    if not expected or not (
         x_inbound_key and hmac.compare_digest(x_inbound_key, expected)
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -998,7 +998,7 @@ async def get_single_vendor_health(
     x_inbound_key: str | None = Header(default=None),
 ):
     expected = os.getenv("HELIX_AUTH_TOKEN")
-    if expected and not (
+    if not expected or not (
         x_inbound_key and hmac.compare_digest(x_inbound_key, expected)
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -1018,7 +1018,7 @@ async def force_prompt_optimization(
     logs and re-calibrate agent prompts, ignoring the anomaly threshold.
     """
     expected = os.getenv("HELIX_AUTH_TOKEN")
-    if expected and not (
+    if not expected or not (
         x_helix_auth_token and hmac.compare_digest(x_helix_auth_token, expected)
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -1049,7 +1049,7 @@ async def execute_orchestrated_master_cycle(
     x_helix_auth_token: Optional[str] = Header(default=None),
 ):
     expected = os.getenv("HELIX_AUTH_TOKEN")
-    if expected and not (
+    if not expected or not (
         x_helix_auth_token and hmac.compare_digest(x_helix_auth_token, expected)
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -1110,7 +1110,7 @@ async def get_dashboard_diagnostics(
     x_helix_auth_token: Optional[str] = Header(default=None),
 ):
     expected = os.getenv("HELIX_AUTH_TOKEN")
-    if expected and not (
+    if not expected or not (
         x_helix_auth_token and hmac.compare_digest(x_helix_auth_token, expected)
     ):
         raise HTTPException(status_code=401, detail="Unauthorized Access.")

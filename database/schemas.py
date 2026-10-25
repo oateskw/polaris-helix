@@ -30,6 +30,44 @@ CREATE INDEX IF NOT EXISTS idx_tpu_processed_at
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
+CREATE TABLE IF NOT EXISTS helix_semantic_memory (
+    id                BIGSERIAL    PRIMARY KEY,
+    agent_name        TEXT         NOT NULL,
+    campaign_id       TEXT,
+    industry          TEXT,
+    outcome_type      TEXT         NOT NULL,
+    narrative_summary TEXT         NOT NULL,
+    embedding         vector(1536),
+    metadata          JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS helix_agent_manifests (
+    id                  BIGSERIAL    PRIMARY KEY,
+    agent_name          TEXT         NOT NULL,
+    is_active           BOOLEAN      NOT NULL DEFAULT TRUE,
+    optimization_status TEXT         NOT NULL DEFAULT 'IDLE',
+    last_optimized_at   TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS helix_agent_schedule (
+    agent_name     TEXT     NOT NULL,
+    weekday_int    SMALLINT NOT NULL CHECK (weekday_int BETWEEN 0 AND 6),
+    is_enabled     BOOLEAN  NOT NULL DEFAULT TRUE,
+    max_daily_runs INTEGER,
+    scheduled_time TIME,
+    PRIMARY KEY (agent_name, weekday_int)
+);
+
+CREATE TABLE IF NOT EXISTS helix_agent_prompts (
+    id            SERIAL       PRIMARY KEY,
+    agent_name    VARCHAR(50)  NOT NULL,
+    prompt_key    VARCHAR(100) NOT NULL,
+    system_prompt TEXT         NOT NULL,
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT unique_agent_prompt_key UNIQUE (agent_name, prompt_key)
+);
+
 DO $$
 BEGIN
     IF to_regclass('helix_semantic_memory') IS NOT NULL THEN
@@ -148,6 +186,8 @@ CREATE TABLE IF NOT EXISTS helix_brain_scheduler (
 CREATE INDEX IF NOT EXISTS idx_hbs_last_targeted ON helix_brain_scheduler (last_targeted_at);
 CREATE INDEX IF NOT EXISTS idx_hbs_assigned_days ON helix_brain_scheduler USING GIN (assigned_days);
 CREATE INDEX IF NOT EXISTS idx_hbs_active_industries ON helix_brain_scheduler (is_active, industry_id) WHERE is_active = TRUE;
+
+ALTER TABLE helix_brain_scheduler ADD COLUMN IF NOT EXISTS campaign_strategy TEXT;
 
 CREATE TABLE IF NOT EXISTS helix_infrastructure_oracle_ledger (
     vendor_name       VARCHAR(50)    PRIMARY KEY,
