@@ -3,7 +3,7 @@ import os
 import sys
 import traceback
 from typing import Final
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qsl, quote, urlencode, urlunparse
 from dotenv import load_dotenv
 import psycopg
 
@@ -43,10 +43,13 @@ def get_validated_database_url() -> str:
     # Add timeout parameters if not present to prevent hanging during initialization
     if "connect_timeout" not in query_map:
         query_map["connect_timeout"] = str(_INIT_CONNECT_TIMEOUT)
-    if "options" not in query_map:
+    # Neon's pooled endpoint ("-pooler" in the host) rejects startup options.
+    if "options" not in query_map and "-pooler" not in (parsed.hostname or ""):
         query_map["options"] = f"-c statement_timeout={_INIT_COMMAND_TIMEOUT}s"
     
-    url = urlunparse(parsed._replace(query=urlencode(query_map)))
+    url = urlunparse(
+        parsed._replace(query=urlencode(query_map, quote_via=quote))
+    )
 
     return url
 
