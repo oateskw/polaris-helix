@@ -232,7 +232,7 @@ CREATE INDEX IF NOT EXISTS idx_hoe_industry_time
 CREATE TABLE IF NOT EXISTS helix_strategy_proposals (
     id         BIGSERIAL    PRIMARY KEY,
     kind       TEXT         NOT NULL CHECK (kind IN (
-                   'adjust_priority', 'pause_industry', 'resume_industry'
+                   'adjust_priority', 'pause_industry', 'resume_industry', 'chiron_brief'
                )),
     payload    JSONB        NOT NULL,
     rationale  TEXT         NOT NULL,
@@ -246,6 +246,37 @@ CREATE TABLE IF NOT EXISTS helix_strategy_proposals (
 
 CREATE INDEX IF NOT EXISTS idx_hsp_status_created
     ON helix_strategy_proposals (status, created_at DESC);
+
+ALTER TABLE helix_strategy_proposals
+    ADD COLUMN IF NOT EXISTS result JSONB;
+
+-- Databases created before 'chiron_brief' existed carry the old CHECK; replace it.
+ALTER TABLE helix_strategy_proposals
+    DROP CONSTRAINT IF EXISTS helix_strategy_proposals_kind_check;
+ALTER TABLE helix_strategy_proposals
+    ADD CONSTRAINT helix_strategy_proposals_kind_check CHECK (kind IN (
+        'adjust_priority', 'pause_industry', 'resume_industry', 'chiron_brief'
+    ));
+
+-- Chiron's job queue. Lives in the database so a sleeping or restarted Render
+-- service cannot lose work. At most one open job per agent.
+CREATE TABLE IF NOT EXISTS chiron_jobs (
+    id           BIGSERIAL    PRIMARY KEY,
+    target_agent TEXT         NOT NULL,
+    payload      JSONB        NOT NULL,
+    status       TEXT         NOT NULL DEFAULT 'queued' CHECK (status IN (
+                     'queued', 'running', 'done', 'failed'
+                 )),
+    attempts     INTEGER      NOT NULL DEFAULT 0,
+    pr_url       TEXT,
+    error        TEXT,
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    started_at   TIMESTAMPTZ,
+    finished_at  TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_chiron_jobs_one_open_per_agent
+    ON chiron_jobs (LOWER(target_agent)) WHERE status IN ('queued', 'running');
 
 CREATE TABLE IF NOT EXISTS chiron_healing_sessions (
     id                 BIGSERIAL    PRIMARY KEY,

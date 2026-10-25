@@ -174,6 +174,11 @@ async def compute_scorecard(
     return sorted(rows.values(), key=lambda r: (-r["points"], r["industry_name"]))
 
 
+def _subject(payload: dict[str, Any]) -> str:
+    """What a proposal is about: an industry, or for Chiron briefs the target agent."""
+    return payload.get("industry_name") or payload.get("target_agent") or ""
+
+
 def _evidence(row: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "leads",
@@ -301,10 +306,10 @@ async def create_proposals(
                     """
                     SELECT 1 FROM helix_strategy_proposals
                     WHERE status = 'pending' AND kind = %s
-                      AND payload->>'industry_name' = %s
+                      AND COALESCE(payload->>'industry_name', payload->>'target_agent') = %s
                     LIMIT 1;
                     """,
-                    (proposal["kind"], proposal["payload"]["industry_name"]),
+                    (proposal["kind"], _subject(proposal["payload"])),
                 )
                 if await cur.fetchone():
                     continue
@@ -375,6 +380,39 @@ async def apply_proposal(db_pool, proposal_id: int) -> dict[str, Any]:
             payload = proposal["payload"]
             industry = payload.get("industry_name")
             kind = proposal["kind"]
+            if kind == "chiron_brief":
+                # Imported here: core.auditor and services.briefs both import this module.
+                from core.auditor import send_optimization_to_chiron
+
+                outcome = await send_optimization_to_chiron(db_pool, payload)
+                if outcome["status"] not in {"queued", "already_queued"}:
+                    await cur.execute(
+                        "UPDATE helix_strategy_proposals SET result = %s WHERE id = %s;",
+                        (Jsonb(outcome), proposal_id),
+                    )
+                    await conn.commit()
+                    return {
+                        "ok": False,
+                        "reason": f"chiron_{outcome['status']}",
+                        "detail": outcome["detail"],
+                    }
+                await cur.execute(
+                    """
+                    UPDATE helix_strategy_proposals
+                    SET status = 'applied', decided_at = NOW(), result = %s
+                    WHERE id = %s;
+                    """,
+                    (Jsonb(outcome), proposal_id),
+                )
+                await conn.commit()
+                return {
+                    "ok": True,
+                    "kind": kind,
+                    "result": {
+                        "industry_name": payload["target_agent"],
+                        "chiron_status": outcome["status"],
+                    },
+                }
             if kind == "adjust_priority":
                 await cur.execute(
                     """
@@ -449,6 +487,12 @@ def format_proposals(proposals: list[dict[str, Any]]) -> str:
     lines = []
     for p in proposals:
         payload = p["payload"]
+        if p["kind"] == "chiron_brief":
+            lines.append(
+                f"#{p['id']} Chiron brief for {payload.get('target_agent')} "
+                f"({payload.get('focus_area')}). {p['rationale']}"
+            )
+            continue
         change = {
             "adjust_priority": f"priority {payload.get('delta', 0):+d}",
             "pause_industry": "pause",
@@ -466,9 +510,26 @@ async def run_strategy_review(
 ) -> dict[str, Any]:
     await expire_old_proposals(db_pool)
     scorecard = await compute_scorecard(db_pool, window_days)
-    created = await create_proposals(db_pool, generate_proposals(scorecard))
+    proposals = generate_proposals(scorecard)
+    pr_report = ""
+    # Imported here: services.briefs imports helpers from this module.
+    from services import briefs
+
+    if briefs.briefs_enabled():
+        try:
+            brief_run = await briefs.propose_briefs(db_pool, window_days)
+            proposals += brief_run["proposals"]
+            pr_report = briefs.format_pr_states(brief_run["pr_states"])
+        except Exception as exc:
+            print(f"⚠️ [STRATEGY REVIEW] Brief generation skipped: {exc}")
+    created = await create_proposals(db_pool, proposals)
     pending = await list_pending_proposals(db_pool)
-    return {"scorecard": scorecard, "created": created, "pending": pending}
+    return {
+        "scorecard": scorecard,
+        "created": created,
+        "pending": pending,
+        "pr_report": pr_report,
+    }
 
 
 async def strategy_review_loop(app) -> None:
@@ -490,7 +551,16 @@ async def strategy_review_loop(app) -> None:
                             outcome=html.escape(
                                 format_scorecard(result["scorecard"], REVIEW_WINDOW_DAYS)
                             ),
-                            impact=html.escape(format_proposals(result["pending"])),
+                            impact=html.escape(
+                                "\n".join(
+                                    part
+                                    for part in (
+                                        format_proposals(result["pending"]),
+                                        result.get("pr_report", ""),
+                                    )
+                                    if part
+                                )
+                            ),
                             next_action="Approve or reject each proposal in Telegram.",
                         )
                     )

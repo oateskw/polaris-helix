@@ -234,6 +234,11 @@ Defaults point at the Render deployments (`config/settings.py`, `services/mesh_c
 | `HELIX_STRATEGY_REVIEW_ENABLED` | `true` | Set `false` to stop the weekly strategy review. |
 | `HELIX_STRATEGY_MIN_LEADS` | `30` | Minimum leads harvested in the window before an industry can get a proposal. |
 | `HELIX_STRATEGY_MAX_NEGATIVE_RATE` | `0.05` | Bounce plus opt-out rate above which a priority cut is proposed. |
+| `HELIX_BRIEFS_ENABLED` | `false` | Let the weekly review propose briefs for Chiron. |
+| `HELIX_BRIEFS_MIN_HARVEST` | `100` | Leads per window below which Nova gets a brief. |
+| `HELIX_BRIEFS_MIN_REPLY_RATE` | `0.02` | Replies per lead below which Vanguard gets a brief. |
+| `HELIX_BRIEFS_MIN_BLUEPRINTS` | `1` | Blueprint submissions per window below which Beacon gets a brief. |
+| `GITHUB_TOKEN` | unset | Read-only token for checking Chiron's pull requests. Optional. |
 | `HELIX_PRIORITY_FIRST_ORDERING` | `false` | When `true`, scheduler selection sorts by `priority_score` before rotation order. Changes Nova rotation. |
 
 Hard-coded constants in `config/settings.py`: PhantomBuster keyword staircase `[25, 12, 8, 5]`, zero-result threshold `2`, tuning cooldown `60` min, credit sync every 8h with ±10 min jitter.
@@ -352,6 +357,20 @@ Helix learns from results instead of only rotating through industries.
 
 Points weight a reply 15, a meeting 40 and a deal 100, matching the live priority bumps. Rates use leads harvested as the denominator, because send counts live in other services. Proposals are rule-based, never applied automatically, and expire after 14 days.
 
+**Briefs for Chiron (off by default).** With `HELIX_BRIEFS_ENABLED=true`, the same review also looks at the whole funnel and may propose a *brief*: a written goal sent to Chiron, which changes the agent's code and opens a pull request. Nothing is sent until you `/approve` it, and Chiron never merges.
+
+| Weak result (28 days) | Brief goes to | Rule |
+| --- | --- | --- |
+| Fewer than `HELIX_BRIEFS_MIN_HARVEST` leads (100) | `nova` | Raise leads harvested. |
+| Bounce plus opt-out rate above the negative limit | `nova` | Improve lead quality. |
+| Replies per lead below `HELIX_BRIEFS_MIN_REPLY_RATE` (2%) | `vanguard` | Improve email copy. |
+| At least 5 replies and no meetings | `vanguard` | Improve the call to action. |
+| Fewer than `HELIX_BRIEFS_MIN_BLUEPRINTS` blueprints (1) | `beacon` | Improve inbound conversion. |
+
+Each brief states the goal, the evidence, where to look, the constraints (prompts and logic only; no auth, secrets, sending limits or unsubscribe handling), and tells Chiron to make no change if nothing is likely to help. A brief is skipped when the agent is inactive, inside the Chiron cooldown (`CHIRON_OPTIMIZATION_COOLDOWN_HOURS`), already queued, or its last pull request is still open. The open-PR check and the "since merge" counts in the weekly message need `GITHUB_TOKEN` (read-only is enough); without it the state shows as unknown. Attribution is coarse: the ledger does not record which template produced a reply, so briefs ask for experiments, not certainties, and results after a merge are noisy at low volume.
+
+If Chiron cannot be reached (it may be waking), `/approve` reports the failure and the proposal stays pending, so you can retry.
+
 Approved priority changes only steer work when scheduler selection puts priority first. Set `HELIX_PRIORITY_FIRST_ORDERING=true` for that, knowing it changes how Nova rotates between industries.
 
 ## Background workers
@@ -421,8 +440,9 @@ Helix is designed to run as one free Render web service with Neon Postgres. As I
 - All state is in Postgres. Nothing writes local files.
 - The weekly review checks the database for a missing run marker, so it still runs after a sleep.
 - Telegram commands wake the service. Telegram retries a delivery that times out during the wake-up, and duplicates are ignored.
-- **Keep it awake with cron-job.org.** Create a job that sends `HEAD https://<your-host>/` every 5 minutes. The first ping after a sleep can exceed cron-job.org's timeout while the service wakes; that failed run still wakes it, so ignore it. If it sleeps, the other scheduled work stops too: Nova dispatch every 30 minutes, the 04:30 ET preflight audit, and the performance auditor. Only the weekly review catches up.
-- One always-on free service fits the monthly instance hours; a second would not.
+- **Keep it awake with cron-job.org, but only 04:00 to 22:00 ET.** Create a job that sends `HEAD https://<your-host>/` every 5 minutes, with an execution window of 04:00 to 22:00 America/New_York. That is about 560 hours a month, which covers the 04:30 preflight audit, Nova's day and the Monday 07:00 review, and leaves room in the shared monthly allowance for Chiron, which has no pinger and is woken by Helix on demand. The first ping after a sleep can exceed cron-job.org's timeout while the service wakes; that failed run still wakes it, so ignore it. If it sleeps, the other scheduled work stops too: Nova dispatch every 30 minutes, the 04:30 ET preflight audit, and the performance auditor. Only the weekly review catches up.
+- Helix awake 24/7 would use nearly the whole monthly allowance (about 744 of 750 hours, to be checked in the Render dashboard), so a second always-on free service would not fit. That is why the pinger has a window.
+- Chiron sleeps when idle. Helix gives it up to 90 seconds, with one retry, to wake when dispatching.
 
 ## Deployment notes
 

@@ -415,6 +415,95 @@ async def evaluate_agent_performance(db_pool, agent_name: str) -> Dict[str, Any]
     return metrics
 
 
+CHIRON_DISPATCH_TIMEOUT_SECONDS = 90.0  # a sleeping Render free service needs about a minute to wake
+CHIRON_DISPATCH_ATTEMPTS = 2
+CHIRON_PAYLOAD_FIELDS = (
+    "target_agent",
+    "target_file",
+    "focus_area",
+    "reason",
+    "issues_detected",
+    "optimization_specification",
+    "metrics_context",
+)
+
+
+async def send_optimization_to_chiron(
+    db_pool, optimization_payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Posts one optimization request to Chiron and, when Chiron queues it, marks the
+    manifest QUEUED. Shared by the auditor and by approved strategy briefs.
+
+    Returns {"status": ..., "detail": ...} where status is one of: queued,
+    already_queued, rejected, unreachable, circuit_open, no_token.
+    """
+    helix_token = os.getenv("HELIX_AUTH_TOKEN", "")
+    if not helix_token:
+        print("⚠️ HELIX_AUTH_TOKEN missing. Cannot dispatch optimization to Chiron.")
+        return {"status": "no_token", "detail": "HELIX_AUTH_TOKEN is not set"}
+
+    if not await is_vendor_circuit_healthy(db_pool, "Anthropic"):
+        print("🛑 Anthropic circuit broken. Aborting Chiron dispatch.")
+        return {"status": "circuit_open", "detail": "Anthropic circuit is open"}
+
+    agent_name = optimization_payload["target_agent"]
+    body = {
+        key: optimization_payload[key]
+        for key in CHIRON_PAYLOAD_FIELDS
+        if optimization_payload.get(key) is not None
+    }
+    last_error = "no attempt made"
+    for attempt in range(1, CHIRON_DISPATCH_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(timeout=CHIRON_DISPATCH_TIMEOUT_SECONDS) as client:
+                res = await client.post(
+                    f"{CHIRON_API_URL.rstrip('/')}/api/v1/chiron/optimize",
+                    headers={
+                        "X-Chiron-Key": helix_token,
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                )
+            response_payload = res.json() if res.content else {}
+            response_status = response_payload.get("status")
+            if (
+                res.status_code in [200, 201, 202]
+                and response_status == "optimization_analysis_queued"
+            ):
+                try:
+                    async with db_pool.connection() as conn:
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                """
+                                UPDATE helix_agent_manifests 
+                                SET last_optimized_at = NOW(),
+                                    optimization_status = 'QUEUED'
+                                WHERE LOWER(agent_name) = %s;
+                                """,
+                                (agent_name.lower(),),
+                            )
+                        await conn.commit()
+                except Exception as db_err:
+                    print(
+                        f"⚠️ Failed to update last_optimized_at for {agent_name}: {db_err}"
+                    )
+                return {"status": "queued", "detail": response_payload}
+
+            if response_status == "optimization_analysis_already_queued":
+                print(f"ℹ️ Chiron optimization already queued for {agent_name}.")
+                return {"status": "already_queued", "detail": response_payload}
+
+            print(
+                f"❌ Chiron optimization dispatch rejected: {res.status_code} - {res.text}"
+            )
+            return {"status": "rejected", "detail": f"HTTP {res.status_code}"}
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            print(f"💥 Chiron dispatch attempt {attempt} failed: {last_error}")
+    return {"status": "unreachable", "detail": last_error}
+
+
 async def dispatch_chiron_optimization(
     db_pool, agent_name: str, audit_results: Dict[str, Any]
 ) -> bool:
@@ -422,15 +511,6 @@ async def dispatch_chiron_optimization(
     Formulates a technical specification and fires an optimization request
     to Chiron's `/api/v1/chiron/optimize` endpoint.
     """
-    helix_token = os.getenv("HELIX_AUTH_TOKEN", "")
-    if not helix_token:
-        print("⚠️ HELIX_AUTH_TOKEN missing. Cannot dispatch optimization to Chiron.")
-        return False
-
-    if not await is_vendor_circuit_healthy(db_pool, "Anthropic"):
-        print("🛑 Anthropic circuit broken. Aborting Chiron dispatch.")
-        return False
-
     issues_summary = "\n".join(
         [f"• {issue}" for issue in audit_results.get("issues", [])]
     )
@@ -468,67 +548,22 @@ async def dispatch_chiron_optimization(
         "metrics_context": audit_results.get("performance_signals", {}),
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            res = await client.post(
-                f"{CHIRON_API_URL.rstrip('/')}/api/v1/chiron/optimize",
-                headers={
-                    "X-Chiron-Key": helix_token,
-                    "Content-Type": "application/json",
-                },
-                json=optimization_payload,
-            )
-
-            response_payload = res.json() if res.content else {}
-            response_status = response_payload.get("status")
-            if (
-                res.status_code in [200, 201, 202]
-                and response_status == "optimization_analysis_queued"
-            ):
-                # 🚀 UPDATE DB TIMESTAMP: Mark manifest as optimized
-                try:
-                    async with db_pool.connection() as conn:
-                        async with conn.cursor() as cur:
-                            await cur.execute(
-                                """
-                                UPDATE helix_agent_manifests 
-                                SET last_optimized_at = NOW(),
-                                    optimization_status = 'QUEUED'
-                                WHERE LOWER(agent_name) = %s;
-                                """,
-                                (agent_name.lower(),),
-                            )
-                        await conn.commit()
-                except Exception as db_err:
-                    print(
-                        f"⚠️ Failed to update last_optimized_at for {agent_name}: {db_err}"
-                    )
-
-                emit_executive_notification(
-                    ExecutiveNotificationEvent(
-                        source_agent="helix",
-                        event_type="pipeline_milestone",
-                        severity="success",
-                        headline="Chiron Optimization Dispatched",
-                        outcome=f"Helix detected underperformance in `{agent_name}` and dispatched Chiron optimization orders.",
-                        impact=f"Issues: {', '.join(audit_results.get('issues', []))}",
-                        next_action="Chiron is running sandboxed tests & creating GitHub PR.",
-                    )
-                )
-                return True
-
-            if response_status == "optimization_analysis_already_queued":
-                print(f"ℹ️ Chiron optimization already queued for {agent_name}.")
-                return False
-
-            print(
-                f"❌ Chiron optimization dispatch rejected: {res.status_code} - {res.text}"
-            )
-            return False
-
-    except Exception as e:
-        print(f"💥 Failed to dispatch Chiron optimization: {e}")
+    outcome = await send_optimization_to_chiron(db_pool, optimization_payload)
+    if outcome["status"] != "queued":
         return False
+
+    emit_executive_notification(
+        ExecutiveNotificationEvent(
+            source_agent="helix",
+            event_type="pipeline_milestone",
+            severity="success",
+            headline="Chiron Optimization Dispatched",
+            outcome=f"Helix detected underperformance in `{agent_name}` and dispatched Chiron optimization orders.",
+            impact=f"Issues: {', '.join(audit_results.get('issues', []))}",
+            next_action="Chiron is running sandboxed tests & creating GitHub PR.",
+        )
+    )
+    return True
 
 
 async def run_preflight_audit(db_pool) -> dict:

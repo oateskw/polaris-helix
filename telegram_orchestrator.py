@@ -202,6 +202,21 @@ async def _handle_strategy_command(
                     f"Proposal #{proposal_id}: {result['reason']}.",
                     "warning",
                 )
+            elif result["kind"] == "chiron_brief":
+                target = result["result"]["industry_name"]
+                await write_helix_command_center_log(
+                    db_pool,
+                    "INFO",
+                    f"Chiron brief #{proposal_id} approved and sent for {target}.",
+                    "HELIX_STRATEGY_PROPOSAL_APPLIED",
+                    target,
+                )
+                ack(
+                    "Brief Sent To Chiron",
+                    f"#{proposal_id} sent for {target} ({result['result']['chiron_status']}).",
+                    "success",
+                    impact="Chiron will open a pull request on GitHub. Review it there; nothing is merged for you.",
+                )
             else:
                 updated = result["result"]
                 await write_helix_command_center_log(
