@@ -197,6 +197,48 @@ CREATE TABLE IF NOT EXISTS helix_infrastructure_oracle_ledger (
     last_updated_at   TIMESTAMPTZ    NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS helix_outcome_events (
+    id                BIGSERIAL      PRIMARY KEY,
+    lead_email        TEXT           NOT NULL,
+    industry_name     TEXT,
+    target_region     TEXT,
+    campaign_strategy TEXT,
+    stage             TEXT           NOT NULL CHECK (stage IN (
+                          'reply', 'positive_reply', 'meeting_booked', 'deal_won',
+                          'bounced', 'opt_out', 'blueprint_submitted'
+                      )),
+    amount            NUMERIC(12, 2),
+    source            TEXT           NOT NULL CHECK (source IN (
+                          'vanguard_status', 'telegram', 'webhook', 'blueprint'
+                      )),
+    source_event_id   TEXT           NOT NULL DEFAULT '',
+    occurred_at       TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+    metadata          JSONB          NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hoe_dedupe
+    ON helix_outcome_events (lead_email, stage, source_event_id);
+CREATE INDEX IF NOT EXISTS idx_hoe_industry_time
+    ON helix_outcome_events (industry_name, occurred_at DESC);
+
+CREATE TABLE IF NOT EXISTS helix_strategy_proposals (
+    id         BIGSERIAL    PRIMARY KEY,
+    kind       TEXT         NOT NULL CHECK (kind IN (
+                   'adjust_priority', 'pause_industry', 'resume_industry'
+               )),
+    payload    JSONB        NOT NULL,
+    rationale  TEXT         NOT NULL,
+    evidence   JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    status     TEXT         NOT NULL DEFAULT 'pending' CHECK (status IN (
+                   'pending', 'approved', 'rejected', 'applied', 'expired'
+               )),
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    decided_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_hsp_status_created
+    ON helix_strategy_proposals (status, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS chiron_healing_sessions (
     id                 BIGSERIAL    PRIMARY KEY,
     triggering_log_id  BIGINT       NOT NULL,

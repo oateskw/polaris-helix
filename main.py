@@ -29,6 +29,8 @@ from psycopg.types.json import Jsonb
 from anthropic import Anthropic
 from telegram_orchestrator import router as telegram_router
 from services.security import tokens_match
+from services.outcomes import record_outcome_event
+from services.strategy import strategy_review_loop
 
 # Submodule Imports
 from core.engine import perpetual_awareness_loop, load_vendor_isolation_matrix
@@ -395,6 +397,9 @@ async def lifespan(app: FastAPI):
     app.state.watchdog_task = asyncio.create_task(
         observability_watchdog_loop(app), name="observability-watchdog"
     )
+    app.state.strategy_task = asyncio.create_task(
+        strategy_review_loop(app), name="strategy-review"
+    )
 
     for task in (
         app.state.auditor_task,
@@ -403,6 +408,7 @@ async def lifespan(app: FastAPI):
         app.state.optimizer_task,
         app.state.summary_task,
         app.state.watchdog_task,
+        app.state.strategy_task,
     ):
         task.add_done_callback(
             lambda completed_task, pool=app.state.db_pool: report_background_task_exit(
@@ -430,6 +436,7 @@ async def lifespan(app: FastAPI):
         app.state.optimizer_task,
         app.state.summary_task,
         app.state.watchdog_task,
+        app.state.strategy_task,
     ]
 
     for task in tasks_to_cancel:
@@ -519,6 +526,16 @@ class BlueprintInboundModel(BaseModel):
     email: str
     status: Optional[str] = "raw_calculation_captured"
     industry_name: Optional[str] = "Unassigned"
+
+
+class OutcomeEventModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    email: str
+    stage: Literal[
+        "reply", "positive_reply", "meeting_booked", "deal_won", "bounced", "opt_out"
+    ]
+    amount: Optional[float] = None
+    source_event_id: str = ""
 
 
 class SchedulerTargetUpdateModel(BaseModel):
@@ -711,6 +728,17 @@ async def inbound_blueprints(
                 )
             await conn.commit()
 
+        await record_outcome_event(
+            app.state.db_pool,
+            lead_email=payload.email,
+            stage="blueprint_submitted",
+            source="blueprint",
+            industry_name=(
+                payload.industry_name if payload.industry_name != "Unassigned" else None
+            ),
+            metadata={"company_name": payload.company_name},
+        )
+
         if payload.industry_name and payload.industry_name != "Unassigned":
             await evaluate_lead_density_and_escalate(
                 payload.industry_name,
@@ -722,6 +750,35 @@ async def inbound_blueprints(
         return {"status": "success"}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/v1/outcomes")
+async def record_outcome(
+    payload: OutcomeEventModel,
+    x_helix_auth_token: Optional[str] = Header(default=None),
+):
+    """Record a funnel outcome (reply, meeting, deal, ...) from a webhook or CRM."""
+    expected = os.getenv("HELIX_AUTH_TOKEN")
+    if not tokens_match(x_helix_auth_token, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if payload.amount is not None and not (0 <= payload.amount <= 100_000_000):
+        raise HTTPException(status_code=422, detail="amount out of range")
+
+    result = await record_outcome_event(
+        app.state.db_pool,
+        lead_email=payload.email,
+        stage=payload.stage,
+        source="webhook",
+        amount=payload.amount,
+        source_event_id=payload.source_event_id[:200],
+    )
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    if result.get("recorded"):
+        await process_roi_attribution_boost(
+            payload.email, payload.stage, app.state.db_pool, record_ledger=False
+        )
+    return {"status": "recorded" if result["recorded"] else "duplicate"}
 
 
 @app.post("/api/v1/leads/status-update")

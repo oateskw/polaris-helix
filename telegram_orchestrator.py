@@ -2,18 +2,31 @@ import os
 import asyncio
 import html
 import json
+import re
 import time
 import datetime
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 import httpx
 from fastapi import APIRouter, Request, HTTPException
 from psycopg.rows import dict_row
 from helix_optimizer import run_daily_prompt_optimization
+from services.outcomes import record_outcome_event
+from services.strategy import (
+    apply_proposal,
+    compute_scorecard,
+    format_proposals,
+    format_scorecard,
+    list_pending_proposals,
+    reject_proposal,
+)
 from services.security import SlidingWindowLimiter, redact_secrets, tokens_match
 from services.telemetry import (
     ExecutiveNotificationEvent,
     send_executive_summary_from_logs,
     is_vendor_circuit_healthy,
+    process_roi_attribution_boost,
+    write_helix_command_center_log,
 )
 
 router = APIRouter(prefix="/api/v1/telegram", tags=["telegram-control"])
@@ -37,6 +50,176 @@ COSTLY_COMMAND_COOLDOWN_SECONDS = 60
 _command_limiter = SlidingWindowLimiter()
 # Hold references so fire-and-forget notification tasks are not garbage-collected.
 _background_tasks: set[asyncio.Task] = set()
+
+
+STRATEGY_COMMANDS = frozenset({"/scorecard", "/proposals", "/approve", "/reject"})
+OUTCOME_COMMANDS = {"/reply": "reply", "/booked": "meeting_booked", "/won": "deal_won"}
+MAX_DEAL_AMOUNT = Decimal("100000000")
+_EMAIL_PATTERN = re.compile(r"^[^@\s<>&]{1,64}@[^@\s<>&]{1,190}\.[^@\s<>&]{2,}$")
+
+
+def _parse_outcome_argument(
+    command: str, argument: str | None
+) -> tuple[str | None, Decimal | None, str | None]:
+    """Return (email, amount, error) for /reply, /booked and /won arguments."""
+    parts = (argument or "").split()
+    expected_parts = 2 if command == "/won" else 1
+    usage = (
+        "Usage: /won email amount"
+        if command == "/won"
+        else f"Usage: {command} email"
+    )
+    if len(parts) != expected_parts:
+        return None, None, usage
+    email = parts[0]
+    if len(email) > 254 or not _EMAIL_PATTERN.match(email):
+        return None, None, "That does not look like a valid email address."
+    amount = None
+    if command == "/won":
+        try:
+            amount = Decimal(parts[1].replace(",", "").lstrip("$"))
+        except InvalidOperation:
+            return None, None, "Amount must be a number, for example 2500."
+        if not amount.is_finite() or amount <= 0 or amount > MAX_DEAL_AMOUNT:
+            return None, None, "Amount must be between 0 and 100,000,000."
+    return email, amount, None
+
+
+async def _handle_outcome_command(
+    db_pool, command: str, argument: str | None, update_id: int
+) -> None:
+    email, amount, error = _parse_outcome_argument(command, argument)
+    if error:
+        emit_executive_notification(
+            ExecutiveNotificationEvent(
+                source_agent="helix",
+                event_type="action_blocked",
+                severity="warning",
+                headline="Outcome Command Rejected",
+                outcome=error,
+                next_action="Fix the command and send it again.",
+            )
+        )
+        return
+
+    stage = OUTCOME_COMMANDS[command]
+    result = await record_outcome_event(
+        db_pool,
+        lead_email=email,
+        stage=stage,
+        source="telegram",
+        amount=float(amount) if amount is not None else None,
+        # A lead can close more than one deal; every other stage happens once.
+        source_event_id=f"tg:{update_id}" if stage == "deal_won" else "",
+    )
+    if result.get("error"):
+        emit_executive_notification(
+            ExecutiveNotificationEvent(
+                source_agent="helix",
+                event_type="critical_failure",
+                severity="critical",
+                headline="Outcome Not Recorded",
+                outcome=f"Could not record {stage} for {email}.",
+                impact=str(result["error"]),
+                next_action="Check database connectivity and retry.",
+            )
+        )
+        return
+    if result.get("duplicate"):
+        emit_executive_notification(
+            ExecutiveNotificationEvent(
+                source_agent="helix",
+                event_type="manual_command_ack",
+                severity="info",
+                headline="Outcome Already Recorded",
+                outcome=f"{stage} for {email} was already in the ledger.",
+                next_action="No action needed.",
+            )
+        )
+        return
+
+    await process_roi_attribution_boost(email, stage, db_pool, record_ledger=False)
+    industry = result.get("industry_name")
+    amount_note = f" (${amount:,.2f})" if amount is not None else ""
+    emit_executive_notification(
+        ExecutiveNotificationEvent(
+            source_agent="helix",
+            event_type="manual_command_ack",
+            severity="success",
+            headline="Outcome Recorded",
+            outcome=f"{stage}{amount_note} logged for {email}.",
+            impact=(
+                f"Attributed to industry: {industry}."
+                if industry
+                else "Lead not found in cold_leads; recorded without an industry."
+            ),
+            next_action="It will count toward the next scorecard.",
+        )
+    )
+
+
+def _parse_proposal_id(argument: str | None) -> int | None:
+    value = (argument or "").strip().lstrip("#")
+    return int(value) if value.isdigit() and len(value) <= 9 else None
+
+
+async def _handle_strategy_command(
+    db_pool, command: str, argument: str | None
+) -> None:
+    def ack(headline: str, outcome: str, severity: str = "info", impact=None) -> None:
+        emit_executive_notification(
+            ExecutiveNotificationEvent(
+                source_agent="helix",
+                event_type="manual_command_ack",
+                severity=severity,
+                headline=headline,
+                outcome=outcome,
+                impact=impact,
+            )
+        )
+
+    if command == "/scorecard":
+        window = 7 if argument == "7" else 28
+        rows = await compute_scorecard(db_pool, window)
+        ack("Scorecard", format_scorecard(rows, window))
+    elif command == "/proposals":
+        ack("Pending Proposals", format_proposals(await list_pending_proposals(db_pool)))
+    else:
+        proposal_id = _parse_proposal_id(argument)
+        if proposal_id is None:
+            ack("Command Rejected", f"Usage: {command} id", "warning")
+        elif command == "/reject":
+            result = await reject_proposal(db_pool, proposal_id)
+            if result["ok"]:
+                ack("Proposal Rejected", f"Proposal #{proposal_id} rejected.")
+            else:
+                ack("Nothing To Reject", f"Proposal #{proposal_id} is not pending.", "warning")
+        else:
+            result = await apply_proposal(db_pool, proposal_id)
+            if not result["ok"]:
+                ack(
+                    "Proposal Not Applied",
+                    f"Proposal #{proposal_id}: {result['reason']}.",
+                    "warning",
+                )
+            else:
+                updated = result["result"]
+                await write_helix_command_center_log(
+                    db_pool,
+                    "INFO",
+                    f"Strategy proposal #{proposal_id} ({result['kind']}) approved and applied.",
+                    "HELIX_STRATEGY_PROPOSAL_APPLIED",
+                    updated["industry_name"],
+                )
+                ack(
+                    "Proposal Applied",
+                    f"#{proposal_id} {result['kind']} applied to {updated['industry_name']}.",
+                    "success",
+                    impact=(
+                        f"Priority now {updated['priority_score']}; "
+                        f"{'active' if updated['is_active'] else 'paused'}."
+                    ),
+                )
 
 
 def _webhook_secret() -> str:
@@ -791,6 +974,42 @@ async def telegram_webhook_handler(request: Request):
                 )
             )
 
+    elif command in STRATEGY_COMMANDS:
+        try:
+            await _handle_strategy_command(
+                request.app.state.db_pool, command, argument
+            )
+        except Exception as err:
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="critical_failure",
+                    severity="critical",
+                    headline="Strategy Command Failed",
+                    outcome=f"{command} crashed before completion.",
+                    impact=str(err),
+                    next_action="Inspect Helix logs and retry.",
+                )
+            )
+
+    elif command in OUTCOME_COMMANDS:
+        try:
+            await _handle_outcome_command(
+                request.app.state.db_pool, command, argument, update_id
+            )
+        except Exception as err:
+            emit_executive_notification(
+                ExecutiveNotificationEvent(
+                    source_agent="helix",
+                    event_type="critical_failure",
+                    severity="critical",
+                    headline="Outcome Command Failed",
+                    outcome=f"{command} crashed before completion.",
+                    impact=str(err),
+                    next_action="Inspect Helix logs and retry.",
+                )
+            )
+
     elif command == "/help":
         emit_executive_notification(
             ExecutiveNotificationEvent(
@@ -800,7 +1019,8 @@ async def telegram_webhook_handler(request: Request):
                 headline="Helix Command Reference",
                 outcome=(
                     "/status, /today, /history, /summary [now|daytime|overnight], /optimize, /execute [agent], "
-                    "/enable <agent>, /disable <agent>"
+                    "/enable <agent>, /disable <agent>, /reply <email>, /booked <email>, "
+                    "/won <email> <amount>, /scorecard [7|28], /proposals, /approve <id>, /reject <id>"
                 ),
                 next_action="Choose a command from the available control surface.",
             )

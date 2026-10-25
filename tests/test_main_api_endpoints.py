@@ -139,6 +139,8 @@ async def test_inbound_blueprints_unassigned_skips_escalation(
 
     escalate = AsyncMock()
     monkeypatch.setattr(app_module, "evaluate_lead_density_and_escalate", escalate)
+    record_outcome = AsyncMock(return_value={"recorded": True})
+    monkeypatch.setattr(app_module, "record_outcome_event", record_outcome)
 
     response = await app_client.post(
         "/api/v1/inbound-blueprints",
@@ -159,6 +161,9 @@ async def test_inbound_blueprints_unassigned_skips_escalation(
     assert response.status_code == 200
     assert connection.commit_calls == 1
     escalate.assert_not_awaited()
+    record_outcome.assert_awaited_once()
+    assert record_outcome.await_args.kwargs["stage"] == "blueprint_submitted"
+    assert record_outcome.await_args.kwargs["industry_name"] is None
 
 
 async def test_update_lead_status_auth_and_success(

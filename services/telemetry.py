@@ -19,6 +19,7 @@ from config.settings import NEW_YORK_TZ, CHIRON_API_URL, ANTHROPIC_MODEL
 # Reimport to prevent circular loops
 from services.mesh_client import trigger_downstream_mesh_with_payload
 from helix_memory import record_experience
+from services.outcomes import record_outcome_event, stage_from_status
 
 # Rate limiting windows
 _GLOBAL_NOTIFICATION_HISTORY = deque()
@@ -274,7 +275,7 @@ def _is_immediate_alert(event: ExecutiveNotificationEvent) -> bool:
 
 
 def _is_command_event(event: ExecutiveNotificationEvent) -> bool:
-    return (event.event_type or "").lower() == "manual_command_ack"
+    return (event.event_type or "").lower() in {"manual_command_ack", "strategy_review"}
 
 
 def get_notification_quiet_score() -> dict[str, int]:
@@ -740,8 +741,19 @@ async def evaluate_lead_density_and_escalate(
         print(f"⚠️ Adaptive intake trigger anomaly: {e}")
 
 
-async def process_roi_attribution_boost(email: str, status: str, db_pool):
+async def process_roi_attribution_boost(
+    email: str, status: str, db_pool, record_ledger: bool = True
+):
     normalized_status = status.lower().strip()
+    if record_ledger:
+        ledger_stage = stage_from_status(normalized_status)
+        if ledger_stage:
+            await record_outcome_event(
+                db_pool,
+                lead_email=email,
+                stage=ledger_stage,
+                source="vanguard_status",
+            )
     reward_weight = 0
     outcome_type = "conversion"
 

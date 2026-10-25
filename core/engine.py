@@ -22,6 +22,17 @@ VENDOR_PHANTOMBUSTERS = "PhantomBusters"
 VENDOR_MOLTSET = "MoltSet"
 VENDOR_ANTHROPIC = "Anthropic"
 NEXUS_MORNING_HOUR = int(os.getenv("NEXUS_MORNING_HOUR", "6"))
+# When true, scheduler selection puts priority_score ahead of rotation order, so
+# approved strategy proposals take effect. Off by default: it changes Nova rotation.
+PRIORITY_FIRST_ORDERING = (
+    os.getenv("HELIX_PRIORITY_FIRST_ORDERING", "false").strip().lower() == "true"
+)
+SCHEDULER_ORDER_BY = (
+    "priority_score DESC, last_targeted_at ASC NULLS FIRST"
+    if PRIORITY_FIRST_ORDERING
+    else "last_targeted_at ASC NULLS FIRST, priority_score DESC"
+)
+
 MOLTSET_RECOVERY_COOLDOWN = datetime.timedelta(minutes=30)
 NOVA_DAILY_RESERVE_RATIO = float(os.getenv("NOVA_DAILY_RESERVE_RATIO", "0.10"))
 NOVA_EXPECTED_RECORDS_PER_DOMAIN = int(
@@ -767,13 +778,13 @@ async def dispatch_nova_if_due(app_instance) -> None:
 
     async with db_pool.connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute("""
+            await cur.execute(f"""
                 SELECT industry_id, industry_name, moltset_category,
                        bottleneck_profile, pain_tokens, target_region,
                        campaign_strategy
                 FROM helix_brain_scheduler
                 WHERE is_active = TRUE
-                ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC
+                ORDER BY {SCHEDULER_ORDER_BY}
                 LIMIT 1;
             """)
             strategy = await cur.fetchone()
@@ -971,11 +982,11 @@ async def perpetual_awareness_loop(app_instance):
 
                     async with db_pool.connection() as conn:
                         async with conn.cursor(row_factory=dict_row) as cur:
-                            await cur.execute("""
+                            await cur.execute(f"""
                                 SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, target_region, campaign_strategy
                                 FROM helix_brain_scheduler 
                                 WHERE is_active = TRUE 
-                                ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC LIMIT 1;
+                                ORDER BY {SCHEDULER_ORDER_BY} LIMIT 1;
                             """)
                             active_strategy = await cur.fetchone()
 
@@ -1259,11 +1270,11 @@ async def perpetual_awareness_loop(app_instance):
                                             "🔄 [SCHEDULER RECYCLE] Auto-cleared cooldown timestamps for standard dispatch."
                                         )
 
-                                    await cur.execute("""
+                                    await cur.execute(f"""
                                         SELECT industry_id, industry_name, moltset_category, bottleneck_profile, pain_tokens, campaign_strategy, target_region
                                         FROM helix_brain_scheduler WHERE is_active = TRUE 
                                         AND (last_targeted_at IS NULL OR last_targeted_at <= NOW() - (minimum_cooldown_hours || ' hours')::INTERVAL)
-                                        ORDER BY last_targeted_at ASC NULLS FIRST, priority_score DESC LIMIT 1;
+                                        ORDER BY {SCHEDULER_ORDER_BY} LIMIT 1;
                                     """)
                                     active_strategy = await cur.fetchone()
 

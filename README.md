@@ -14,6 +14,9 @@ Helix is the orchestration and observability core of the Polaris multi-agent ser
 - [Database](#database)
 - [HTTP API](#http-api)
 - [Telegram control surface](#telegram-control-surface)
+- [Telegram security](#telegram-security)
+- [Outcome ledger and strategy review](#outcome-ledger-and-strategy-review)
+- [Running on Render free tier](#running-on-render-free-tier)
 - [Background workers](#background-workers)
 - [Vendor circuit breakers](#vendor-circuit-breakers)
 - [Scheduling rules](#scheduling-rules)
@@ -170,7 +173,7 @@ All settings come from environment variables (loaded from `.env` via python-dote
 | Variable | Purpose |
 | --- | --- |
 | `DATABASE_URL` | Postgres connection string. Must start with `postgresql://`. `sslmode=require` is enforced. |
-| `HELIX_AUTH_TOKEN` | Shared secret for inbound API auth, Telegram webhook secret, and outbound calls to the mesh. |
+| `HELIX_AUTH_TOKEN` | Shared secret for inbound API auth and outbound calls to the mesh. Also the Telegram webhook secret unless `TELEGRAM_WEBHOOK_SECRET` is set. |
 
 ### Service integrations
 
@@ -186,6 +189,8 @@ All settings come from environment variables (loaded from `.env` via python-dote
 | `MYEMAILVERIFIER_API_KEY` | none | MyEmailVerifier credit sync. |
 | `TELEGRAM_BOT_TOKEN` | none | Operator bot. |
 | `TELEGRAM_CHAT_ID` | none | Admin chat. Commands from other chats are not served. |
+| `TELEGRAM_WEBHOOK_SECRET` | `HELIX_AUTH_TOKEN` | Dedicated webhook secret (recommended). Letters, digits, `_`, `-`; max 256. Re-run `register_telegram_webhook.py` after setting it. |
+| `TELEGRAM_MAX_COMMAND_AGE_SECONDS` | `900` | Telegram updates older than this are dropped. |
 | `TELEGRAM_SUMMARY_CHAT_ID` | `TELEGRAM_CHAT_ID` | Destination for summaries. |
 | `TELEGRAM_CRITICAL_BOT_TOKEN`, `TELEGRAM_CRITICAL_CHAT_ID` | fall back to the above | Separate channel for critical alerts. |
 
@@ -212,6 +217,10 @@ Defaults point at the Render deployments (`config/settings.py`, `services/mesh_c
 | `NOVA_THRESHOLD_ALERT_DEBOUNCE_HOURS` | `6` | Debounce for budget-threshold alerts. |
 | `NOVA_BUDGET_DEFERRAL_ALERT_COOLDOWN_MINUTES` | `720` | Cooldown for "Nova deferred for budget" alerts. |
 | `CHIRON_OPTIMIZATION_COOLDOWN_HOURS` | `168` (7 days) | Minimum gap between Chiron optimizations per agent. |
+| `HELIX_STRATEGY_REVIEW_ENABLED` | `true` | Set `false` to stop the weekly strategy review. |
+| `HELIX_STRATEGY_MIN_LEADS` | `30` | Minimum leads harvested in the window before an industry can get a proposal. |
+| `HELIX_STRATEGY_MAX_NEGATIVE_RATE` | `0.05` | Bounce plus opt-out rate above which a priority cut is proposed. |
+| `HELIX_PRIORITY_FIRST_ORDERING` | `false` | When `true`, scheduler selection sorts by `priority_score` before rotation order. Changes Nova rotation. |
 
 Hard-coded constants in `config/settings.py`: PhantomBuster keyword staircase `[25, 12, 8, 5]`, zero-result threshold `2`, tuning cooldown `60` min, credit sync every 8h with ±10 min jitter.
 
@@ -231,6 +240,8 @@ Hard-coded constants in `config/settings.py`: PhantomBuster keyword staircase `[
 | `helix_semantic_memory` | pgvector-backed learned guidelines (checked at startup, indexed if present). |
 | `helix_agent_manifests` | Per-agent state, including `optimization_status` and `last_optimized_at` (used by the auditor). |
 | `helix_agent_prompts` | Editable agent system prompts (created by the optimizer). |
+| `helix_outcome_events` | Append-only funnel ledger: reply, meeting, deal (with amount), bounce, opt-out, blueprint. Idempotent on `(lead_email, stage, source_event_id)`. |
+| `helix_strategy_proposals` | Proposed priority/pause/resume changes awaiting your approval. |
 | `helix_agent_schedule` | Per-agent weekday/time schedule read by the awareness loop (`weekday_int`, `scheduled_time`, `is_enabled`). |
 
 Log retention: the auditor deletes `agent_system_logs` older than 30 days on every pass.
@@ -249,6 +260,7 @@ Authentication is a shared-secret header compared in constant time (`hmac.compar
 | GET | `/api/v1/health` | none | Health check. |
 | POST | `/api/v1/ingest` | `x-helix-auth-token` | Ingest a list of leads. |
 | POST | `/api/v1/inbound-blueprints` | `x-helix-auth-token` | Store an inbound ROI blueprint. |
+| POST | `/api/v1/outcomes` | `x-helix-auth-token` | Record a funnel outcome (`reply`, `positive_reply`, `meeting_booked`, `deal_won`, `bounced`, `opt_out`) from a calendar or CRM webhook. Body: `email`, `stage`, optional `amount`, `source_event_id`. |
 | POST | `/api/v1/leads/status-update?email=` | `x-vanguard-key` | Update lead status, triggers ROI attribution boost. |
 | POST | `/api/v1/logs` | `x-helix-auth-token` | Ingest an agent log or telemetry event. Drives the reactive remediation in `analyze_and_orchestrate_log`. |
 | GET | `/api/v1/logs/latest?agent=` | `x-inbound-key` | Latest log for an agent. |
@@ -280,7 +292,26 @@ Commands are accepted only from `TELEGRAM_CHAT_ID`, and each update is claimed i
 | `/optimize` | Force prompt optimization. |
 | `/execute [agent]` | Run the full mesh, or one of `nexus, nova, beacon, radar, pulsar, vanguard, aura`. |
 | `/enable <agent>`, `/disable <agent>` | Toggle an agent. `helix` can be enabled but not disabled. |
+| `/reply <email>`, `/booked <email>` | Log a reply or a booked meeting for a lead. |
+| `/won <email> <amount>` | Log a closed deal and its value in USD. |
+| `/scorecard [7\|28]` | Per-industry funnel summary for the last 7 or 28 days. |
+| `/proposals` | List pending strategy proposals. |
+| `/approve <id>`, `/reject <id>` | Apply or discard a proposal. Nothing changes until you approve. |
 | `/help` | Command reference. |
+
+### Telegram security
+
+The webhook is the only way to command Helix from outside, so it is layered:
+
+- **Secret token.** Every request must carry `X-Telegram-Bot-Api-Secret-Token`, compared in constant time on UTF-8 bytes (non-ASCII input returns 401, not 500). Set a dedicated `TELEGRAM_WEBHOOK_SECRET` so a leak of `HELIX_AUTH_TOKEN` from any other agent does not also give control of the bot. Without it, the webhook falls back to `HELIX_AUTH_TOKEN`.
+- **Sender check.** Only a non-bot user whose ID and chat ID both equal `TELEGRAM_CHAT_ID` is served, which limits it to your private chat.
+- **Replay protection.** Updates must carry a `date` within `TELEGRAM_MAX_COMMAND_AGE_SECONDS` (default 15 min), and each `update_id` is processed once.
+- **Size limits.** Bodies over 64 KB and command text over 512 characters are rejected.
+- **Rate limits.** 20 commands per minute overall, and `/execute` and `/optimize` once per minute each, since they dispatch work and spend vendor credits.
+- **Output hygiene.** Messages sent to Telegram are HTML-escaped, truncated, and scrubbed of configured secret values and bot-token URLs.
+- **Input validation.** Emails, amounts and proposal IDs are strictly parsed before any write.
+
+Not covered: Telegram's source IPs are not allow-listed, because behind Render's proxy they would have to be read from a spoofable header. The secret token is the control.
 
 ### Notifications
 
@@ -288,6 +319,26 @@ Commands are accepted only from `TELEGRAM_CHAT_ID`, and each update is claimed i
 
 - **Overnight Summary**: 19:00 to 06:00 (sent at 06:00)
 - **Daytime Summary**: 06:00 to 19:00 (sent at 19:00)
+
+## Outcome ledger and strategy review
+
+Helix learns from results instead of only rotating through industries.
+
+**Ledger.** Every reply, booked meeting, closed deal (with amount), bounce, opt-out and inbound blueprint is written to `helix_outcome_events`. Sources: Vanguard status updates (automatic), Telegram commands, `POST /api/v1/outcomes`, and the blueprint endpoint. Region and campaign strategy are copied from the industry's scheduler row at the time of the event, so attribution is approximate if those change later.
+
+**Weekly review.** From Monday 07:00 ET, one review runs per week, and it catches up if the host was asleep at that time. It builds a scorecard over the last 28 days and sends it to Telegram with numbered proposals:
+
+| Proposal | Trigger (needs at least `HELIX_STRATEGY_MIN_LEADS` leads) |
+| --- | --- |
+| Priority +10 | Active, has results, and yield per 100 leads is above the median of eligible industries. |
+| Priority -10 | Bounce plus opt-out rate above `HELIX_STRATEGY_MAX_NEGATIVE_RATE`. |
+| Priority -5 | No replies, meetings or deals, priority above 1. |
+| Pause | No results from 3 times the minimum lead sample. |
+| Resume | Paused, but produced results in the window. |
+
+Points weight a reply 15, a meeting 40 and a deal 100, matching the live priority bumps. Rates use leads harvested as the denominator, because send counts live in other services. Proposals are rule-based, never applied automatically, and expire after 14 days.
+
+Approved priority changes only steer work when scheduler selection puts priority first. Set `HELIX_PRIORITY_FIRST_ORDERING=true` for that, knowing it changes how Nova rotates between industries.
 
 ## Background workers
 
@@ -301,6 +352,7 @@ Started in `lifespan` in `main.py`. If any exits, Helix writes a `CRITICAL` comm
 | `prompt-optimizer` | `reactive_optimizer_loop` | hourly | Optimize prompts if 5 or more warnings/errors landed in the last 3 hours. |
 | `executive-summary-scheduler` | `scheduled_summary_loop` | 06:00 and 19:00 ET | Executive summaries. |
 | `observability-watchdog` | `observability_watchdog_loop` | 5 min | Detect stale Nova runs and pipeline stalls. |
+| `strategy-review` | `strategy_review_loop` | checks every 30 min | Weekly scorecard and proposals, with catch-up after a sleep. |
 
 ### Agent KPI thresholds
 
@@ -347,6 +399,16 @@ pytest
 ```
 
 The suite uses stub DB pools and mocked HTTP, so it needs no database or network. Coverage includes API endpoints, auditor logic, config, DB connection validation, core engine, mesh client, MoltSet recovery, Nova dispatch, optimizer, Telegram orchestrator, and telemetry.
+
+## Running on Render free tier
+
+Helix is designed to run as one free Render web service with Neon Postgres. As I understand the free tier (check Render's current docs): the service spins down after about 15 minutes without inbound requests, takes about a minute to wake, has no persistent disk, and cron jobs are paid.
+
+- All state is in Postgres. Nothing writes local files.
+- The weekly review checks the database for a missing run marker, so it still runs after a sleep.
+- Telegram commands wake the service. Telegram retries a delivery that times out during the wake-up, and duplicates are ignored.
+- **Keep it awake with cron-job.org.** Create a job that sends `HEAD https://<your-host>/` every 5 minutes. The first ping after a sleep can exceed cron-job.org's timeout while the service wakes; that failed run still wakes it, so ignore it. If it sleeps, the other scheduled work stops too: Nova dispatch every 30 minutes, the 04:30 ET preflight audit, and the performance auditor. Only the weekly review catches up.
+- One always-on free service fits the monthly instance hours; a second would not.
 
 ## Deployment notes
 
