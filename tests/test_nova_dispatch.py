@@ -145,10 +145,10 @@ async def test_daily_budget_deferral_emits_explicit_leveling_telegram_notice(
         "core.engine.get_nova_consumed_records_today", AsyncMock(return_value=100)
     )
     command_log = AsyncMock()
-    telegram = MagicMock()
+    notify = MagicMock()
     mesh_dispatch = AsyncMock()
     monkeypatch.setattr("core.engine.write_helix_command_center_log", command_log)
-    monkeypatch.setattr("core.engine.send_telegram_broadcast", telegram)
+    monkeypatch.setattr("core.engine.emit_executive_notification", notify)
     monkeypatch.setattr(
         "core.engine.trigger_downstream_mesh_with_payload", mesh_dispatch
     )
@@ -160,6 +160,9 @@ async def test_daily_budget_deferral_emits_explicit_leveling_telegram_notice(
         call.args[3] == "NOVA_DAILY_BUDGET_DEFERRED"
         for call in command_log.await_args_list
     )
-    telegram.assert_called_once()
-    assert "held back to level out the weekly allotment" in telegram.call_args.args[0]
+    notify.assert_called_once()
+    event = notify.call_args.args[0]
+    assert event.source_agent == "nova"
+    assert event.event_type == "budget_deferral"
+    assert "held back to level out the weekly allotment" in event.outcome
     mesh_dispatch.assert_not_awaited()
