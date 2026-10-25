@@ -447,6 +447,19 @@ Helix is designed to run as one free Render web service with Neon Postgres. As I
 - Helix awake 24/7 would use nearly the whole monthly allowance (about 744 of 750 hours, to be checked in the Render dashboard), so a second always-on free service would not fit. That is why the pinger has a window.
 - Chiron sleeps when idle. Helix gives it up to 90 seconds, with one retry, to wake when dispatching.
 
+## Keeping Neon asleep
+
+Neon's free compute scales to zero after about 5 minutes without activity, and every wake counts against the monthly compute allowance. Helix is built to touch the database only when it has to:
+
+- **No standing connections.** The pool opens connections on demand (`min_size=0`) and closes them after 270 seconds idle. An always-open connection, or the pool refilling after `max_lifetime`, would stop Neon from suspending.
+- **The weekly review is quiet between runs.** It queries the database at most once per week: it sleeps until Monday 07:00 ET, checks the run marker once, then sleeps until the next Monday. Only a failed check retries every 30 minutes.
+- **The pinger does not touch the database.** `HEAD /` and `GET /api/v1/health` never query Postgres.
+- **Workers that poll are off by default** (`HELIX_ENABLED_WORKERS`).
+
+What still wakes Neon: a Helix start (it runs the schema check), each Telegram command, each outcome written through `/api/v1/outcomes`, and lead status updates from Vanguard. Those are the real work. Chiron touches the database only when it starts and when a job changes state; it does not poll.
+
+To check, open the Neon console, then Monitoring, and watch the compute active time. A healthy week looks like short bursts, not a flat line.
+
 ## Deployment notes
 
 - Deployed on Render as a web service (the other agents are separate Render services; default URLs are `*.onrender.com`), with Neon Postgres.

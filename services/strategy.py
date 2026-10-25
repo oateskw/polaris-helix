@@ -72,6 +72,31 @@ def review_is_due(
     return last_run_at < week_start
 
 
+def current_week_start(now_et: datetime.datetime) -> datetime.datetime:
+    """Monday 07:00 ET of the week containing now_et."""
+    days_since_monday = (now_et.weekday() - REVIEW_WEEKDAY) % 7
+    return (now_et - datetime.timedelta(days=days_since_monday)).replace(
+        hour=REVIEW_HOUR_ET, minute=0, second=0, microsecond=0
+    )
+
+
+def next_check_delay(now_et: datetime.datetime, checked_this_week: bool) -> float:
+    """Seconds to sleep before the loop needs to look at anything again.
+
+    The loop touches the database only when a review could be due, so Neon can
+    scale to zero the rest of the week: before Monday 07:00, sleep until it; once
+    this week is settled, sleep until next Monday 07:00. Capped at 12 hours, and a
+    failed check retries on the normal interval."""
+    week_start = current_week_start(now_et)
+    if now_et < week_start:
+        target = week_start
+    elif checked_this_week:
+        target = week_start + datetime.timedelta(days=7)
+    else:
+        return float(REVIEW_CHECK_INTERVAL_SECONDS)
+    return min(max(60.0, (target - now_et).total_seconds()), 12 * 3600.0)
+
+
 async def get_last_review_at(db_pool) -> datetime.datetime | None:
     async with db_pool.connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -561,27 +586,40 @@ def _review_notification(result: dict[str, Any]) -> ExecutiveNotificationEvent:
 
 
 async def strategy_review_loop(app) -> None:
-    """Weekly review with catch-up: safe on a host that sleeps and wakes (Render free tier)."""
+    """Weekly review with catch-up: safe on a host that sleeps and wakes (Render free tier).
+    Touches the database at most once per week unless a check fails."""
     print("[STRATEGY REVIEW] Weekly review loop initialized.")
+    settled_week = None  # week_start we already know is reviewed, so no query is needed
     while True:
+        delay = float(REVIEW_CHECK_INTERVAL_SECONDS)
         try:
-            if os.getenv("HELIX_STRATEGY_REVIEW_ENABLED", "true").strip().lower() != "false":
+            if os.getenv("HELIX_STRATEGY_REVIEW_ENABLED", "true").strip().lower() == "false":
+                delay = 3600.0
+            else:
                 db_pool = app.state.db_pool
                 now_et = datetime.datetime.now(EASTERN_TZ)
-                if review_is_due(now_et, await get_last_review_at(db_pool)):
-                    result = await run_strategy_review(db_pool)
-                    if review_has_news(result):
-                        emit_executive_notification(_review_notification(result))
-                    await write_helix_command_center_log(
-                        db_pool,
-                        "INFO",
-                        f"Weekly strategy review completed: {len(result['created'])} new proposals, "
-                        f"{len(result['pending'])} pending.",
-                        REVIEW_MARKER,
-                        "System Core",
-                    )
+                week_start = current_week_start(now_et)
+                # review_is_due(now, None) is False before Monday 07:00, with no query.
+                if settled_week != week_start and review_is_due(now_et, None):
+                    if review_is_due(now_et, await get_last_review_at(db_pool)):
+                        result = await run_strategy_review(db_pool)
+                        if review_has_news(result):
+                            emit_executive_notification(_review_notification(result))
+                        await write_helix_command_center_log(
+                            db_pool,
+                            "INFO",
+                            f"Weekly strategy review completed: {len(result['created'])} new proposals, "
+                            f"{len(result['pending'])} pending.",
+                            REVIEW_MARKER,
+                            "System Core",
+                        )
+                    settled_week = week_start
+                delay = next_check_delay(
+                    datetime.datetime.now(EASTERN_TZ),
+                    settled_week == week_start,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             print(f"⚠️ [STRATEGY REVIEW] Loop iteration anomaly: {exc}")
-        await asyncio.sleep(REVIEW_CHECK_INTERVAL_SECONDS)
+        await asyncio.sleep(delay)

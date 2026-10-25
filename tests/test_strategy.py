@@ -380,3 +380,55 @@ async def test_lifespan_starts_only_enabled_workers(monkeypatch):
         assert main.app.state.strategy_task is not None
 
     credit_sync.assert_not_called()
+
+
+def test_next_check_delay_lets_the_database_sleep():
+    from services.strategy import REVIEW_CHECK_INTERVAL_SECONDS, next_check_delay
+
+    sunday = datetime.datetime(2026, 10, 25, 12, 0, tzinfo=ET)
+    monday_3am = datetime.datetime(2026, 10, 26, 3, 0, tzinfo=ET)
+    monday_8am = datetime.datetime(2026, 10, 26, 8, 0, tzinfo=ET)
+
+    # Before Monday 07:00: wait for it, no query needed.
+    assert next_check_delay(monday_3am, False) == 4 * 3600
+    # Settled this week: long sleep, capped at 12 hours so a clock change cannot strand it.
+    assert next_check_delay(sunday, True) == 12 * 3600
+    assert next_check_delay(monday_8am, True) == 12 * 3600
+    # Not settled (a check failed): retry on the normal interval.
+    assert next_check_delay(monday_8am, False) == REVIEW_CHECK_INTERVAL_SECONDS
+
+
+async def test_review_loop_queries_once_then_not_again_this_week(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    import services.strategy as strategy
+
+    app = SimpleNamespace(state=SimpleNamespace(db_pool=object()))
+    lookups = []
+    ticks = []
+
+    async def fake_last(db_pool):
+        lookups.append(1)
+        return datetime.datetime.now(ET)  # already reviewed this week
+
+    async def fake_sleep(seconds):
+        ticks.append(seconds)
+        if len(ticks) == 3:
+            raise asyncio.CancelledError
+
+    class FixedDatetime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.datetime(2026, 10, 28, 12, 0, tzinfo=tz)  # Wednesday
+
+    monkeypatch.setattr(strategy, "get_last_review_at", fake_last)
+    monkeypatch.setattr(strategy.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(strategy.datetime, "datetime", FixedDatetime)
+    monkeypatch.setattr(strategy, "review_is_due", lambda now, last: last is None or False)
+
+    with pytest.raises(asyncio.CancelledError):
+        await strategy.strategy_review_loop(app)
+
+    assert lookups == [1]  # three ticks, one query
+    assert ticks == [12 * 3600.0] * 3

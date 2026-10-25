@@ -38,7 +38,9 @@ def create_async_db_pool() -> AsyncConnectionPool:
         open=False,  # We call await pool.open() in lifespan startup
         check=AsyncConnectionPool.check_connection,
         max_idle=270.0,
-        min_size=2,
+        # No standing connections: an idle open connection, and the pool's refill
+        # after max_lifetime, would keep Neon's compute from scaling to zero.
+        min_size=0,
         max_size=20,
         timeout=30.0,
         max_lifetime=1800.0,
