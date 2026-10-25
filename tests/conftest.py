@@ -94,6 +94,15 @@ def auth_env(monkeypatch):
     monkeypatch.setenv("EXECUTION_DAYS", TEST_EXECUTION_DAYS)
 
 
+@pytest.fixture(autouse=True)
+def reset_command_limiter():
+    """The Telegram command limiter is module-level state; isolate each test."""
+    import telegram_orchestrator
+
+    telegram_orchestrator._command_limiter = telegram_orchestrator.SlidingWindowLimiter()
+    yield
+
+
 @pytest.fixture
 def db_pool_factory():
     def _build(

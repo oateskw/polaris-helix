@@ -1,3 +1,4 @@
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -14,6 +15,7 @@ def telegram_update(text: str, update_id: int = 1) -> dict:
             "from": {"id": int(TEST_CHAT_ID)},
             "chat": {"id": int(TEST_CHAT_ID)},
             "text": text,
+            "date": int(time.time()),
         },
     }
 

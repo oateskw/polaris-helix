@@ -18,7 +18,7 @@ def _webhook_url(value: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Register the Helix Telegram webhook using HELIX_AUTH_TOKEN."
+        description="Register the Helix Telegram webhook (TELEGRAM_WEBHOOK_SECRET, else HELIX_AUTH_TOKEN)."
     )
     parser.add_argument(
         "webhook_url",
@@ -29,14 +29,16 @@ def main() -> int:
 
     load_dotenv()
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    auth_token = os.getenv("HELIX_AUTH_TOKEN", "")
+    auth_token = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip() or os.getenv(
+        "HELIX_AUTH_TOKEN", ""
+    )
     if not bot_token:
         parser.error("TELEGRAM_BOT_TOKEN is not configured")
     if not auth_token:
-        parser.error("HELIX_AUTH_TOKEN is not configured")
+        parser.error("TELEGRAM_WEBHOOK_SECRET or HELIX_AUTH_TOKEN is not configured")
     if not TELEGRAM_SECRET_PATTERN.fullmatch(auth_token):
         parser.error(
-            "HELIX_AUTH_TOKEN must contain only letters, numbers, underscores, or hyphens "
+            "The webhook secret must contain only letters, numbers, underscores, or hyphens "
             "to be accepted by Telegram"
         )
 
@@ -54,7 +56,7 @@ def main() -> int:
         response.raise_for_status()
         result = response.json()
     except (httpx.HTTPError, ValueError) as exc:
-        print(f"Webhook registration failed: {exc}")
+        print(f"Webhook registration failed: {str(exc).replace(bot_token, '***')}")
         return 1
 
     if not result.get("ok"):
@@ -63,7 +65,7 @@ def main() -> int:
         )
         return 1
 
-    print("Helix Telegram webhook registered with HELIX_AUTH_TOKEN authentication.")
+    print("Helix Telegram webhook registered with secret-token authentication.")
     return 0
 
 

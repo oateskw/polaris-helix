@@ -1,13 +1,15 @@
 import os
 import asyncio
-import hmac
 import html
+import json
+import time
 import datetime
 from zoneinfo import ZoneInfo
 import httpx
 from fastapi import APIRouter, Request, HTTPException
 from psycopg.rows import dict_row
 from helix_optimizer import run_daily_prompt_optimization
+from services.security import SlidingWindowLimiter, redact_secrets, tokens_match
 from services.telemetry import (
     ExecutiveNotificationEvent,
     send_executive_summary_from_logs,
@@ -23,6 +25,25 @@ DISPATCHABLE_AGENTS = frozenset(
     {"nexus", "nova", "beacon", "radar", "pulsar", "vanguard", "aura"}
 )
 SCHEDULABLE_AGENTS = DISPATCHABLE_AGENTS | {"helix"}
+
+# Webhook hardening limits
+MAX_WEBHOOK_BODY_BYTES = 64 * 1024
+MAX_COMMAND_TEXT_CHARS = 512
+MAX_COMMAND_AGE_SECONDS = int(os.getenv("TELEGRAM_MAX_COMMAND_AGE_SECONDS", "900"))
+COMMANDS_PER_MINUTE = 20
+# Commands that spend vendor credits or dispatch work; allow one per cooldown window.
+COSTLY_COMMANDS = frozenset({"/execute", "/optimize"})
+COSTLY_COMMAND_COOLDOWN_SECONDS = 60
+_command_limiter = SlidingWindowLimiter()
+# Hold references so fire-and-forget notification tasks are not garbage-collected.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _webhook_secret() -> str:
+    """Dedicated webhook secret, falling back to the shared Helix token."""
+    return os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip() or os.getenv(
+        "HELIX_AUTH_TOKEN", ""
+    )
 
 
 def _summary_window_from_argument(
@@ -69,15 +90,18 @@ async def _send_command_notification(event: ExecutiveNotificationEvent) -> None:
         print("Telegram command response skipped: credentials are not configured.")
         return
 
+    def safe(value: str) -> str:
+        return html.escape(redact_secrets(value))
+
     lines = [
-        f"<b>{html.escape(event.headline)}</b>",
-        f"Agent: <code>{html.escape(event.source_agent)}</code>",
-        f"Outcome: {html.escape(event.outcome)}",
+        f"<b>{safe(event.headline)}</b>",
+        f"Agent: <code>{safe(event.source_agent)}</code>",
+        f"Outcome: {safe(event.outcome)}",
     ]
     if event.impact:
-        lines.append(f"Impact: {html.escape(event.impact)}")
+        lines.append(f"Impact: {safe(event.impact)[:600]}")
     if event.next_action:
-        lines.append(f"Next: {html.escape(event.next_action)}")
+        lines.append(f"Next: {safe(event.next_action)}")
 
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -92,14 +116,16 @@ async def _send_command_notification(event: ExecutiveNotificationEvent) -> None:
             if response.status_code != 200:
                 print(
                     "Telegram command response rejected "
-                    f"with HTTP {response.status_code}: {response.text[:300]}"
+                    f"with HTTP {response.status_code}: {redact_secrets(response.text[:300])}"
                 )
     except Exception as exc:
-        print(f"Telegram command response failed: {exc}")
+        print(f"Telegram command response failed: {redact_secrets(exc)}")
 
 
 def emit_executive_notification(event: ExecutiveNotificationEvent) -> None:
-    asyncio.create_task(_send_command_notification(event))
+    task = asyncio.create_task(_send_command_notification(event))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def _parse_command(text: str) -> tuple[str, str | None]:
@@ -148,18 +174,22 @@ async def telegram_webhook_handler(request: Request):
     Secure incoming webhook endpoint handling interactive commands
     sent to @Polaris_Inbound_Lead_bot.
     """
-    expected_secret = os.getenv("HELIX_AUTH_TOKEN", "")
     provided_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if (
-        not expected_secret
-        or not provided_secret
-        or not hmac.compare_digest(provided_secret, expected_secret)
-    ):
+    if not tokens_match(provided_secret, _webhook_secret()):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    declared_length = request.headers.get("content-length", "")
+    if declared_length.isdigit() and int(declared_length) > MAX_WEBHOOK_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Payload too large")
+    raw_body = await request.body()
+    if len(raw_body) > MAX_WEBHOOK_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Payload too large")
+
     try:
-        payload = await request.json()
-    except Exception:
+        payload = json.loads(raw_body)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
     message = payload.get("message")
@@ -180,9 +210,41 @@ async def telegram_webhook_handler(request: Request):
         # Ignore unauthorized users silently to prevent exploit scanning
         return {"status": "unauthorized_user_dropped"}
 
+    if sender.get("is_bot") is True:
+        return {"status": "unauthorized_user_dropped"}
+
+    # Reject stale updates so a captured request cannot be replayed later.
+    message_date = message.get("date")
+    if (
+        not isinstance(message_date, int)
+        or isinstance(message_date, bool)
+        or abs(time.time() - message_date) > MAX_COMMAND_AGE_SECONDS
+    ):
+        return {"status": "stale_dropped"}
+
+    if len(text) > MAX_COMMAND_TEXT_CHARS:
+        return {"status": "ignored"}
+
     command, argument = _parse_command(text)
     if not command.startswith("/"):
         return {"status": "ignored"}
+
+    if not _command_limiter.allow("all", COMMANDS_PER_MINUTE, 60):
+        return {"status": "rate_limited"}
+    if command in COSTLY_COMMANDS and not _command_limiter.allow(
+        f"costly:{command}", 1, COSTLY_COMMAND_COOLDOWN_SECONDS
+    ):
+        emit_executive_notification(
+            ExecutiveNotificationEvent(
+                source_agent="helix",
+                event_type="action_blocked",
+                severity="warning",
+                headline="Command Throttled",
+                outcome=f"{command} was run less than {COSTLY_COMMAND_COOLDOWN_SECONDS}s ago.",
+                next_action="Wait a minute before running it again.",
+            )
+        )
+        return {"status": "throttled"}
 
     update_id = payload.get("update_id")
     if not isinstance(update_id, int):
