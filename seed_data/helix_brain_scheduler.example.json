@@ -1,0 +1,15 @@
+[
+  {
+    "_note": "TEMPLATE. Copy to helix_brain_scheduler.json and replace with your real industries. Files named *.example.json are never loaded.",
+    "industry_name": "Dental Practices",
+    "moltset_category": "Health and Pharmaceuticals",
+    "bottleneck_profile": "Front-desk staff lose hours to appointment reminders, insurance verification and no-show follow-up.",
+    "pain_tokens": ["no-shows", "insurance verification", "appointment reminders"],
+    "target_region": "Texas",
+    "is_active": true,
+    "priority_score": 1,
+    "minimum_cooldown_hours": 24,
+    "assigned_days": [1, 3],
+    "campaign_strategy": "LIVE_AUDIT"
+  }
+]

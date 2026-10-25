@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS helix_agent_manifests (
     last_optimized_at   TIMESTAMPTZ
 );
 
+ALTER TABLE helix_agent_manifests
+    ADD COLUMN IF NOT EXISTS purpose           TEXT,
+    ADD COLUMN IF NOT EXISTS dependencies      TEXT,
+    ADD COLUMN IF NOT EXISTS critical_paths    TEXT,
+    ADD COLUMN IF NOT EXISTS target_repository TEXT,
+    ADD COLUMN IF NOT EXISTS target_files      TEXT[];
+
 CREATE TABLE IF NOT EXISTS helix_agent_schedule (
     agent_name     TEXT     NOT NULL,
     weekday_int    SMALLINT NOT NULL CHECK (weekday_int BETWEEN 0 AND 6),
@@ -249,15 +256,32 @@ CREATE TABLE IF NOT EXISTS chiron_healing_sessions (
     created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     CONSTRAINT unique_trigger_log UNIQUE (triggering_log_id)
 );
+
+ALTER TABLE chiron_healing_sessions
+    ADD COLUMN IF NOT EXISTS git_branch_name     TEXT,
+    ADD COLUMN IF NOT EXISTS target_file_path    TEXT,
+    ADD COLUMN IF NOT EXISTS pull_request_number INTEGER,
+    ADD COLUMN IF NOT EXISTS pull_request_url    TEXT,
+    ADD COLUMN IF NOT EXISTS failure_reason      TEXT,
+    ADD COLUMN IF NOT EXISTS updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW();
 """
 
 SEED_SQL = """
+-- Vendor names must match the VENDOR_* constants in the code exactly: the circuit
+-- matrix is keyed by this column. The NOT EXISTS check is case-insensitive so an
+-- older row spelled 'Moltset' is not duplicated.
 INSERT INTO helix_infrastructure_oracle_ledger
     (vendor_name, credits_remaining, credit_unit, is_circuit_broken)
-VALUES
+SELECT v.vendor_name, v.credits_remaining, v.credit_unit, v.is_circuit_broken
+FROM (VALUES
     ('MyEmailVerifier', 100.00, 'CREDITS', FALSE),
     ('PhantomBusters', 1200.00, 'MINUTES', FALSE),
-    ('Moltset', 200.00, 'USD', FALSE),
+    ('MoltSet', 200.00, 'USD', FALSE),
     ('Anthropic', 100.00, 'USD', FALSE)
+) AS v(vendor_name, credits_remaining, credit_unit, is_circuit_broken)
+WHERE NOT EXISTS (
+    SELECT 1 FROM helix_infrastructure_oracle_ledger l
+    WHERE LOWER(l.vendor_name) = LOWER(v.vendor_name)
+)
 ON CONFLICT (vendor_name) DO NOTHING;
 """

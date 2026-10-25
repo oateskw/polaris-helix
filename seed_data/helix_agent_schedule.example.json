@@ -1,0 +1,17 @@
+[
+  {
+    "_note": "TEMPLATE. Copy to helix_agent_schedule.json. weekday_int is 0 (Sunday) to 6 (Saturday). Rows with scheduled_time (ET, HH:MM) run at that time; rows without it run on Helix's regular cadence. Telegram /enable <agent> also creates enabled rows for all 7 days.",
+    "agent_name": "beacon",
+    "weekday_int": 2,
+    "is_enabled": true,
+    "max_daily_runs": 1,
+    "scheduled_time": "09:30"
+  },
+  {
+    "agent_name": "nova",
+    "weekday_int": 2,
+    "is_enabled": true,
+    "max_daily_runs": null,
+    "scheduled_time": null
+  }
+]

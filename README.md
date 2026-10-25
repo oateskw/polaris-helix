@@ -95,7 +95,9 @@ Campaign strategies recognized by the mesh: `LIVE_AUDIT`, `OBJECTION_KILLER`, `B
 main.py                     FastAPI app, lifespan, REST endpoints, summary + watchdog loops
 telegram_orchestrator.py    /api/v1/telegram/webhook and command handlers
 register_telegram_webhook.py  CLI to register the Telegram webhook
-init_db.py                  Provisions schema and seeds the vendor ledger
+init_db.py                  Provisions schema, seeds the vendor ledger, loads seed_data/
+export_seed.py              Writes the live prompts, manifests, industries and schedule to seed_data/
+seed_data/                  JSON backups of the irreplaceable configuration rows
 helix_optimizer.py          Claude-driven prompt optimization (daily/reactive)
 helix_memory.py             Embedding + pgvector semantic memory
 config/settings.py          Constants, vendor URLs, schedule helpers, MoltSet categories
@@ -146,7 +148,19 @@ ANTHROPIC_API_KEY=sk-ant-...
 python init_db.py
 ```
 
-This runs `PROVISION_SQL` and `SEED_SQL` in one transaction. It creates every table Helix reads or writes, including `helix_agent_schedule`, `helix_agent_manifests`, `helix_semantic_memory` and `helix_agent_prompts`. All statements are `IF NOT EXISTS`, so it is safe against an existing database. It enforces `sslmode=require` and sets a 10s connect timeout and 30s statement timeout. It is idempotent.
+This runs `PROVISION_SQL`, `SEED_SQL` and the JSON files in [seed_data/](seed_data/README.md) in one transaction. It creates every table Helix reads or writes, including `helix_agent_schedule`, `helix_agent_manifests`, `helix_semantic_memory` and `helix_agent_prompts`. All statements are `IF NOT EXISTS`, so it is safe against an existing database. It enforces `sslmode=require` and sets a 10s connect timeout and 30s statement timeout. It is idempotent.
+
+### Rebuild after losing the database
+
+The rows that cannot be re-harvested (agent prompts, agent manifests, industries, the schedule) live in `seed_data/` as JSON, so a lost database is a short job:
+
+```bash
+python init_db.py --dry-run     # validate the seed files first, contacts nothing
+python init_db.py               # schema + seed data; existing rows are kept
+python export_seed.py           # after any change, write the live config back to seed_data/ and commit it
+```
+
+Existing rows are never overwritten unless you pass `--overwrite`, because the prompt optimizer and Telegram commands change them at runtime. Lead data, logs and memory are not backed up this way; use Neon's restore window or a scheduled `pg_dump` for those. See [seed_data/README.md](seed_data/README.md) for the file formats.
 
 ### Run
 
@@ -423,5 +437,5 @@ Helix is designed to run as one free Render web service with Neon Postgres. As I
 2. **Duplicated `get_validated_database_url`** in `database/connection.py` and `init_db.py`, with slightly different behavior (the latter adds timeouts).
 3. **Default model mismatch.** `config/settings.py` defaults `ANTHROPIC_MODEL` to `claude-3-5-sonnet-latest`, while the optimizer defaults to `claude-haiku-4-5`.
 4. **Aura proxy drift.** Aura forwards logs to `/api/v1/helix/log`, but Helix ingests at `/api/v1/logs` (noted in the architecture doc).
-5. **Reconstructed schema.** The DDL for `helix_agent_schedule`, `helix_agent_manifests`, `helix_semantic_memory` and `helix_agent_prompts` was written from how this repo's queries use them. Other services (for example Chiron) may use additional columns, so compare against the live database before relying on `init_db.py` for a rebuild.
+5. **Reconstructed schema.** The DDL for `helix_agent_schedule`, `helix_agent_manifests`, `helix_semantic_memory`, `helix_agent_prompts` and the Chiron columns of `chiron_healing_sessions` was written from how the code uses them, not from the original database. Other services may use more columns.
 6. **Nova budget-deferral alerts are not sent to Telegram by default.** They are `warning` severity, and the default `HELIX_NOTIFICATION_POLICY_MODE=strict` suppresses non-critical, non-command events, so they only reach the summaries. Set the mode to `legacy` if you want them delivered immediately.

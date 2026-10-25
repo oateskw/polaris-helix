@@ -89,6 +89,8 @@ def anyio_backend():
 @pytest.fixture(autouse=True)
 def auth_env(monkeypatch):
     monkeypatch.setenv("HELIX_AUTH_TOKEN", TEST_AUTH_TOKEN)
+    # A developer's .env may define a dedicated webhook secret; tests use the shared token.
+    monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET", raising=False)
     monkeypatch.setenv("VANGUARD_API_KEY", TEST_VANGUARD_KEY)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "")
     monkeypatch.setenv("EXECUTION_DAYS", TEST_EXECUTION_DAYS)

@@ -1,0 +1,92 @@
+[
+  {
+    "agent_name": "helix",
+    "is_active": false,
+    "purpose": "Orchestration core and observability hub of the Polaris mesh. Chooses the daily industry target, dispatches the other agents, ingests their logs, guards vendor budgets with circuit breakers, audits agent KPIs, proposes strategy changes from funnel results, and takes owner commands over Telegram.",
+    "dependencies": "Postgres (Neon) with pgvector, Anthropic API, OpenAI embeddings, Telegram Bot API, Chiron, and every downstream agent (Nexus, Nova, Beacon, Radar, Pulsar, Vanguard, Aura).",
+    "critical_paths": "Authentication (tokens_match, Telegram webhook secret), vendor circuit breakers, scheduler target selection, Telegram command handling, outcome ledger writes, database provisioning.",
+    "target_repository": "polaris-helix",
+    "target_files": ["main.py", "telegram_orchestrator.py", "core/engine.py", "core/auditor.py", "services/mesh_client.py", "services/telemetry.py", "services/credit_sync.py", "services/strategy.py", "services/outcomes.py", "helix_optimizer.py", "helix_memory.py"]
+  },
+  {
+    "agent_name": "nexus",
+    "is_active": true,
+    "purpose": "Strategic directive compiler. Picks the campaign strategy family (LIVE_AUDIT, OBJECTION_KILLER, BUILD_IN_PUBLIC, BEFORE_AFTER), generates buying-signal queries, shapes directives and hashtags, and launches PhantomBuster runs.",
+    "dependencies": "Helix (dispatch and telemetry), Anthropic API, PhantomBuster, Postgres.",
+    "critical_paths": "Strategy selection, PhantomBuster launch and keyword limits, authentication of Helix requests, telemetry to Helix.",
+    "target_repository": "polaris-beacon",
+    "target_files": ["nexus_agent.py"]
+  },
+  {
+    "agent_name": "beacon",
+    "is_active": true,
+    "purpose": "LinkedIn campaign generator. Writes campaign content from the chosen strategy and learned guidelines, schedules posts through Publer, and streams telemetry to Helix.",
+    "dependencies": "Helix, Nexus directive, Anthropic API, Publer, Postgres (beacon_history).",
+    "critical_paths": "Campaign strategy validation, Publer scheduling and media upload, authentication of Helix requests, telemetry to Helix.",
+    "target_repository": "polaris-beacon",
+    "target_files": ["beacon_agent.py"]
+  },
+  {
+    "agent_name": "radar",
+    "is_active": true,
+    "purpose": "Scraper and interception ingestion. Normalizes scraped social and email signals, de-duplicates them, and forwards qualified leads to enrichment.",
+    "dependencies": "Helix, PhantomBuster and Instantly webhooks, Vector enrichment, Postgres.",
+    "critical_paths": "Webhook authentication, de-duplication, forwarding to enrichment, telemetry batching.",
+    "target_repository": "polaris-beacon",
+    "target_files": ["radar_agent.py"]
+  },
+  {
+    "agent_name": "pulsar",
+    "is_active": true,
+    "purpose": "Inbound comment and reply handler. Processes inbox hooks and sweeps, de-duplicates, and runs guardrailed reaction flows including Telegram callbacks.",
+    "dependencies": "Helix, Anthropic API, Telegram, Postgres.",
+    "critical_paths": "Webhook authentication, de-duplication, reaction guardrails, Telegram callback handling.",
+    "target_repository": "polaris-beacon",
+    "target_files": ["pulsar_agent.py"]
+  },
+  {
+    "agent_name": "nova",
+    "is_active": true,
+    "purpose": "Lead harvester. Uses MoltSet to find companies and people for the targeted industry, enforces weekly and daily search-capacity budgets, stages records, and inserts cold leads with a durable telemetry outbox.",
+    "dependencies": "Helix (dispatch, budget and circuit state), MoltSet API, Postgres (staging queue, telemetry outbox, cold_leads).",
+    "critical_paths": "MoltSet capacity guardrails, advisory-lock run orchestration, staging queue processing, telemetry outbox replay, authentication of Helix requests.",
+    "target_repository": "polaris-vanguard",
+    "target_files": ["nova_agent.py"]
+  },
+  {
+    "agent_name": "vanguard",
+    "is_active": true,
+    "purpose": "Outbound dispatch engine. Pulls ready_to_send leads, checks sending quotas, writes outreach copy with Claude (with a fallback), sends through Instantly, updates lead status, and reports aggregate results to Helix.",
+    "dependencies": "Helix, Anthropic API, Instantly, MyEmailVerifier, Postgres.",
+    "critical_paths": "Quota and pacing checks, opt-out and bounce handling, lead status mutation, reply webhooks, telemetry to Helix.",
+    "target_repository": "polaris-vanguard",
+    "target_files": ["vanguard_core.py"]
+  },
+  {
+    "agent_name": "vector",
+    "is_active": false,
+    "purpose": "Social-hook ingestion and enrichment. Captures inbound social leads, de-duplicates them, enriches with MoltSet, validates email with MyEmailVerifier (with LLM typo rescue), and promotes good leads to ready_to_send.",
+    "dependencies": "Helix, MoltSet, MyEmailVerifier, Anthropic API, Postgres.",
+    "critical_paths": "De-duplication, email validation quality gates, promotion to ready_to_send, failure-state handling.",
+    "target_repository": "polaris-vector",
+    "target_files": ["social_hook.py", "enrichment_worker.py"]
+  },
+  {
+    "agent_name": "aura",
+    "is_active": false,
+    "purpose": "Marketing engine. Generates brand and campaign payloads, video and reel scripts, and handles Instagram listener and hunter routes plus a log proxy to Helix.",
+    "dependencies": "Helix, Anthropic API, Instagram integrations, Postgres.",
+    "critical_paths": "Authentication of Helix requests, Instagram listener and hunter routes, log forwarding to Helix.",
+    "target_repository": "polaris-aura",
+    "target_files": ["aura_agent.py"]
+  },
+  {
+    "agent_name": "chiron",
+    "is_active": false,
+    "purpose": "The mechanic. Opens GitHub pull requests that fix crashes (heal) or implement optimization briefs (optimize) in the other agents' repositories. Never merges or deploys.",
+    "dependencies": "Helix (instructions, logs, vendor circuit), Anthropic API, GitHub API, Postgres (prompts, manifests, healing sessions).",
+    "critical_paths": "Authentication of Helix requests, SEARCH/REPLACE patch application, the sandbox test run before pushing, branch naming, PR creation.",
+    "target_repository": "polaris-chiron",
+    "target_files": ["chiron_healer.py", "proactive_optimizer.py", "patch_generator.py", "git_handler.py"]
+  }
+]

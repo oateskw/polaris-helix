@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 import traceback
@@ -7,6 +8,7 @@ from dotenv import load_dotenv
 import psycopg
 
 from database.schemas import PROVISION_SQL, SEED_SQL
+from database.seeding import SeedError, apply_seed_data, load_all_seed_data
 
 load_dotenv()
 
@@ -49,16 +51,30 @@ def get_validated_database_url() -> str:
     return url
 
 
-def run_provisioning() -> None:
+def run_provisioning(*, seed: bool = True, overwrite: bool = False) -> None:
     """Execute database provisioning with schema creation and seed data insertion.
     
     This function establishes a connection to the cloud Postgres instance,
     provisions the schema, and seeds initial operational data. It enforces
     transactional integrity and proper resource cleanup.
     
+    Args:
+        seed: Also load the JSON files in seed_data/ (prompts, manifests, scheduler,
+            agent schedule). Files are validated before any connection is made.
+        overwrite: Replace existing rows with the seed values. By default existing
+            rows are left alone, so re-running never undoes runtime changes.
+
     Exits:
         sys.exit(1): On configuration errors or connection failures.
     """
+    seed_rows: dict = {}
+    if seed:
+        try:
+            seed_rows = load_all_seed_data()
+        except SeedError as exc:
+            print(f"\n❌ [init_db] SEED DATA ERROR: {exc}\n", file=sys.stderr)
+            sys.exit(1)
+
     try:
         database_url = get_validated_database_url()
     except ValueError as exc:
@@ -77,6 +93,15 @@ def run_provisioning() -> None:
 
             print("🌱 Seeding critical operational infrastructure ledger defaults...")
             cur.execute(SEED_SQL)
+
+            if seed:
+                mode = "overwriting existing rows" if overwrite else "keeping existing rows"
+                print(f"📦 Loading seed_data/ ({mode})...")
+                results = apply_seed_data(cur, seed_rows, overwrite=overwrite)
+                for table, (written, kept) in results.items():
+                    print(f"   {table}: {written} written, {kept} left alone")
+                if not results:
+                    print("   No seed files found; nothing to load.")
 
         conn.commit()
         print("✅ [init_db] Success! Schema provisioned and seed rows verified.")
@@ -115,5 +140,43 @@ def run_provisioning() -> None:
                 pass  # Suppress cleanup errors
 
 
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Provision the Helix database schema and load seed_data/."
+    )
+    parser.add_argument(
+        "--no-seed", action="store_true", help="Create the schema only."
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace existing rows with the seed_data/ values (default: keep them).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate seed_data/ and print row counts without connecting.",
+    )
+    args = parser.parse_args(argv)
+
+    # Windows consoles default to cp1252, which cannot print the status emoji.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+    if args.dry_run:
+        try:
+            counts = {t: len(r) for t, r in load_all_seed_data().items()}
+        except SeedError as exc:
+            print(f"❌ [init_db] SEED DATA ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+        for table, count in counts.items():
+            print(f"{table}: {count} rows")
+        print("✅ Seed files are valid. No database was contacted.")
+        return
+
+    run_provisioning(seed=not args.no_seed, overwrite=args.overwrite)
+
+
 if __name__ == "__main__":
-    run_provisioning()
+    main()
