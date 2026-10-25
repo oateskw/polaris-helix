@@ -107,7 +107,8 @@ BEGIN
     IF to_regclass('helix_agent_manifests') IS NOT NULL THEN
         ALTER TABLE helix_agent_manifests
             ADD COLUMN IF NOT EXISTS optimization_status TEXT NOT NULL DEFAULT 'IDLE',
-            ADD COLUMN IF NOT EXISTS last_optimized_at TIMESTAMPTZ;
+            ADD COLUMN IF NOT EXISTS last_optimized_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS last_optimization_pr_url TEXT;
 
         UPDATE helix_agent_manifests
         SET optimization_status = 'IDLE'
