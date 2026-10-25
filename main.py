@@ -248,13 +248,8 @@ async def ensure_observability_schema(db_pool) -> None:
         await conn.commit()
 
     if not os.getenv("OPENAI_API_KEY"):
-        await write_helix_command_center_log(
-            db_pool,
-            "WARNING",
-            "OPENAI_API_KEY is not configured. Learned-guideline embeddings are disabled.",
-            "HELIX_MEMORY_EMBEDDING_KEY_MISSING",
-            "helix_memory",
-        )
+        # Stdout only: memory is optional, so this should not fill the log table.
+        print("ℹ️ OPENAI_API_KEY is not configured. Learned-guideline embeddings are disabled.")
 
     if memory_schema_status:
         compatibility_ok = all(
@@ -365,6 +360,28 @@ async def observability_watchdog_loop(app: FastAPI) -> None:
             )
 
 
+# worker key -> (app.state attribute, task name)
+WORKER_TASKS = {
+    "auditor": ("auditor_task", "performance-auditor"),
+    "awareness": ("awareness_task", "awareness-dispatcher"),
+    "credit-sync": ("credit_sync_task", "vendor-credit-sync"),
+    "optimizer": ("optimizer_task", "prompt-optimizer"),
+    "summary": ("summary_task", "executive-summary-scheduler"),
+    "watchdog": ("watchdog_task", "observability-watchdog"),
+    "strategy": ("strategy_task", "strategy-review"),
+}
+DEFAULT_ENABLED_WORKERS = "strategy"
+
+
+def enabled_workers() -> set[str]:
+    """Workers to start. HELIX_ENABLED_WORKERS is a comma list of the keys in
+    WORKER_TASKS, or "all". Unknown names are ignored."""
+    raw = os.getenv("HELIX_ENABLED_WORKERS", DEFAULT_ENABLED_WORKERS).strip().lower()
+    if raw == "all":
+        return set(WORKER_TASKS)
+    return {name.strip() for name in raw.split(",") if name.strip() in WORKER_TASKS}
+
+
 # Modify the lifespan context manager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -376,71 +393,46 @@ async def lifespan(app: FastAPI):
 
     await app.state.db_pool.open(wait=True)
     await ensure_observability_schema(app.state.db_pool)
-    await sync_external_vendor_credits(app.state.db_pool)
 
-    # Background Tasks - Ensure tasks respect operational constraints
-    app.state.auditor_task = asyncio.create_task(
-        run_agent_performance_audit_loop(app.state.db_pool), name="performance-auditor"
-    )
-    app.state.awareness_task = asyncio.create_task(
-        perpetual_awareness_loop(app), name="awareness-dispatcher"
-    )
-    app.state.credit_sync_task = asyncio.create_task(
-        credit_sync_scheduler_loop(app.state.db_pool), name="vendor-credit-sync"
-    )
-    app.state.optimizer_task = asyncio.create_task(
-        reactive_optimizer_loop(app.state.db_pool), name="prompt-optimizer"
-    )
-    app.state.summary_task = asyncio.create_task(
-        scheduled_summary_loop(app), name="executive-summary-scheduler"
-    )
-    app.state.watchdog_task = asyncio.create_task(
-        observability_watchdog_loop(app), name="observability-watchdog"
-    )
-    app.state.strategy_task = asyncio.create_task(
-        strategy_review_loop(app), name="strategy-review"
-    )
+    enabled = enabled_workers()
+    if "credit-sync" in enabled:
+        await sync_external_vendor_credits(app.state.db_pool)
 
-    for task in (
-        app.state.auditor_task,
-        app.state.awareness_task,
-        app.state.credit_sync_task,
-        app.state.optimizer_task,
-        app.state.summary_task,
-        app.state.watchdog_task,
-        app.state.strategy_task,
-    ):
-        task.add_done_callback(
-            lambda completed_task, pool=app.state.db_pool: report_background_task_exit(
-                completed_task, pool
+    # Only the workers named in HELIX_ENABLED_WORKERS start (default: strategy review).
+    pool = app.state.db_pool
+    worker_factories = {
+        "auditor": lambda: run_agent_performance_audit_loop(pool),
+        "awareness": lambda: perpetual_awareness_loop(app),
+        "credit-sync": lambda: credit_sync_scheduler_loop(pool),
+        "optimizer": lambda: reactive_optimizer_loop(pool),
+        "summary": lambda: scheduled_summary_loop(app),
+        "watchdog": lambda: observability_watchdog_loop(app),
+        "strategy": lambda: strategy_review_loop(app),
+    }
+    for worker_key, (state_name, task_name) in WORKER_TASKS.items():
+        task = None
+        if worker_key in enabled:
+            task = asyncio.create_task(worker_factories[worker_key](), name=task_name)
+            task.add_done_callback(
+                lambda completed_task, pool=pool: report_background_task_exit(
+                    completed_task, pool
+                )
             )
-        )
+        setattr(app.state, state_name, task)
 
-    emit_executive_notification(
-        ExecutiveNotificationEvent(
-            source_agent="helix",
-            event_type="pipeline_milestone",
-            severity="success",
-            headline="Helix Orchestrator Online",
-            outcome="Core orchestrator, auditor, credit sync, and optimizer workers started.",
-            next_action="Monitoring active agent pipeline in real time.",
-        )
-    )
+    started = [name for _, name in (WORKER_TASKS[k] for k in WORKER_TASKS if k in enabled)]
+    print(f"[HELIX] Workers started: {', '.join(started) or 'none'}")
+    # No startup Telegram message: it said nothing the owner can act on.
     yield
 
-    # Clean teardown with explicit cancellation order including auditor_task
+    # Clean teardown: cancel whichever workers were started
     tasks_to_cancel = [
-        app.state.auditor_task,
-        app.state.awareness_task,
-        app.state.credit_sync_task,
-        app.state.optimizer_task,
-        app.state.summary_task,
-        app.state.watchdog_task,
-        app.state.strategy_task,
+        getattr(app.state, state_name, None) for state_name, _ in WORKER_TASKS.values()
     ]
+    tasks_to_cancel = [task for task in tasks_to_cancel if task is not None]
 
     for task in tasks_to_cancel:
-        if task and not task.done():
+        if not task.done():
             task.cancel()
 
     await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
@@ -625,14 +617,18 @@ async def audit_agent_endpoint(
 @app.get("/api/v1/health")
 async def health_check():
     workers = {}
-    for worker_name, state_name in (
-        ("performance_auditor", "auditor_task"),
-        ("awareness_dispatcher", "awareness_task"),
-        ("vendor_credit_sync", "credit_sync_task"),
-        ("prompt_optimizer", "optimizer_task"),
+    enabled = enabled_workers()
+    for worker_name, worker_key, state_name in (
+        ("performance_auditor", "auditor", "auditor_task"),
+        ("awareness_dispatcher", "awareness", "awareness_task"),
+        ("vendor_credit_sync", "credit-sync", "credit_sync_task"),
+        ("prompt_optimizer", "optimizer", "optimizer_task"),
+        ("strategy_review", "strategy", "strategy_task"),
     ):
         task = getattr(app.state, state_name, None)
-        if task is None:
+        if worker_key not in enabled:
+            workers[worker_name] = "disabled"
+        elif task is None:
             workers[worker_name] = "not_started"
         elif task.done():
             workers[worker_name] = "stopped"
@@ -641,7 +637,7 @@ async def health_check():
 
     overall_status = (
         "healthy"
-        if all(status == "running" for status in workers.values())
+        if all(status in {"running", "disabled"} for status in workers.values())
         else "degraded"
     )
     return {

@@ -42,6 +42,8 @@ async def test_root_heartbeat_get_and_head(app_client):
 async def test_health_reports_background_worker_states(
     app_module, app_client, monkeypatch
 ):
+    monkeypatch.setenv("HELIX_ENABLED_WORKERS", "all")
+
     class RunningTask:
         def done(self):
             return False
@@ -62,12 +64,13 @@ async def test_health_reports_background_worker_states(
     response = await app_client.get("/api/v1/health")
 
     assert response.status_code == 200
-    assert response.json()["status"] == "healthy"
+    assert response.json()["status"] == "degraded"
     assert response.json()["workers"] == {
         "performance_auditor": "running",
         "awareness_dispatcher": "running",
         "vendor_credit_sync": "running",
         "prompt_optimizer": "running",
+        "strategy_review": "not_started",
     }
 
 

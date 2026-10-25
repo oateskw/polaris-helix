@@ -310,7 +310,7 @@ async def test_review_loop_runs_once_when_due_and_stays_quiet_otherwise(monkeypa
         await strategy.strategy_review_loop(app)
     assert review.call_count == 1
     assert marker_writes == [strategy.REVIEW_MARKER]
-    assert notify.call_args.args[0].event_type == "strategy_review"
+    notify.assert_not_called()  # empty database: marker written, nothing to report
 
     monkeypatch.setattr(strategy, "review_is_due", lambda now, last: False)
     with pytest.raises(asyncio.CancelledError):
@@ -322,3 +322,61 @@ async def test_review_loop_runs_once_when_due_and_stays_quiet_otherwise(monkeypa
     with pytest.raises(asyncio.CancelledError):
         await strategy.strategy_review_loop(app)
     assert review.call_count == 1
+
+
+def test_review_has_news_only_with_data_or_proposals():
+    from services.strategy import review_has_news
+
+    empty = {"scorecard": [{"leads": 0, "points": 0}], "pending": []}
+    assert review_has_news(empty) is False
+    assert review_has_news({**empty, "pending": [{"id": 1}]}) is True
+    assert review_has_news({"scorecard": [{"leads": 5, "points": 0}], "pending": []}) is True
+
+
+def test_enabled_workers_defaults_to_strategy_only(monkeypatch):
+    import main
+
+    monkeypatch.delenv("HELIX_ENABLED_WORKERS", raising=False)
+    assert main.enabled_workers() == {"strategy"}
+    monkeypatch.setenv("HELIX_ENABLED_WORKERS", "all")
+    assert main.enabled_workers() == set(main.WORKER_TASKS)
+    monkeypatch.setenv("HELIX_ENABLED_WORKERS", "strategy, awareness ,bogus")
+    assert main.enabled_workers() == {"strategy", "awareness"}
+
+
+async def test_lifespan_starts_only_enabled_workers(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    import main
+
+    class Pool:
+        open = AsyncMock()
+        close = AsyncMock()
+
+    started = []
+
+    async def idle(*args, **kwargs):
+        await asyncio.sleep(3600)
+
+    monkeypatch.delenv("HELIX_ENABLED_WORKERS", raising=False)
+    monkeypatch.setattr(main, "create_async_db_pool", lambda: Pool())
+    monkeypatch.setattr(main, "ensure_observability_schema", AsyncMock())
+    credit_sync = AsyncMock()
+    monkeypatch.setattr(main, "sync_external_vendor_credits", credit_sync)
+    for name in (
+        "run_agent_performance_audit_loop",
+        "perpetual_awareness_loop",
+        "credit_sync_scheduler_loop",
+        "reactive_optimizer_loop",
+        "scheduled_summary_loop",
+        "observability_watchdog_loop",
+        "strategy_review_loop",
+    ):
+        monkeypatch.setattr(main, name, lambda *a, _n=name, **k: (started.append(_n), idle())[1])
+
+    async with main.lifespan(main.app):
+        assert started == ["strategy_review_loop"]
+        assert main.app.state.auditor_task is None
+        assert main.app.state.strategy_task is not None
+
+    credit_sync.assert_not_called()

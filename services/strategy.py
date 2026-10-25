@@ -532,6 +532,34 @@ async def run_strategy_review(
     }
 
 
+def review_has_news(result: dict[str, Any]) -> bool:
+    """False for an empty database: nothing to report, so no Telegram message."""
+    return bool(result["pending"]) or any(
+        row["leads"] or row["points"] for row in result["scorecard"]
+    )
+
+
+def _review_notification(result: dict[str, Any]) -> ExecutiveNotificationEvent:
+    return ExecutiveNotificationEvent(
+        source_agent="helix",
+        event_type="strategy_review",
+        severity="info",
+        headline="Weekly Strategy Review",
+        outcome=html.escape(format_scorecard(result["scorecard"], REVIEW_WINDOW_DAYS)),
+        impact=html.escape(
+            chr(10).join(
+                part
+                for part in (
+                    format_proposals(result["pending"]),
+                    result.get("pr_report", ""),
+                )
+                if part
+            )
+        ),
+        next_action="Approve or reject each proposal in Telegram.",
+    )
+
+
 async def strategy_review_loop(app) -> None:
     """Weekly review with catch-up: safe on a host that sleeps and wakes (Render free tier)."""
     print("[STRATEGY REVIEW] Weekly review loop initialized.")
@@ -542,28 +570,8 @@ async def strategy_review_loop(app) -> None:
                 now_et = datetime.datetime.now(EASTERN_TZ)
                 if review_is_due(now_et, await get_last_review_at(db_pool)):
                     result = await run_strategy_review(db_pool)
-                    emit_executive_notification(
-                        ExecutiveNotificationEvent(
-                            source_agent="helix",
-                            event_type="strategy_review",
-                            severity="info",
-                            headline="Weekly Strategy Review",
-                            outcome=html.escape(
-                                format_scorecard(result["scorecard"], REVIEW_WINDOW_DAYS)
-                            ),
-                            impact=html.escape(
-                                "\n".join(
-                                    part
-                                    for part in (
-                                        format_proposals(result["pending"]),
-                                        result.get("pr_report", ""),
-                                    )
-                                    if part
-                                )
-                            ),
-                            next_action="Approve or reject each proposal in Telegram.",
-                        )
-                    )
+                    if review_has_news(result):
+                        emit_executive_notification(_review_notification(result))
                     await write_helix_command_center_log(
                         db_pool,
                         "INFO",

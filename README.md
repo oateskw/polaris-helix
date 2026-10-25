@@ -375,6 +375,9 @@ Approved priority changes only steer work when scheduler selection puts priority
 
 ## Background workers
 
+**Which workers start.** By default only the weekly strategy review starts. The others exist for when the downstream agents are running again, and are opt-in through `HELIX_ENABLED_WORKERS`, a comma list of: `awareness` (Nova dispatch and the 04:30 preflight), `auditor` (agent KPIs and Chiron dispatch), `credit-sync` (vendor credits, which also runs once at boot), `optimizer` (hourly prompt optimizer), `summary` (6:00 and 19:00 digests), `watchdog` (5-minute heartbeat and Nova health probe), and `strategy`. Use `all` to start everything. `GET /api/v1/health` reports a disabled worker as `disabled`, and stays `healthy` if every enabled worker is running. Helix sends no Telegram message at startup, and a weekly review on an empty database sends nothing (it still records that it ran).
+
+
 Started in `lifespan` in `main.py`. If any exits, Helix writes a `CRITICAL` command-center log and an executive notification. All are cancelled on shutdown.
 
 | Task name | Function | Cadence | Purpose |

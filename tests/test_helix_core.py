@@ -96,6 +96,7 @@ def mock_outbound_mesh_proxy():
 @pytest.mark.anyio
 async def test_01_health_matrix_endpoint():
     """Verify standard core uptime diagnostics."""
+    os.environ["HELIX_ENABLED_WORKERS"] = "all"
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as ac:
